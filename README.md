@@ -1,163 +1,93 @@
 # Lightbox
 
-Lightbox is a native macOS image material manager built with SwiftUI and AppKit.
+Lightbox 是一款为 macOS 打造的图片浏览与素材整理工具。
 
-The `main` line is the Lite personal gallery. The `full/finder-bridge` branch expands the same app into a Finder-like image browser for a local Library, pinned folders, local folders, and NAS-backed product catalogs.
+它适合用来快速翻看本地图片、整理素材文件夹、预览细节、对比图片，并像使用 Finder 一样在不同文件夹之间切换。界面轻量、干净，重点放在图片本身。
 
-## Requirements
+## 下载
 
-- macOS 15 or newer
-- Xcode / Command Line Tools with Swift 6.3 support
-- GitHub CLI is optional, only needed for publishing changes
+前往 [Releases](https://github.com/a11oydyyy/Lightbox/releases/latest) 下载最新版。
 
-## Quick Start
+- `Lightbox-v1.3.2.zip`：适合 Apple Silicon Mac，macOS 15 或更新版本。
+- `Lightbox-Intel-x86-v1.3.2.zip`：适合 Intel Mac，或需要 macOS 13 兼容版本的设备。
 
-```bash
-git clone <repo-url>
-cd Lightbox
-swift build
-./script/build_and_run.sh
-```
+下载后解压，把 Lightbox 拖到“应用程序”文件夹即可使用。首次打开时，如果 macOS 提醒需要确认，请在系统提示中允许打开。
 
-For tests:
+## 你可以用它做什么
 
-```bash
-swift test
-```
+- 浏览本地图片文件夹和素材库
+- 固定常用文件夹，快速切换
+- 用瀑布流或网格方式查看图片
+- 单击打开大图预览
+- 使用键盘快速切换上一张 / 下一张
+- 多选图片，批量查看和整理
+- 查看、复制、拖出图片到其他 App
+- 使用 macOS 颜色标签辅助分类
+- 将不需要的图片移到 Lightbox 的回收区域
+- 在 App 内检查新版本并更新
 
-For a direct debug run without bundling:
+## 设计方向
 
-```bash
-swift run LightboxNative
-```
+Lightbox 不是一个厚重的图库系统，也不是修图软件。
 
-## Project Layout
+它更像一个专注图片素材的轻量工作台：打开快、切换快、预览直接，尽量减少干扰，让你把注意力放在图片和文件夹本身。
 
-```text
-Sources/LightboxNative/
-  App/            App entry, commands, window configuration, shared state
-  DesignSystem/   Glass, motion, spacing, radius, hover interaction primitives
-  Domain/         Asset model, sources, filters, color tags, gallery mode
-  Features/       Gallery, preview, shell, import UI
-  Support/        Image loading, sources, index, local storage, drag/drop, clipboard, file watching
-Tests/            Focused Swift tests
-Docs/             Architecture notes
-script/           Local build and run helper
-```
+## 版本说明
 
-## Local Data
+当前公开版本：`1.3.2`
 
-The local Library is stored here by default:
+这个版本包含：
 
-```text
-~/Library/Application Support/Lightbox/Library
-```
+- 更流畅的图片预览开合动画
+- 更稳定的侧边栏和文件夹切换体验
+- 主版本与 Intel / macOS 13 兼容版本的独立下载包
+- App 内置更新入口
+- 更干净的公开仓库结构
 
-New imports are copied into:
+---
 
-```text
-~/Library/Application Support/Lightbox/Library/Imported
-```
+# Lightbox
 
-The fixed trash directory is:
+Lightbox is a native image browser and material organizer for macOS.
 
-```text
-~/Library/Application Support/Lightbox/Trash
-```
+It helps you browse local image folders, organize visual assets, preview details, compare images, and move through folders with a Finder-like workflow. The interface stays quiet and focused so the images remain the center of attention.
 
-Pinned folders are referenced in place and can point at local folders or NAS-mounted folders. The app keeps a lightweight SQLite index at:
+## Download
 
-```text
-~/Library/Application Support/Lightbox/Lightbox.sqlite
-```
+Get the latest version from [Releases](https://github.com/a11oydyyy/Lightbox/releases/latest).
 
-Adding or removing image files directly in the current folder is reflected through the directory monitor; `Cmd+R` manually refreshes the current location.
+- `Lightbox-v1.3.2.zip`: for Apple Silicon Macs running macOS 15 or later.
+- `Lightbox-Intel-x86-v1.3.2.zip`: for Intel Macs, or devices that need the macOS 13 compatible build.
 
-On first launch, the app migrates older local assets from:
+Unzip the download and move Lightbox into your Applications folder. On first launch, if macOS asks for confirmation, allow the app from the system prompt.
 
-```text
-~/Library/Application Support/Lightbox/Imports
-~/Downloads/素材
-```
+## What It Does
 
-Those migrations are one-time user-default guarded copies into the default Library folder.
+- Browse local image folders and libraries
+- Pin frequently used folders
+- View images in masonry or grid layout
+- Open large previews with a single click
+- Move between images with the keyboard
+- Select multiple images for review and organization
+- Copy images or drag them into other apps
+- Use macOS color tags for lightweight classification
+- Move unwanted images into Lightbox's trash area
+- Check for updates inside the app
 
-## Current Features
+## Design
 
-- Native macOS window with hidden title bar and polished light-mode visual system
-- Local Library backed by real local files, not mock-only data
-- Pinned folders for browsing paths in place
-- Import by file picker or drag/drop into Library / Imported
-- Top path bar with Library / pinned-folder picker, breadcrumb navigation, search, and multi-select state
-- Directory row above the image gallery, independent from image thumbnail scale
-- Local SQLite index for pinned paths and visible folder snapshots
-- Drag images out to other apps as copied files
-- Right-click menu with Copy, Move to Trash / Restore, Show in Finder, and macOS color tags
-- Library / Trash / color-tag filtering from the bottom glass island
-- Thumbnail size slider with animated resizing
-- Masonry and square Grid gallery modes
-- Mouse hover glow on image cards and visible SwiftUI buttons
-- Single-click preview with animated open/close
-- Multi-select with gray checkboxes, Cmd toggle, Shift range selection, and drag rectangle selection
-- Fixed trash storage and empty Trash with no prompt
+Lightbox is not a heavy photo library or an editing suite.
 
-## Useful Commands
+It is a lightweight workspace for image materials: fast to open, fast to navigate, direct in preview, and intentionally low on distraction.
 
-Build:
+## Version
 
-```bash
-swift build
-```
+Current public version: `1.3.2`
 
-Run as an app bundle:
+This version includes:
 
-```bash
-./script/build_and_run.sh
-```
-
-Run tests:
-
-```bash
-swift test
-```
-
-Verify app launch:
-
-```bash
-./script/build_and_run.sh --verify
-```
-
-Create the release app bundle and zip package:
-
-```bash
-./script/build_and_run.sh package
-```
-
-The main package is written to `dist/Lightbox-v1.3.2.zip`.
-The macOS 13 / Intel-compatible package is written with:
-
-```bash
-./script/build_and_run.sh package13
-```
-
-That package is written to `dist/Lightbox-Intel-x86-v1.3.2.zip`.
-
-This package is an internal test build. It is not signed with an Apple Developer ID and is not notarized, so Gatekeeper may show "damaged" or reject it after the zip is downloaded on another Mac. For internal testing, remove quarantine after copying it to `/Applications`:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Lightbox.app
-```
-
-For external distribution, use a Developer ID Application certificate and notarization instead of the default local package.
-
-## Notes For Development On Another Mac
-
-1. Clone the repo and run `swift build`.
-2. Launch with `./script/build_and_run.sh`.
-3. If the Library is empty, choose a Library folder, pin a folder, or import images.
-4. If you want the same imported assets as this Mac, copy the Library folder from `~/Library/Application Support/Lightbox/Library` separately. Image assets are user data and are not stored in this repository.
-5. The app icon is included at `Sources/LightboxNative/Resources/AppIcon.icns`.
-
-## Current Architecture Status
-
-The Full branch is file-system backed with a lightweight SQLite index. It scans supported image files from the current Library or pinned folder and the fixed Trash folder, reads dimensions with ImageIO, uses creation / added dates for sorting, and stores visible folder snapshots in SQLite. AB comparison and explicit file-management mode are planned next-phase features.
+- Smoother preview open and close animations
+- More stable sidebar and folder switching
+- Separate main and Intel / macOS 13 compatible downloads
+- Built-in update checking
+- A cleaner public repository structure
