@@ -1,0 +1,2444 @@
+import AppKit
+import OSLog
+import SwiftUI
+import UniformTypeIdentifiers
+
+@MainActor
+final class AppState: ObservableObject {
+    nonisolated private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "LibraryLoading")
+    nonisolated private static let comparisonLogger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Comparison")
+    nonisolated private static let previewLogger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Preview")
+    @Published var sidebarCollapsed = LightboxSettingsStore.defaultSidebarCollapsed {
+        didSet {
+            LightboxSettingsStore.saveSidebarCollapsed(sidebarCollapsed)
+        }
+    }
+    @Published var sidebarWidth: CGFloat = LightboxSettingsStore.defaultSidebarWidth {
+        didSet {
+            let clamped = LightboxSettingsStore.clampSidebarWidth(sidebarWidth)
+            if sidebarWidth != clamped {
+                sidebarWidth = clamped
+            }
+            LightboxSettingsStore.saveSidebarWidth(clamped)
+        }
+    }
+    @Published var sidebarVisibleLocationIDs: Set<SidebarLocationID> = LightboxSettingsStore.defaultSidebarLocationIDs {
+        didSet {
+            LightboxSettingsStore.saveSidebarVisibleLocationIDs(sidebarVisibleLocationIDs)
+        }
+    }
+    @Published var showFolderCards = LightboxSettingsStore.defaultShowFolderCards {
+        didSet {
+            LightboxSettingsStore.saveShowFolderCards(showFolderCards)
+        }
+    }
+    @Published var selectedFilter: LibraryFilter = .all {
+        didSet {
+            guard selectedFilter != oldValue else { return }
+            rebuildActiveAssets()
+            clearSelection()
+            restartLibraryMonitor()
+            if selectedFilter == .trash || oldValue == .trash {
+                refreshLibrary()
+            }
+        }
+    }
+    @Published var galleryLayoutMode: GalleryLayoutMode = .masonry
+    @Published var thumbnailWidth: CGFloat = 206
+    @Published var assets: [LightboxAsset] = [] {
+        didSet {
+            rebuildActiveAssets()
+        }
+    }
+    @Published var libraryFolder: URL = LightboxLibraryStore.libraryFolder
+    @Published var sources: [LibrarySource] = []
+    @Published var selectedSourceID: LibrarySource.ID = LibrarySource.favoritesID
+    @Published private var temporarySource: LibrarySource?
+    @Published var currentFolderURL: URL = LightboxLibraryStore.favoritesFolder
+    @Published var folderEntries: [LibraryFolderEntry] = []
+    @Published var searchText = "" {
+        didSet {
+            rebuildActiveAssets()
+        }
+    }
+    @Published var sortField: GallerySortField = .time {
+        didSet {
+            rebuildActiveAssets()
+        }
+    }
+    @Published var sortDirection: GallerySortDirection = .descending {
+        didSet {
+            rebuildActiveAssets()
+        }
+    }
+    @Published var selectedAssetIDs: Set<LightboxAsset.ID> = []
+    @Published var selectedAssetID: LightboxAsset.ID?
+    @Published var previewAssetID: LightboxAsset.ID?
+    @Published var previewSourceHiddenAssetID: LightboxAsset.ID?
+    @Published var previewSourceFrame: CGRect?
+    @Published var previewSessionID = UUID()
+    @Published var previewStepDirection: PreviewDirection?
+    @Published private(set) var previewInteractionLayerReady = false
+    @Published var comparisonAssets: [LightboxAsset] = []
+    @Published var compareTrayAssets: [LightboxAsset] = []
+    @Published var compareTrayPulseID: LightboxAsset.ID?
+    @Published var compareTrayRejectGeneration = 0
+    @Published private var previewPhase: PreviewPhase = .closed
+    @Published var isDropTargeted = false
+    @Published var showFileImporter = false
+    @Published var importProgress: ImportProgress?
+    @Published var libraryLoadingStatus: LibraryLoadingStatus?
+    @Published var trashAccessDenied = false
+    @Published var colorMode: LightboxColorMode = .system {
+        didSet {
+            LightboxSettingsStore.saveColorMode(colorMode)
+        }
+    }
+    @Published var glassOpacity: Double = LightboxSettingsStore.defaultGlassOpacity {
+        didSet {
+            let clamped = LightboxSettingsStore.clampGlassOpacity(glassOpacity)
+            if glassOpacity != clamped {
+                glassOpacity = clamped
+            }
+            LightboxSettingsStore.saveGlassOpacity(clamped)
+        }
+    }
+    @Published var appLanguage: LightboxLanguage = .english {
+        didSet {
+            LightboxSettingsStore.saveLanguage(appLanguage)
+        }
+    }
+
+    private var importTask: Task<Void, Never>?
+    private var previewOpenTask: Task<Void, Never>?
+    private var previewCloseTask: Task<Void, Never>?
+    private var previewSourceRevealTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
+    private var libraryLoadTask: Task<Void, Never>?
+    private var assetMetadataTask: Task<Void, Never>?
+    private var indexWriteTask: Task<Void, Never>?
+    private var sharingPicker: NSSharingServicePicker?
+    private var refreshSerial = 0
+    private var libraryDirectoryMonitor: DirectoryChangeMonitor?
+    private let trashDirectoryMonitor: DirectoryChangeMonitor
+    private let indexStore = LightboxIndexStore()
+    private var selectionAnchorID: LightboxAsset.ID?
+    private var cachedActiveAssets: [LightboxAsset] = []
+    private var previewSpaceAssetFrames: [LightboxAsset.ID: CGRect] = [:]
+    private var compareTrayPulseTask: Task<Void, Never>?
+    private var compareTrayDragID: LightboxAsset.ID?
+    private let compareTrayLimit = 8
+
+    init() {
+        ImageCache.shared.removeAll()
+        LightboxLibraryStore.prepareStorage()
+        colorMode = LightboxSettingsStore.loadColorMode()
+        glassOpacity = LightboxSettingsStore.loadGlassOpacity()
+        appLanguage = LightboxSettingsStore.loadLanguage()
+        sidebarCollapsed = LightboxSettingsStore.loadSidebarCollapsed()
+        sidebarWidth = LightboxSettingsStore.loadSidebarWidth()
+        sidebarVisibleLocationIDs = LightboxSettingsStore.loadSidebarVisibleLocationIDs()
+        showFolderCards = LightboxSettingsStore.loadShowFolderCards()
+        let folder = LightboxLibraryStore.libraryFolder
+        trashDirectoryMonitor = DirectoryChangeMonitor(url: LightboxLibraryStore.primarySystemTrashFolder)
+        let loadedSources = LibrarySourceStore.loadSources(favoritesRoot: folder)
+        let savedSourceID = LibrarySourceStore.selectedSourceID(default: LibrarySource.favoritesID)
+        var resolvedSource = loadedSources.first { $0.id == savedSourceID } ?? LibrarySource.favorites(rootURL: folder)
+        var restoredTemporarySource: LibrarySource?
+        var initialFolderURL = resolvedSource.rootURL
+
+        if let lastSession = LibrarySourceStore.loadLastSession(),
+           FileManager.default.fileExists(atPath: lastSession.folderURL.path) {
+            if let matchedSource = loadedSources.first(where: {
+                $0.id == lastSession.sourceID ||
+                $0.rootURL.standardizedFileURL.path == lastSession.sourceRootURL.path
+            }) {
+                resolvedSource = matchedSource
+                initialFolderURL = lastSession.folderURL
+            } else if lastSession.sourceKind == .external,
+                      FileManager.default.fileExists(atPath: lastSession.sourceRootURL.path) {
+                let temporary = LibrarySource(
+                    id: lastSession.sourceID,
+                    name: lastSession.sourceName,
+                    rootURL: lastSession.sourceRootURL,
+                    kind: .external
+                )
+                restoredTemporarySource = temporary
+                resolvedSource = temporary
+                initialFolderURL = lastSession.folderURL
+            }
+        }
+
+        libraryFolder = folder
+        sources = loadedSources
+        temporarySource = restoredTemporarySource
+        selectedSourceID = resolvedSource.id
+        currentFolderURL = initialFolderURL
+        refreshLibrary()
+        restartLibraryMonitor()
+        trashDirectoryMonitor.start { [weak self] in
+            self?.scheduleLibraryRefresh()
+        }
+    }
+
+    deinit {
+        libraryDirectoryMonitor?.stop()
+        trashDirectoryMonitor.stop()
+        refreshTask?.cancel()
+        importTask?.cancel()
+        previewOpenTask?.cancel()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        libraryLoadTask?.cancel()
+        assetMetadataTask?.cancel()
+        indexWriteTask?.cancel()
+        compareTrayPulseTask?.cancel()
+    }
+
+    var activeAssets: [LightboxAsset] {
+        cachedActiveAssets
+    }
+
+    var isViewingTrash: Bool {
+        selectedFilter == .trash
+    }
+
+    var selectedSource: LibrarySource? {
+        if let temporarySource, temporarySource.id == selectedSourceID {
+            return temporarySource
+        }
+
+        return sources.first { $0.id == selectedSourceID }
+    }
+
+    var sourceMenuSources: [LibrarySource] {
+        var menuSources = sources.filter { !$0.isLocalLibrary }
+        if let selectedSource,
+           !selectedSource.isLocalLibrary,
+           !menuSources.contains(where: { sourceMatches($0, selectedSource) }) {
+            menuSources.append(selectedSource)
+        }
+        return menuSources
+    }
+
+    var pinnedSidebarSources: [LibrarySource] {
+        sources.filter { !$0.isLocalLibrary }
+    }
+
+    var sidebarLocations: [SidebarLocationID] {
+        SidebarLocationID.allCases.filter { location in
+            sidebarVisibleLocationIDs.contains(location) && location.defaultURL.map { FileManager.default.fileExists(atPath: $0.path) } == true
+        }
+    }
+
+    var sidebarVolumes: [SidebarVolume] {
+        guard sidebarVisibleLocationIDs.contains(.volumes) else { return [] }
+        let keys: [URLResourceKey] = [.volumeNameKey, .isVolumeKey]
+        let urls = FileManager.default.mountedVolumeURLs(
+            includingResourceValuesForKeys: keys,
+            options: [.skipHiddenVolumes]
+        ) ?? []
+
+        return urls.compactMap { url in
+            let standardizedURL = url.standardizedFileURL
+            guard standardizedURL.path != "/" else { return nil }
+            let name = (try? standardizedURL.resourceValues(forKeys: [.volumeNameKey]).volumeName)
+                ?? standardizedURL.lastPathComponent
+            guard !name.isEmpty else { return nil }
+            return SidebarVolume(url: standardizedURL, displayName: name)
+        }
+        .sorted { lhs, rhs in
+            lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    func isSourcePinned(_ source: LibrarySource) -> Bool {
+        sources.contains {
+            !$0.isLocalLibrary && sourceMatches($0, source)
+        }
+    }
+
+    var currentPathTitle: String {
+        if isViewingTrash {
+            return localized(.trash)
+        }
+
+        return currentFolderFilterTitle
+    }
+
+    var currentFolderFilterTitle: String {
+        guard let selectedSource else {
+            return "Lightbox"
+        }
+
+        let relativePath = currentFolderURL.relativePath(from: selectedSource.rootURL)
+        return relativePath.isEmpty ? selectedSource.displayName : currentFolderURL.lastPathComponent
+    }
+
+    var currentFolderSegmentTitle: String {
+        let folderName = currentFolderURL.lastPathComponent
+        if !folderName.isEmpty {
+            return folderName
+        }
+
+        return selectedSource?.displayName ?? "Lightbox"
+    }
+
+    var currentPathForCopy: String {
+        if isViewingTrash {
+            return LightboxLibraryStore.primarySystemTrashFolder.path
+        }
+
+        return currentFolderURL.standardizedFileURL.path
+    }
+
+    var breadcrumbs: [PathBreadcrumb] {
+        guard !isViewingTrash else {
+            return []
+        }
+
+        var breadcrumbs: [PathBreadcrumb] = []
+        var path = ""
+        for (index, component) in currentFolderURL.standardizedFileURL.pathComponents.enumerated() {
+            if index == 0 {
+                path = component
+                breadcrumbs.append(PathBreadcrumb(title: volumeTitle(), url: URL(fileURLWithPath: path, isDirectory: true)))
+                continue
+            }
+
+            path = URL(fileURLWithPath: path, isDirectory: true)
+                .appendingPathComponent(component, isDirectory: true)
+                .path
+            breadcrumbs.append(PathBreadcrumb(title: component, url: URL(fileURLWithPath: path, isDirectory: true)))
+        }
+
+        return breadcrumbs
+    }
+
+    var canOpenParentFolder: Bool {
+        guard !isViewingTrash else { return false }
+        let currentPath = currentFolderURL.standardizedFileURL.path
+        let parentPath = currentFolderURL.deletingLastPathComponent().standardizedFileURL.path
+        return currentPath != parentPath
+    }
+
+    var canPinCurrentPath: Bool {
+        guard !isViewingTrash else { return false }
+        let currentPath = currentFolderURL.standardizedFileURL.path
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: currentPath, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return false
+        }
+
+        return !sources.contains {
+            $0.rootURL.standardizedFileURL.path == currentPath
+        }
+    }
+
+    func openParentFolder() {
+        guard canOpenParentFolder else { return }
+        openFolderURL(currentFolderURL.deletingLastPathComponent())
+    }
+
+    private func volumeTitle() -> String {
+        let volumeName = (try? currentFolderURL.resourceValues(forKeys: [.volumeNameKey]).volumeName) ?? ""
+        if !volumeName.isEmpty {
+            return volumeName
+        }
+
+        return "Macintosh HD"
+    }
+
+    var trashedAssets: [LightboxAsset] {
+        assets.filter(\.isDeleted)
+    }
+
+    var tags: [String] {
+        MacColorTag.sort(Array(Set(assets.flatMap(\.tags))))
+    }
+
+    var libraryTags: [String] {
+        MacColorTag.sort(Array(Set(assets.filter { !$0.isDeleted }.flatMap(\.tags))))
+    }
+
+    var libraryColorTags: [MacColorTag] {
+        MacColorTag.all.filter { tag in
+            assets.contains { asset in
+                !asset.isDeleted && asset.tags.contains(tag.name)
+            }
+        }
+    }
+
+    var selectedAsset: LightboxAsset? {
+        guard let selectedAssetID else { return activeAssets.first }
+        return assets.first { $0.id == selectedAssetID }
+    }
+
+    var explicitlySelectedAsset: LightboxAsset? {
+        guard let selectedAssetID else { return nil }
+        return assets.first { $0.id == selectedAssetID }
+    }
+
+    var canMoveSelectionToTrash: Bool {
+        if !selectedAssetIDs.isEmpty {
+            return assets.contains { asset in
+                selectedAssetIDs.contains(asset.id) && !asset.isDeleted && asset.sourceURL != nil
+            }
+        }
+
+        guard let asset = explicitlySelectedAsset else { return false }
+        return !asset.isDeleted && asset.sourceURL != nil
+    }
+
+    var previewAsset: LightboxAsset? {
+        guard let previewAssetID else { return nil }
+        return assets.first { $0.id == previewAssetID }
+    }
+
+    var isComparing: Bool {
+        comparisonAssets.count >= 2
+    }
+
+    var isPreviewPresented: Bool {
+        previewPhase == .opening || previewPhase == .open || previewPhase == .closing
+    }
+
+    var isPreviewClosing: Bool {
+        previewPhase == .closing
+    }
+
+    var needsPreviewRootClickCatcher: Bool {
+        isPreviewPresented && !previewInteractionLayerReady
+    }
+
+    var hasActiveOverlay: Bool {
+        isPreviewPresented || isComparing
+    }
+
+    var selectedAssetCount: Int {
+        selectedAssetIDs.count
+    }
+
+    var hasExplicitSelection: Bool {
+        !selectedAssetIDs.isEmpty
+    }
+
+    var canStartCompareTrayComparison: Bool {
+        compareTrayAssets.count >= 2
+    }
+
+    var preferredColorScheme: ColorScheme? {
+        colorMode.preferredColorScheme
+    }
+
+    func localized(_ key: LightboxTextKey) -> String {
+        LightboxLocalization.text(key, language: appLanguage)
+    }
+
+    func localizedColorTagName(_ tagName: String) -> String {
+        LightboxLocalization.colorTagName(tagName, language: appLanguage)
+    }
+
+    func localizedColorTagFilterTitle(_ tagName: String) -> String {
+        LightboxLocalization.filterColorTag(tagName, language: appLanguage)
+    }
+
+    func selectedCountText(_ count: Int) -> String {
+        LightboxLocalization.selectedCount(count, language: appLanguage)
+    }
+
+    func loadingStatusText(_ status: LibraryLoadingStatus) -> String {
+        switch status.phase {
+        case .scanning:
+            return localized(.scanningFolder)
+        case .preparingPreviews:
+            return LightboxLocalization.preparingPreviews(status.processed, total: status.total, language: appLanguage)
+        }
+    }
+
+    func sortFieldTitle(_ field: GallerySortField) -> String {
+        switch field {
+        case .time:
+            localized(.sortTime)
+        case .size:
+            localized(.sortSize)
+        case .tag:
+            localized(.sortTag)
+        case .fileName:
+            localized(.sortFileName)
+        case .type:
+            localized(.sortType)
+        }
+    }
+
+    var sortDirectionTitle: String {
+        switch sortDirection {
+        case .ascending:
+            localized(.sortAscending)
+        case .descending:
+            localized(.sortDescending)
+        }
+    }
+
+    var sortDirectionIcon: String {
+        switch sortDirection {
+        case .ascending:
+            "arrow.up"
+        case .descending:
+            "arrow.down"
+        }
+    }
+
+    func setSortField(_ field: GallerySortField) {
+        if sortField == field {
+            sortDirection = sortDirection.toggled
+        } else {
+            sortField = field
+        }
+    }
+
+    func toggleSortDirection() {
+        sortDirection = sortDirection.toggled
+    }
+
+    func select(_ asset: LightboxAsset) {
+        selectedAssetIDs = [asset.id]
+        selectedAssetID = asset.id
+        selectionAnchorID = asset.id
+    }
+
+    func isAssetHighlighted(_ asset: LightboxAsset) -> Bool {
+        if selectedAssetIDs.isEmpty {
+            return selectedAssetID == asset.id
+        }
+
+        return selectedAssetIDs.contains(asset.id)
+    }
+
+    func handleAssetClick(
+        _ asset: LightboxAsset,
+        modifiers: NSEvent.ModifierFlags,
+        click: LightboxClickContext? = nil,
+        sourceFrame: CGRect?
+    ) {
+        let extendsSelection = modifiers.contains(.command)
+        let selectsRange = modifiers.contains(.shift)
+        Self.previewLogger.info("asset click received phase=\(self.previewPhase.rawValue, privacy: .public) overlay=\(self.hasActiveOverlay, privacy: .public) asset=\(asset.originalName, privacy: .public) frame=\(Self.frameDescription(sourceFrame), privacy: .public) \(Self.clickDescription(click, sourceFrame: sourceFrame), privacy: .public)")
+        guard !hasActiveOverlay else {
+            Self.previewLogger.info("asset click ignored activeOverlay=true phase=\(self.previewPhase.rawValue, privacy: .public) asset=\(asset.originalName, privacy: .public) frame=\(Self.frameDescription(sourceFrame), privacy: .public)")
+            return
+        }
+
+        if selectsRange {
+            selectRange(to: asset, extending: extendsSelection)
+            return
+        }
+
+        if extendsSelection {
+            toggleSelection(asset)
+            return
+        }
+
+        if !selectedAssetIDs.isEmpty {
+            if selectedAssetIDs.count == 1, selectedAssetIDs.contains(asset.id) {
+                clearSelection()
+                showPreview(for: asset, sourceFrame: sourceFrame)
+            } else {
+                replaceSelection(with: [asset.id], primary: asset.id, anchor: asset.id)
+            }
+            return
+        }
+
+        showPreview(for: asset, sourceFrame: sourceFrame)
+    }
+
+    func updatePreviewSpaceAssetFrames(_ frames: [LightboxAsset.ID: CGRect]) {
+        previewSpaceAssetFrames = frames
+    }
+
+    func previewSpaceFrame(for assetID: LightboxAsset.ID) -> CGRect? {
+        previewSpaceAssetFrames[assetID]
+    }
+
+    private func previewSpaceAssetHit(at point: CGPoint?) -> (asset: LightboxAsset, frame: CGRect)? {
+        guard let point else { return nil }
+        for asset in activeAssets {
+            guard let frame = previewSpaceAssetFrames[asset.id],
+                  frame.contains(point)
+            else {
+                continue
+            }
+
+            return (asset, frame)
+        }
+
+        return nil
+    }
+
+    func previewSwitchTarget(
+        at point: CGPoint?,
+        excluding currentAssetID: LightboxAsset.ID
+    ) -> (asset: LightboxAsset, frame: CGRect)? {
+        guard let hit = previewSpaceAssetHit(at: point),
+              hit.asset.id != currentAssetID
+        else {
+            return nil
+        }
+
+        return hit
+    }
+
+    func previewSpaceHitDescription(at point: CGPoint?) -> String {
+        guard let point else { return "point=nil" }
+        if let hit = previewSpaceAssetHit(at: point) {
+            return "hit=\(hit.asset.originalName) frame=\(Self.frameDescription(hit.frame)) point=\(LightboxClickFormatter.pointDescription(point))"
+        }
+
+        guard let nearest = activeAssets.compactMap({ asset -> (LightboxAsset, CGRect, CGFloat)? in
+            guard let frame = previewSpaceAssetFrames[asset.id] else { return nil }
+            return (asset, frame, Self.distance(from: point, to: frame))
+        }).min(by: { $0.2 < $1.2 }) else {
+            return "hit=nil frames=0 point=\(LightboxClickFormatter.pointDescription(point))"
+        }
+
+        return "hit=nil nearest=\(nearest.0.originalName) distance=\(String(format: "%.1f", nearest.2)) frame=\(Self.frameDescription(nearest.1)) point=\(LightboxClickFormatter.pointDescription(point))"
+    }
+
+    func markPreviewInteractionLayerReady(_ isReady: Bool) {
+        guard previewInteractionLayerReady != isReady else { return }
+        previewInteractionLayerReady = isReady
+        Self.previewLogger.info("preview interaction-layer ready=\(isReady, privacy: .public) phase=\(self.previewPhase.rawValue, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+    }
+
+    func handlePreviewRootClick(_ click: LightboxClickContext) {
+        handlePreviewRootClick(at: click.localTopLeftLocation)
+    }
+
+    func handlePreviewRootClick(at point: CGPoint?) {
+        guard isPreviewPresented else {
+            Self.previewLogger.info("preview root-click ignored phase=\(self.previewPhase.rawValue, privacy: .public)")
+            return
+        }
+
+        let underlying = previewSpaceHitDescription(at: point)
+        if previewPhase == .closing {
+            if let currentID = previewAssetID,
+               let hit = previewSwitchTarget(at: point, excluding: currentID) {
+                Self.previewLogger.info("preview root-click action=switch-during-close target=\(hit.asset.originalName, privacy: .public) underlying=\(underlying, privacy: .public)")
+                showPreview(for: hit.asset, sourceFrame: hit.frame)
+                return
+            }
+
+            if let previewAssetID {
+                Self.previewLogger.info("preview root-click action=reopen-current underlying=\(underlying, privacy: .public)")
+                _ = reopenPreviewDuringClose(for: previewAssetID)
+            }
+            return
+        }
+
+        guard previewPhase == .opening || previewPhase == .open else {
+            Self.previewLogger.info("preview root-click ignored phase=\(self.previewPhase.rawValue, privacy: .public) underlying=\(underlying, privacy: .public)")
+            return
+        }
+
+        Self.previewLogger.info("preview root-click action=close phase=\(self.previewPhase.rawValue, privacy: .public) underlying=\(underlying, privacy: .public)")
+        _ = beginInteractivePreviewClose(after: .milliseconds(60), revealSourceAfter: .milliseconds(0))
+    }
+
+    func replaceSelection(with ids: Set<LightboxAsset.ID>) {
+        replaceSelection(with: ids, primary: firstVisibleID(in: ids), anchor: firstVisibleID(in: ids))
+    }
+
+    func clearSelection() {
+        selectedAssetIDs = []
+        selectedAssetID = nil
+        selectionAnchorID = nil
+    }
+
+    func toggleGalleryLayoutMode() {
+        galleryLayoutMode = galleryLayoutMode.next
+    }
+
+    func chooseSource(_ sourceID: LibrarySource.ID) {
+        guard let source = sources.first(where: { $0.id == sourceID }) else { return }
+        temporarySource = nil
+        activateSource(source, persistSelection: true)
+    }
+
+    func openSource(_ source: LibrarySource) {
+        if let existing = sources.first(where: { sourceMatches($0, source) }) {
+            chooseSource(existing.id)
+            return
+        }
+
+        chooseTemporarySource(source)
+    }
+
+    func openSidebarFolder(_ url: URL) {
+        let standardizedURL = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            Self.logger.error("sidebar folder open rejected missing-or-not-directory path=\(standardizedURL.path, privacy: .public)")
+            return
+        }
+
+        if let source = bestSource(containing: standardizedURL) {
+            temporarySource = nil
+            activateSource(source, persistSelection: true, initialFolderURL: standardizedURL)
+            return
+        }
+
+        chooseTemporarySource(LibrarySourceStore.makeExternalSource(rootURL: standardizedURL))
+    }
+
+    func openTrashFromSidebar() {
+        selectedFilter = .trash
+        searchText = ""
+        clearSelection()
+    }
+
+    private func chooseTemporarySource(_ source: LibrarySource) {
+        temporarySource = source
+        indexStore.upsertSource(source)
+        activateSource(source, persistSelection: false)
+    }
+
+    private func activateSource(_ source: LibrarySource, persistSelection: Bool, initialFolderURL: URL? = nil) {
+        selectedSourceID = source.id
+        LibrarySourceStore.saveSelectedSourceID(persistSelection ? source.id : LibrarySource.favoritesID)
+        selectedFilter = .all
+        currentFolderURL = initialFolderURL?.standardizedFileURL ?? source.rootURL
+        saveCurrentFolderSession()
+        searchText = ""
+        clearSelection()
+        ImageCache.shared.cancelOutstandingRequests(reason: "choose-source")
+        restartLibraryMonitor()
+        refreshLibrary()
+    }
+
+    func addExternalSource() {
+        let panel = NSOpenPanel()
+        panel.title = localized(.openFolder)
+        panel.prompt = localized(.openFolder).replacingOccurrences(of: "...", with: "")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK,
+              let url = panel.url
+        else {
+            return
+        }
+
+        let standardizedURL = url.standardizedFileURL
+        if let existing = sources.first(where: { $0.rootURL.standardizedFileURL.path == standardizedURL.path }) {
+            chooseSource(existing.id)
+            return
+        }
+
+        chooseTemporarySource(LibrarySourceStore.makeExternalSource(rootURL: standardizedURL))
+    }
+
+    func pinCurrentPath() {
+        guard canPinCurrentPath else { return }
+        pinFolder(currentFolderURL, selectPinnedFolder: true)
+    }
+
+    func unpinSource(_ sourceID: LibrarySource.ID) {
+        guard let source = sources.first(where: { $0.id == sourceID }),
+              !source.isLocalLibrary
+        else {
+            return
+        }
+
+        let wasSelected = selectedSourceID == sourceID
+        sources.removeAll { $0.id == sourceID }
+        LibrarySourceStore.saveExternalSources(sources)
+        if wasSelected {
+            temporarySource = source
+            LibrarySourceStore.saveSelectedSourceID(LibrarySource.favoritesID)
+        }
+    }
+
+    func pinSource(_ source: LibrarySource, selectPinnedFolder: Bool) {
+        guard !source.isLocalLibrary else { return }
+        if let existing = sources.first(where: {
+            $0.id == source.id || $0.rootURL.standardizedFileURL.path == source.rootURL.standardizedFileURL.path
+        }) {
+            if selectPinnedFolder {
+                chooseSource(existing.id)
+            }
+            return
+        }
+
+        sources.append(source)
+        LibrarySourceStore.saveExternalSources(sources)
+        indexStore.upsertSource(source)
+        if temporarySource?.rootURL.standardizedFileURL.path == source.rootURL.standardizedFileURL.path {
+            temporarySource = nil
+        }
+        if selectedSourceID == source.id {
+            LibrarySourceStore.saveSelectedSourceID(source.id)
+        }
+        if selectPinnedFolder {
+            chooseSource(source.id)
+        }
+    }
+
+    private func pinFolder(_ url: URL, selectPinnedFolder: Bool) {
+        let standardizedURL = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return
+        }
+
+        if let existing = sources.first(where: { $0.rootURL.standardizedFileURL.path == standardizedURL.path }) {
+            if selectPinnedFolder {
+                chooseSource(existing.id)
+            }
+            return
+        }
+
+        let source = LibrarySourceStore.makeExternalSource(rootURL: standardizedURL)
+        sources.append(source)
+        LibrarySourceStore.saveExternalSources(sources)
+        indexStore.upsertSource(source)
+        if temporarySource?.rootURL.standardizedFileURL.path == standardizedURL.path {
+            temporarySource = nil
+        }
+        if selectPinnedFolder {
+            chooseSource(source.id)
+        }
+    }
+
+    private func sourceMatches(_ lhs: LibrarySource, _ rhs: LibrarySource) -> Bool {
+        lhs.id == rhs.id || lhs.rootURL.standardizedFileURL.path == rhs.rootURL.standardizedFileURL.path
+    }
+
+    private func bestSource(containing folderURL: URL) -> LibrarySource? {
+        let folderPath = folderURL.standardizedFileURL.path
+        let candidates = sources.filter { source in
+            let rootPath = source.rootURL.standardizedFileURL.path
+            return folderPath == rootPath || folderPath.hasPrefix(rootPath + "/")
+        }
+
+        return candidates.max {
+            $0.rootURL.standardizedFileURL.path.count < $1.rootURL.standardizedFileURL.path.count
+        }
+    }
+
+    private func saveCurrentFolderSession() {
+        guard !isViewingTrash, let selectedSource else { return }
+        LibrarySourceStore.saveLastSession(source: selectedSource, folderURL: currentFolderURL)
+    }
+
+    func openFolder(_ folder: LibraryFolderEntry) {
+        Self.logger.info("folder open requested source=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
+        guard folder.sourceID == selectedSourceID else {
+            Self.logger.error("folder open rejected source mismatch folderSource=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
+            return
+        }
+        openFolderURL(folder.url)
+    }
+
+    func openBreadcrumb(_ breadcrumb: PathBreadcrumb) {
+        openFolderURL(breadcrumb.url)
+    }
+
+    private func openFolderURL(_ url: URL) {
+        let standardizedURL = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            Self.logger.error("folder open rejected missing-or-not-directory path=\(standardizedURL.path, privacy: .public)")
+            return
+        }
+
+        selectedFilter = .all
+        currentFolderURL = standardizedURL
+        saveCurrentFolderSession()
+        searchText = ""
+        clearSelection()
+        ImageCache.shared.cancelOutstandingRequests(reason: "open-folder")
+        restartLibraryMonitor()
+        refreshLibrary()
+    }
+
+    func copyCurrentPathToClipboard() {
+        let path = currentPathForCopy
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(path, forType: .string)
+        Self.logger.info("path copied path=\(path, privacy: .public)")
+    }
+
+    func showPreview(for asset: LightboxAsset? = nil, sourceFrame: CGRect? = nil) {
+        guard var target = asset ?? selectedAsset ?? activeAssets.first else {
+            Self.previewLogger.info("preview show ignored reason=no-target phase=\(self.previewPhase.rawValue, privacy: .public)")
+            return
+        }
+        target = resolvedPreviewTarget(target, sourceFrame: sourceFrame)
+
+        let previousPhase = previewPhase
+        let nextSessionID = UUID()
+        closeComparison()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        previewInteractionLayerReady = false
+        previewPhase = .opening
+        previewSessionID = nextSessionID
+        previewStepDirection = nil
+        selectedAssetIDs = []
+        selectionAnchorID = nil
+        selectedAssetID = target.id
+        previewSourceHiddenAssetID = nil
+        previewSourceFrame = sourceFrame
+        previewAssetID = target.id
+        Self.previewLogger.info("preview show phase=\(previousPhase.rawValue, privacy: .public)->opening session=\(nextSessionID.uuidString, privacy: .public) asset=\(target.originalName, privacy: .public) frame=\(Self.frameDescription(sourceFrame), privacy: .public) folder=\(self.currentFolderURL.lastPathComponent, privacy: .public)")
+        schedulePreviewOpenCompletion()
+    }
+
+    private func resolvedPreviewTarget(_ asset: LightboxAsset, sourceFrame: CGRect?) -> LightboxAsset {
+        guard needsPreviewDimensionResolve(asset),
+              let url = asset.sourceURL
+        else {
+            return asset
+        }
+
+        if let dimensions = ImageProbe.dimensions(for: url),
+           dimensions.width > 1,
+           dimensions.height > 1 {
+            var resolved = asset
+            resolved.width = dimensions.width
+            resolved.height = dimensions.height
+            resolved.metadataLoaded = true
+
+            if let index = assets.firstIndex(where: { $0.id == asset.id }) {
+                var nextAssets = assets
+                nextAssets[index].width = dimensions.width
+                nextAssets[index].height = dimensions.height
+                nextAssets[index].metadataLoaded = true
+                assets = nextAssets
+            }
+
+            Self.previewLogger.info("preview dimensions resolved asset=\(asset.originalName, privacy: .public) width=\(dimensions.width, format: .fixed(precision: 0)) height=\(dimensions.height, format: .fixed(precision: 0))")
+            return resolved
+        }
+
+        guard let sourceFrame,
+              sourceFrame.width > 1,
+              sourceFrame.height > 1
+        else {
+            return asset
+        }
+
+        var fallback = asset
+        fallback.width = sourceFrame.width
+        fallback.height = sourceFrame.height
+        fallback.metadataLoaded = false
+
+        if let index = assets.firstIndex(where: { $0.id == asset.id }) {
+            var nextAssets = assets
+            nextAssets[index].width = sourceFrame.width
+            nextAssets[index].height = sourceFrame.height
+            nextAssets[index].metadataLoaded = false
+            assets = nextAssets
+        }
+
+        Self.previewLogger.info("preview dimensions fallback-to-card asset=\(asset.originalName, privacy: .public) width=\(sourceFrame.width, format: .fixed(precision: 0)) height=\(sourceFrame.height, format: .fixed(precision: 0))")
+        return fallback
+    }
+
+    private func needsPreviewDimensionResolve(_ asset: LightboxAsset) -> Bool {
+        !asset.metadataLoaded || asset.width <= 1 || asset.height <= 1
+    }
+
+    func hidePreviewSourceForCurrentPreview(_ assetID: LightboxAsset.ID) {
+        guard previewAssetID == assetID,
+              previewPhase == .opening || previewPhase == .open
+        else {
+            Self.previewLogger.info("preview source hide ignored phase=\(self.previewPhase.rawValue, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+            return
+        }
+
+        previewSourceHiddenAssetID = assetID
+        Self.previewLogger.info("preview source hide session=\(self.previewSessionID.uuidString, privacy: .public)")
+    }
+
+    private func markPreviewOpen() {
+        guard previewPhase == .opening else {
+            Self.previewLogger.info("preview open ignored phase=\(self.previewPhase.rawValue, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+            return
+        }
+        Self.previewLogger.info("preview open phase=opening->open session=\(self.previewSessionID.uuidString, privacy: .public)")
+        previewPhase = .open
+    }
+
+    func beginPreviewClose(
+        after delay: Duration = MotionTokens.previewGeometryDuration,
+        revealSourceAfter sourceRevealDelay: Duration = MotionTokens.previewSourceRevealDelay
+    ) -> Bool {
+        let previousPhase = previewPhase
+        guard previewPhase == .opening || previewPhase == .open else {
+            Self.previewLogger.info("preview close rejected phase=\(self.previewPhase.rawValue, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+            return false
+        }
+        previewOpenTask?.cancel()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        previewPhase = .closing
+        previewStepDirection = nil
+        Self.previewLogger.info("preview close begin phase=\(previousPhase.rawValue, privacy: .public)->closing session=\(self.previewSessionID.uuidString, privacy: .public) delay=\(Self.durationDescription(delay), privacy: .public) revealDelay=\(Self.durationDescription(sourceRevealDelay), privacy: .public) sourceHidden=\(self.previewSourceHiddenAssetID != nil, privacy: .public)")
+        previewSourceRevealTask = Task { [weak self] in
+            try? await Task.sleep(for: sourceRevealDelay)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                Self.previewLogger.info("preview source reveal session=\(self?.previewSessionID.uuidString ?? "nil", privacy: .public)")
+                self?.previewSourceHiddenAssetID = nil
+            }
+        }
+        previewCloseTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.finishPreviewClose()
+            }
+        }
+        return true
+    }
+
+    func beginInteractivePreviewClose(
+        after delay: Duration = MotionTokens.previewGeometryDuration,
+        revealSourceAfter sourceRevealDelay: Duration = MotionTokens.previewSourceRevealDelay
+    ) -> Bool {
+        guard previewPhase == .opening || previewPhase == .open else { return false }
+        return beginPreviewClose(after: delay, revealSourceAfter: sourceRevealDelay)
+    }
+
+    func reopenPreviewDuringClose(for assetID: LightboxAsset.ID) -> Bool {
+        guard previewPhase == .closing,
+              previewAssetID == assetID
+        else {
+            Self.previewLogger.info("preview reopen rejected phase=\(self.previewPhase.rawValue, privacy: .public) assetID=\(assetID, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+            return false
+        }
+
+        previewOpenTask?.cancel()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        previewPhase = .opening
+        previewStepDirection = nil
+        previewSourceHiddenAssetID = assetID
+        selectedAssetID = assetID
+        Self.previewLogger.info("preview reopen phase=closing->opening session=\(self.previewSessionID.uuidString, privacy: .public) assetID=\(assetID, privacy: .public)")
+        schedulePreviewOpenCompletion()
+        return true
+    }
+
+    func closePreview() {
+        previewOpenTask?.cancel()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        finishPreviewClose(force: true)
+    }
+
+    func showComparisonFromSelection() {
+        let selected = activeAssets.filter { selectedAssetIDs.contains($0.id) }
+        guard selected.count >= 2 else { return }
+        Self.comparisonLogger.info("comparison open selected=\(selected.count) source=\(self.selectedSourceID, privacy: .public)")
+        ImageCache.shared.cancelOutstandingRequests(reason: "open-comparison")
+        previewOpenTask?.cancel()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        previewAssetID = nil
+        previewSourceHiddenAssetID = nil
+        previewInteractionLayerReady = false
+        previewSourceFrame = nil
+        previewPhase = .closed
+        previewSessionID = UUID()
+        previewStepDirection = nil
+        comparisonAssets = selected
+        selectedAssetIDs = []
+        selectionAnchorID = nil
+        selectedAssetID = selected.first?.id
+    }
+
+    func addToCompareTray(_ asset: LightboxAsset) {
+        guard !asset.isDeleted else { return }
+        guard !compareTrayAssets.contains(where: { $0.id == asset.id }) else {
+            pulseCompareTrayItem(asset.id)
+            return
+        }
+        guard compareTrayAssets.count < compareTrayLimit else {
+            compareTrayRejectGeneration += 1
+            return
+        }
+
+        compareTrayAssets.append(asset)
+        pulseCompareTrayItem(asset.id)
+    }
+
+    func addSelectedToCompareTray(fallback asset: LightboxAsset) {
+        let selected = activeAssets.filter { selectedAssetIDs.contains($0.id) }
+        let targets = selected.count > 1 && selected.contains(where: { $0.id == asset.id }) ? selected : [asset]
+        for target in targets {
+            addToCompareTray(target)
+        }
+    }
+
+    func addCompareTrayItem(for url: URL) {
+        let standardizedPath = url.standardizedFileURL.path
+        if let existing = assets.first(where: { $0.sourceURL?.standardizedFileURL.path == standardizedPath }) {
+            addToCompareTray(existing)
+            return
+        }
+
+        let fallbackSize = MockLibrary.importFallbackSizes[compareTrayAssets.count % MockLibrary.importFallbackSizes.count]
+        let size = ImageProbe.dimensions(for: url) ?? fallbackSize
+        let asset = LightboxAsset(
+            originalName: url.lastPathComponent,
+            width: size.width,
+            height: size.height,
+            tags: FinderTagStore.colorTags(for: url),
+            sourceURL: url,
+            addedAt: LocalImageSource.addedDate(for: url) ?? .now,
+            fileSize: LocalImageSource.fileSize(for: url),
+            palette: MockPalette.imported[compareTrayAssets.count % MockPalette.imported.count],
+            metadataLoaded: true
+        )
+        addToCompareTray(asset)
+    }
+
+    func handleCompareTrayDrop(providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty else { return false }
+        Task { [weak self] in
+            for provider in providers {
+                guard let url = await Self.fileURL(from: provider) else { continue }
+                await MainActor.run {
+                    self?.addCompareTrayItem(for: url)
+                }
+            }
+            await MainActor.run {
+                self?.compareTrayDragID = nil
+            }
+        }
+        return true
+    }
+
+    func removeFromCompareTray(_ assetID: LightboxAsset.ID) {
+        compareTrayAssets.removeAll { $0.id == assetID }
+        if comparisonAssets.contains(where: { $0.id == assetID }) {
+            comparisonAssets.removeAll { $0.id == assetID }
+            if comparisonAssets.count < 2 {
+                closeComparison()
+            }
+        }
+    }
+
+    func clearCompareTray() {
+        compareTrayAssets = []
+        closeComparison()
+    }
+
+    func startCompareTrayComparison() {
+        guard compareTrayAssets.count >= 2 else {
+            compareTrayRejectGeneration += 1
+            return
+        }
+
+        Self.comparisonLogger.info("comparison open tray count=\(self.compareTrayAssets.count)")
+        ImageCache.shared.cancelOutstandingRequests(reason: "open-compare-tray")
+        previewOpenTask?.cancel()
+        previewCloseTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        previewAssetID = nil
+        previewSourceHiddenAssetID = nil
+        previewInteractionLayerReady = false
+        previewSourceFrame = nil
+        previewPhase = .closed
+        previewSessionID = UUID()
+        previewStepDirection = nil
+        comparisonAssets = compareTrayAssets
+        selectedAssetIDs = []
+        selectionAnchorID = nil
+        selectedAssetID = compareTrayAssets.first?.id
+    }
+
+    func compareTrayLabel(for assetID: LightboxAsset.ID) -> String? {
+        guard let index = compareTrayAssets.firstIndex(where: { $0.id == assetID }) else {
+            return nil
+        }
+        return comparisonLabel(for: index)
+    }
+
+    func beginCompareTrayDrag(_ assetID: LightboxAsset.ID) {
+        compareTrayDragID = assetID
+    }
+
+    func moveCompareTrayDraggedItem(before targetID: LightboxAsset.ID) {
+        guard let draggedID = compareTrayDragID,
+              draggedID != targetID,
+              let fromIndex = compareTrayAssets.firstIndex(where: { $0.id == draggedID }),
+              let toIndex = compareTrayAssets.firstIndex(where: { $0.id == targetID })
+        else {
+            return
+        }
+
+        let item = compareTrayAssets.remove(at: fromIndex)
+        let adjustedIndex = fromIndex < toIndex ? toIndex - 1 : toIndex
+        compareTrayAssets.insert(item, at: adjustedIndex)
+    }
+
+    func endCompareTrayDrag() {
+        compareTrayDragID = nil
+    }
+
+    private func pulseCompareTrayItem(_ assetID: LightboxAsset.ID) {
+        compareTrayPulseTask?.cancel()
+        compareTrayPulseID = assetID
+        compareTrayPulseTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(420))
+            guard !Task.isCancelled else { return }
+            if self?.compareTrayPulseID == assetID {
+                self?.compareTrayPulseID = nil
+            }
+        }
+    }
+
+    private func comparisonLabel(for index: Int) -> String {
+        "\(index + 1)"
+    }
+
+    func closeComparison() {
+        guard !comparisonAssets.isEmpty else { return }
+        Self.comparisonLogger.info("comparison close count=\(self.comparisonAssets.count)")
+        comparisonAssets = []
+    }
+
+    func closeActiveOverlay() {
+        if isComparing {
+            closeComparison()
+            return
+        }
+
+        _ = beginPreviewClose()
+    }
+
+    private func finishPreviewClose(force: Bool = false) {
+        let previousPhase = previewPhase
+        guard force || previewPhase == .closing else {
+            Self.previewLogger.info("preview finish ignored force=\(force, privacy: .public) phase=\(self.previewPhase.rawValue, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+            return
+        }
+        previewSourceRevealTask?.cancel()
+        previewAssetID = nil
+        previewSourceHiddenAssetID = nil
+        previewInteractionLayerReady = false
+        selectedAssetID = nil
+        selectedAssetIDs = []
+        selectionAnchorID = nil
+        previewSourceFrame = nil
+        previewPhase = .closed
+        previewStepDirection = nil
+        Self.previewLogger.info("preview close finish force=\(force, privacy: .public) phase=\(previousPhase.rawValue, privacy: .public)->closed session=\(self.previewSessionID.uuidString, privacy: .public)")
+    }
+
+    func togglePreview() {
+        switch previewPhase {
+        case .closed:
+            showPreview()
+        case .opening, .open:
+            _ = beginPreviewClose()
+        case .closing:
+            if let previewAssetID {
+                _ = reopenPreviewDuringClose(for: previewAssetID)
+            }
+        }
+    }
+
+    private func schedulePreviewOpenCompletion() {
+        previewOpenTask?.cancel()
+        previewOpenTask = Task { [weak self] in
+            try? await Task.sleep(for: MotionTokens.previewGeometryDuration)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.markPreviewOpen()
+            }
+        }
+    }
+
+    func stepPreview(_ direction: PreviewDirection) {
+        let visible = activeAssets
+        guard visible.count > 1,
+              previewPhase == .opening || previewPhase == .open
+        else { return }
+        let currentID = previewAssetID ?? selectedAssetID
+        let currentIndex = currentID.flatMap { id in visible.firstIndex { $0.id == id } } ?? 0
+        let nextIndex: Int
+        switch direction {
+        case .previous:
+            nextIndex = (currentIndex - 1 + visible.count) % visible.count
+        case .next:
+            nextIndex = (currentIndex + 1) % visible.count
+        }
+        let nextAsset = resolvedPreviewTarget(visible[nextIndex], sourceFrame: nil)
+        previewOpenTask?.cancel()
+        previewSourceRevealTask?.cancel()
+        if previewPhase == .opening {
+            previewPhase = .open
+        }
+        selectedAssetID = nextAsset.id
+        previewSourceHiddenAssetID = nil
+        previewSourceFrame = nil
+        previewStepDirection = direction
+        previewAssetID = nextAsset.id
+        Self.previewLogger.info("preview step direction=\(direction.rawValue, privacy: .public) asset=\(nextAsset.originalName, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
+    }
+
+    func markDeleted(_ asset: LightboxAsset) {
+        let targetAssets: [LightboxAsset]
+        if selectedAssetIDs.count > 1, selectedAssetIDs.contains(asset.id) {
+            let selectedIDs = selectedAssetIDs
+            targetAssets = activeAssets.filter { selectedIDs.contains($0.id) }
+        } else {
+            targetAssets = [asset]
+        }
+
+        moveAssetsToSystemTrash(targetAssets)
+    }
+
+    func deleteSelectedAssets() {
+        let targetAssets: [LightboxAsset]
+        if !selectedAssetIDs.isEmpty {
+            let selectedIDs = selectedAssetIDs
+            targetAssets = activeAssets.filter { selectedIDs.contains($0.id) }
+        } else if let asset = explicitlySelectedAsset {
+            targetAssets = [asset]
+        } else {
+            return
+        }
+
+        moveAssetsToSystemTrash(targetAssets)
+    }
+
+    private func moveAssetsToSystemTrash(_ targetAssets: [LightboxAsset]) {
+        var removedIDs = Set<LightboxAsset.ID>()
+
+        for asset in targetAssets where !asset.isDeleted {
+            guard let sourceURL = asset.sourceURL else { continue }
+            if LightboxLibraryStore.moveToSystemTrash(sourceURL) {
+                removedIDs.insert(asset.id)
+            } else {
+                Self.logger.error("system trash failed id=\(asset.id, privacy: .public) path=\(sourceURL.path, privacy: .public)")
+            }
+        }
+
+        guard !removedIDs.isEmpty else { return }
+
+        assets.removeAll { removedIDs.contains($0.id) }
+        selectedAssetIDs.subtract(removedIDs)
+        if let selectedAssetID, removedIDs.contains(selectedAssetID) {
+            self.selectedAssetID = firstVisibleID(in: selectedAssetIDs)
+        }
+        if let selectionAnchorID, removedIDs.contains(selectionAnchorID) {
+            self.selectionAnchorID = firstVisibleID(in: selectedAssetIDs)
+        }
+        if selectedAssetIDs.isEmpty {
+            selectionAnchorID = nil
+        }
+        if let previewAssetID, removedIDs.contains(previewAssetID) {
+            closePreview()
+        }
+        for assetID in removedIDs {
+            removeFromCompareTray(assetID)
+        }
+    }
+
+    func restore(_ asset: LightboxAsset) {
+        guard let sourceURL = asset.sourceURL,
+              LightboxLibraryStore.isSystemTrashURL(sourceURL)
+        else {
+            return
+        }
+
+        let assetID = asset.id
+        Task { [weak self] in
+            let restored = await LightboxLibraryStore.restoreFromSystemTrash(sourceURL)
+            guard let self else { return }
+
+            guard restored else {
+                Self.logger.error("system trash restore failed id=\(assetID, privacy: .public) path=\(sourceURL.path, privacy: .public)")
+                return
+            }
+
+            finishRestore(assetID)
+        }
+    }
+
+    private func finishRestore(_ assetID: LightboxAsset.ID) {
+        assets.removeAll { $0.id == assetID }
+        selectedAssetIDs.remove(assetID)
+        if selectedAssetID == assetID {
+            selectedAssetID = firstVisibleID(in: selectedAssetIDs)
+        }
+        if selectionAnchorID == assetID {
+            selectionAnchorID = firstVisibleID(in: selectedAssetIDs)
+        }
+        removeFromCompareTray(assetID)
+        scheduleLibraryRefresh()
+    }
+
+    func applyTag(_ tag: String, to asset: LightboxAsset) {
+        guard MacColorTag.isColorTag(tag) else { return }
+        update(asset) { item in
+            var nextTags = item.tags
+            if !nextTags.contains(tag) {
+                nextTags.append(tag)
+            }
+            writeColorTags(nextTags, to: &item)
+        }
+    }
+
+    func toggleTag(_ tag: String, to asset: LightboxAsset) {
+        guard MacColorTag.isColorTag(tag) else { return }
+        let targetIDs: Set<LightboxAsset.ID>
+        if selectedAssetIDs.count > 1, selectedAssetIDs.contains(asset.id) {
+            targetIDs = selectedAssetIDs
+        } else {
+            targetIDs = [asset.id]
+        }
+        let targetAssets = assets.filter { targetIDs.contains($0.id) }
+        let removesTag = !targetAssets.isEmpty && targetAssets.allSatisfy { $0.tags.contains(tag) }
+        var nextAssets = assets
+        var changed = false
+
+        for index in nextAssets.indices where targetIDs.contains(nextAssets[index].id) {
+            var nextTags = nextAssets[index].tags
+            if removesTag {
+                nextTags.removeAll { $0 == tag }
+            } else if !nextTags.contains(tag) {
+                nextTags.append(tag)
+            }
+
+            let previousTags = nextAssets[index].tags
+            writeColorTags(nextTags, to: &nextAssets[index])
+            if nextAssets[index].tags != previousTags {
+                changed = true
+            }
+        }
+
+        if changed {
+            assets = nextAssets
+        }
+    }
+
+    func selectedAssetTagCoverage(for tag: String) -> Double {
+        guard MacColorTag.isColorTag(tag), !selectedAssetIDs.isEmpty else { return 0 }
+        let selectedAssets = assets.filter { selectedAssetIDs.contains($0.id) }
+        guard !selectedAssets.isEmpty else { return 0 }
+        let taggedCount = selectedAssets.filter { $0.tags.contains(tag) }.count
+        return Double(taggedCount) / Double(selectedAssets.count)
+    }
+
+    func toggleTagForSelection(_ tag: String) {
+        guard MacColorTag.isColorTag(tag), !selectedAssetIDs.isEmpty else { return }
+        let targetIDs = selectedAssetIDs
+        let selectedAssets = assets.filter { targetIDs.contains($0.id) }
+        guard !selectedAssets.isEmpty else { return }
+
+        let removesTag = selectedAssets.allSatisfy { $0.tags.contains(tag) }
+        var nextAssets = assets
+        var changed = false
+
+        for index in nextAssets.indices where targetIDs.contains(nextAssets[index].id) {
+            var nextTags = nextAssets[index].tags
+            if removesTag {
+                nextTags.removeAll { $0 == tag }
+            } else if !nextTags.contains(tag) {
+                nextTags.append(tag)
+            }
+
+            let previousTags = nextAssets[index].tags
+            writeColorTags(nextTags, to: &nextAssets[index])
+            if nextAssets[index].tags != previousTags {
+                changed = true
+            }
+        }
+
+        if changed {
+            assets = nextAssets
+        }
+    }
+
+    func revealInFinder(_ asset: LightboxAsset) {
+        guard let url = asset.sourceURL else { return }
+        revealURLInFinder(url)
+    }
+
+    func openWithApplication(_ asset: LightboxAsset, applicationURL: URL?) {
+        let targets = operationTargetAssets(fallback: asset)
+        let urls = existingFileURLs(for: targets)
+        guard !urls.isEmpty else { return }
+
+        if let applicationURL {
+            open(urls, with: applicationURL)
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = localized(.openWith)
+        panel.prompt = localized(.openWith).replacingOccurrences(of: "...", with: "")
+        panel.message = urls.count == 1 ? asset.originalName : selectedCountText(urls.count)
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        panel.treatsFilePackagesAsDirectories = false
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+
+        guard panel.runModal() == .OK,
+              let applicationURL = panel.url
+        else { return }
+
+        open(urls, with: applicationURL)
+    }
+
+    private func operationTargetAssets(fallback asset: LightboxAsset) -> [LightboxAsset] {
+        if selectedAssetIDs.count > 1, selectedAssetIDs.contains(asset.id) {
+            let selectedIDs = selectedAssetIDs
+            return activeAssets.filter { selectedIDs.contains($0.id) }
+        }
+
+        return [asset]
+    }
+
+    private func existingFileURLs(for assets: [LightboxAsset]) -> [URL] {
+        assets.compactMap { asset in
+            guard let url = asset.sourceURL,
+                  FileManager.default.fileExists(atPath: url.path)
+            else {
+                return nil
+            }
+
+            return url
+        }
+    }
+
+    private func open(_ urls: [URL], with applicationURL: URL) {
+        guard !urls.isEmpty else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(urls, withApplicationAt: applicationURL, configuration: configuration) { _, error in
+            if let error {
+                Self.logger.error("open-with failed app=\(applicationURL.path, privacy: .public) count=\(urls.count) error=\(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
+    func revealCurrentFolderInFinder() {
+        let folderURL = isViewingTrash ? LightboxLibraryStore.primarySystemTrashFolder : currentFolderURL
+        revealURLInFinder(folderURL)
+    }
+
+    func revealFolderInFinder(_ folder: LibraryFolderEntry) {
+        revealURLInFinder(folder.url)
+    }
+
+    func revealSidebarURLInFinder(_ url: URL) {
+        revealURLInFinder(url)
+    }
+
+    func isFolderPinned(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        return sources.contains { source in
+            !source.isLocalLibrary && source.rootURL.standardizedFileURL.path == path
+        }
+    }
+
+    func togglePinFolderURL(_ url: URL) {
+        let standardizedURL = url.standardizedFileURL
+        if let source = sources.first(where: {
+            !$0.isLocalLibrary && $0.rootURL.standardizedFileURL.path == standardizedURL.path
+        }) {
+            unpinSource(source.id)
+            return
+        }
+
+        pinFolder(standardizedURL, selectPinnedFolder: false)
+    }
+
+    func openFullDiskAccessSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func revealURLInFinder(_ url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func copyToClipboard(_ asset: LightboxAsset) {
+        let urls = existingFileURLs(for: operationTargetAssets(fallback: asset))
+        guard !urls.isEmpty else { return }
+        ImageClipboardWriter.copyImages(at: urls)
+    }
+
+    func share(_ asset: LightboxAsset, from view: NSView) {
+        let urls = existingFileURLs(for: operationTargetAssets(fallback: asset))
+        guard !urls.isEmpty else { return }
+
+        let picker = NSSharingServicePicker(items: urls)
+        sharingPicker = picker
+        picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+    }
+
+    func chooseLibraryFolder() {
+        let panel = NSOpenPanel()
+        panel.title = localized(.chooseLibraryFolder)
+        panel.prompt = localized(.chooseLibraryFolder).replacingOccurrences(of: "...", with: "")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = libraryFolder
+
+        guard panel.runModal() == .OK,
+              let url = panel.url
+        else {
+            return
+        }
+
+        setLibraryFolder(url)
+    }
+
+    func setLibraryFolder(_ url: URL) {
+        LightboxLibraryStore.setLibraryFolder(url)
+        libraryFolder = url.standardizedFileURL
+        temporarySource = nil
+        LightboxLibraryStore.prepareStorage()
+        sources = sources.map { source in
+            guard source.id == LibrarySource.favoritesID else { return source }
+            return .favorites(rootURL: libraryFolder)
+        }
+        if !sources.contains(where: { $0.id == LibrarySource.favoritesID }) {
+            sources.insert(.favorites(rootURL: libraryFolder), at: 0)
+        }
+        selectedSourceID = LibrarySource.favoritesID
+        LibrarySourceStore.saveSelectedSourceID(selectedSourceID)
+        currentFolderURL = libraryFolder
+        saveCurrentFolderSession()
+        searchText = ""
+        ImageCache.shared.removeAll()
+        restartLibraryMonitor()
+        refreshLibrary()
+        removeDetachedSelection()
+    }
+
+    func refreshLibrary() {
+        let cancelledRefreshTask = refreshTask != nil
+        let cancelledLoadTask = libraryLoadTask != nil
+        let cancelledMetadataTask = assetMetadataTask != nil
+        refreshTask?.cancel()
+        libraryLoadTask?.cancel()
+        assetMetadataTask?.cancel()
+        refreshSerial += 1
+        let refreshID = refreshSerial
+        libraryLoadingStatus = LibraryLoadingStatus(phase: .scanning, processed: 0, total: nil)
+        Self.logger.info("refresh[\(refreshID)] begin trash=\(self.isViewingTrash) source=\(self.selectedSourceID, privacy: .public) sourceKind=\(self.selectedSource?.kind.rawValue ?? "none", privacy: .public) folder=\(self.currentFolderURL.path, privacy: .public) cancelledDebounce=\(cancelledRefreshTask) cancelledLoad=\(cancelledLoadTask) cancelledMetadata=\(cancelledMetadataTask)")
+        if isViewingTrash {
+            folderEntries = []
+            let trashFolders = LightboxLibraryStore.systemTrashFolders
+            libraryLoadTask = Task.detached(priority: .userInitiated) { [weak self] in
+                let startedAt = Date()
+                Self.logger.info("refresh[\(refreshID)] system trash scan task start folders=\(trashFolders.count)")
+                let snapshot = LocalImageSource.loadSystemTrashSnapshot(in: trashFolders)
+
+                await MainActor.run {
+                    guard let self, !Task.isCancelled, self.isViewingTrash else {
+                        Self.logger.info("refresh[\(refreshID)] trash ignored cancelled=\(Task.isCancelled)")
+                        return
+                    }
+                    let applyStartedAt = Date()
+                    self.trashAccessDenied = !snapshot.inaccessibleFolders.isEmpty && snapshot.assets.isEmpty
+                    self.mergeLibrarySnapshot(snapshot.assets)
+                    self.libraryLoadingStatus = nil
+                    Self.logger.info("refresh[\(refreshID)] system trash complete folders=\(trashFolders.count) assets=\(snapshot.assets.count) deniedFolders=\(snapshot.inaccessibleFolders.count) apply=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s total=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+                }
+            }
+            return
+        }
+        trashAccessDenied = false
+
+        guard let source = selectedSource else {
+            libraryLoadingStatus = nil
+            Self.logger.info("refresh[\(refreshID)] no selected source")
+            return
+        }
+        if !FileManager.default.fileExists(atPath: currentFolderURL.path) {
+            Self.logger.info("refresh[\(refreshID)] current folder missing, fallback=\(source.rootURL.path, privacy: .public)")
+            currentFolderURL = source.rootURL
+            saveCurrentFolderSession()
+        }
+
+        let folderURL = currentFolderURL
+        libraryLoadTask = Task.detached(priority: .userInitiated) { [weak self, source] in
+            let startedAt = Date()
+            Self.logger.info("refresh[\(refreshID)] scan task start source=\(source.id, privacy: .public) sourceKind=\(source.kind.rawValue, privacy: .public) folder=\(folderURL.path, privacy: .public)")
+            let cachedDimensions = LightboxIndexStore().cachedDimensions(
+                sourceID: source.id,
+                parentPath: folderURL.path
+            )
+            let directorySnapshot = LocalImageSource.loadFolderSnapshot(
+                in: folderURL,
+                sourceID: source.id,
+                rootURL: source.rootURL,
+                probeMetadata: false,
+                initialMetadataLimit: source.isLocalLibrary ? 120 : 32,
+                cachedDimensions: cachedDimensions
+            )
+            let folders = directorySnapshot.folders
+            let snapshot = directorySnapshot.assets
+
+            await MainActor.run {
+                guard let self,
+                      !Task.isCancelled,
+                      !self.isViewingTrash,
+                      self.selectedSourceID == source.id,
+                      self.currentFolderURL.standardizedFileURL.path == folderURL.standardizedFileURL.path
+                else {
+                    Self.logger.info("refresh[\(refreshID)] ignored cancelled=\(Task.isCancelled) folder=\(folderURL.path, privacy: .public)")
+                    return
+                }
+
+                let applyStartedAt = Date()
+                self.folderEntries = folders
+                let mergeStartedAt = Date()
+                self.mergeLibrarySnapshot(snapshot)
+                let mergeSeconds = Date().timeIntervalSince(mergeStartedAt)
+                Self.logger.info("refresh[\(refreshID)] scan complete entries=\(directorySnapshot.entryCount) folders=\(folders.count) assets=\(snapshot.count) read=\(directorySnapshot.directoryReadSeconds, format: .fixed(precision: 2))s classify=\(directorySnapshot.classificationSeconds, format: .fixed(precision: 2))s metadataProbe=\(directorySnapshot.metadataProbeSeconds, format: .fixed(precision: 2))s sort=\(directorySnapshot.sortSeconds, format: .fixed(precision: 2))s merge=\(mergeSeconds, format: .fixed(precision: 2))s scanTotal=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+                self.libraryLoadingStatus = nil
+                self.scheduleVisibleSnapshotIndex(
+                    source: source,
+                    folderURL: folderURL,
+                    folders: folders,
+                    assets: snapshot,
+                    refreshID: refreshID
+                )
+                let dimensionRefreshLimit = source.isLocalLibrary ? snapshot.count : min(snapshot.count, 900)
+                self.startAssetMetadataRefresh(
+                    snapshot,
+                    folderURL: folderURL,
+                    sourceID: source.id,
+                    refreshID: refreshID,
+                    metadataLimit: dimensionRefreshLimit,
+                    tagLimit: snapshot.count,
+                    loadsFinderTags: true
+                )
+                Self.logger.info("refresh[\(refreshID)] apply complete applyTotal=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s folderEntries=\(self.folderEntries.count) storeAssets=\(self.assets.count) visibleSnapshotAssets=\(snapshot.count)")
+            }
+        }
+    }
+
+    func importSelectedFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        importTask?.cancel()
+        importTask = Task { [weak self] in
+            await self?.simulateImport(urls: urls)
+        }
+    }
+
+    func handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty else { return false }
+        if LightboxDragState.isDraggingAsset || providers.contains(where: Self.isInternalAssetDrag) {
+            isDropTargeted = false
+            return false
+        }
+
+        isDropTargeted = false
+        importTask?.cancel()
+        let targetFolder = LightboxLibraryStore.favoritesImportedFolder
+        importTask = Task { [weak self] in
+            let urls = await Self.importedURLs(from: providers, libraryFolder: targetFolder)
+            await self?.simulateImport(urls: urls, fallbackCount: urls.isEmpty ? providers.count : nil)
+        }
+        return true
+    }
+
+    private static func isInternalAssetDrag(_ provider: NSItemProvider) -> Bool {
+        provider.hasItemConformingToTypeIdentifier(LightboxPasteboardTypes.internalAssetDragIdentifier)
+    }
+
+    private static func importedURLs(from providers: [NSItemProvider], libraryFolder: URL) async -> [URL] {
+        var urls: [URL] = []
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
+               let url = await fileURL(from: provider) {
+                urls.append(url)
+                continue
+            }
+
+            if let url = await imageRepresentationURL(from: provider, libraryFolder: libraryFolder) {
+                urls.append(url)
+            }
+        }
+
+        return urls
+    }
+
+    private static func fileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                continuation.resume(returning: url(from: item))
+            }
+        }
+    }
+
+    private static func imageRepresentationURL(from provider: NSItemProvider, libraryFolder: URL) async -> URL? {
+        let imageTypeIdentifiers = provider.registeredTypeIdentifiers.filter { identifier in
+            UTType(identifier)?.conforms(to: .image) == true
+        }
+        let preferredName = await preferredFileName(from: provider)
+
+        for identifier in imageTypeIdentifiers {
+            if let url = await persistedFileRepresentation(
+                from: provider,
+                typeIdentifier: identifier,
+                libraryFolder: libraryFolder,
+                preferredName: preferredName
+            ) {
+                return url
+            }
+
+            if let data = await dataRepresentation(from: provider, typeIdentifier: identifier),
+               let url = ImportedImageStore.persist(
+                   data: data,
+                   suggestedName: preferredName,
+                    typeIdentifier: identifier,
+                    libraryFolder: libraryFolder
+               ) {
+                return url
+            }
+        }
+
+        return nil
+    }
+
+    private static func persistedFileRepresentation(
+        from provider: NSItemProvider,
+        typeIdentifier: String,
+        libraryFolder: URL,
+        preferredName: String?
+    ) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, _ in
+                let persistedURL = url.flatMap {
+                    ImportedImageStore.persist(
+                        $0,
+                        libraryFolder: libraryFolder,
+                        preferredName: preferredName
+                    )
+                }
+                continuation.resume(returning: persistedURL)
+            }
+        }
+    }
+
+    private static func dataRepresentation(from provider: NSItemProvider, typeIdentifier: String) async -> Data? {
+        await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    private static func preferredFileName(from provider: NSItemProvider) async -> String? {
+        if let suggestedName = sanitizedFileName(provider.suggestedName) {
+            return suggestedName
+        }
+
+        if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier),
+           let sourceURL = await urlItem(from: provider, typeIdentifier: UTType.url.identifier),
+           let name = sanitizedFileName(sourceURL.lastPathComponent) {
+            return name
+        }
+
+        return nil
+    }
+
+    private static func urlItem(from provider: NSItemProvider, typeIdentifier: String) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadItem(forTypeIdentifier: typeIdentifier, options: nil) { item, _ in
+                continuation.resume(returning: url(from: item))
+            }
+        }
+    }
+
+    private static func sanitizedFileName(_ name: String?) -> String? {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else {
+            return nil
+        }
+
+        return URL(fileURLWithPath: trimmed).lastPathComponent
+    }
+
+    nonisolated private static func url(from item: NSSecureCoding?) -> URL? {
+        if let url = item as? URL {
+            return url
+        }
+
+        if let data = item as? Data {
+            if let url = URL(dataRepresentation: data, relativeTo: nil) {
+                return url
+            }
+
+            if let string = String(data: data, encoding: .utf8) {
+                return URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+
+        if let string = item as? String {
+            return URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return nil
+    }
+
+    private func simulateImport(urls: [URL], fallbackCount: Int? = nil) async {
+        let total = max(urls.count, fallbackCount ?? 0)
+        guard total > 0 else { return }
+        showLibraryImportedFolder()
+        importProgress = ImportProgress(processed: 0, total: total)
+
+        for index in 0..<total {
+            if Task.isCancelled { return }
+            if let asset = makeImportedAsset(url: urls.indices.contains(index) ? urls[index] : nil, index: index) {
+                assets.insert(asset, at: 0)
+                selectedAssetIDs = []
+                selectionAnchorID = nil
+                selectedAssetID = asset.id
+            }
+            importProgress = ImportProgress(processed: index + 1, total: total)
+        }
+
+        try? await Task.sleep(for: .milliseconds(420))
+        importProgress = nil
+        refreshLibrary()
+    }
+
+    private func makeImportedAsset(url: URL?, index: Int) -> LightboxAsset? {
+        let importedURL = url.flatMap {
+            ImportedImageStore.persist($0, libraryFolder: LightboxLibraryStore.favoritesImportedFolder)
+        } ?? url
+        if let importedURL,
+           assets.contains(where: { $0.sourceURL?.standardizedFileURL.path == importedURL.standardizedFileURL.path }) {
+            return nil
+        }
+
+        let size = importedURL.flatMap(ImageProbe.dimensions) ?? MockLibrary.importFallbackSizes[index % MockLibrary.importFallbackSizes.count]
+        let name = importedURL?.lastPathComponent ?? "Dropped image \(index + 1)"
+        let addedAt = Date()
+        return LightboxAsset(
+            originalName: name,
+            width: size.width,
+            height: size.height,
+            tags: importedURL.map(FinderTagStore.colorTags) ?? [],
+            sourceURL: importedURL,
+            addedAt: addedAt,
+            fileSize: importedURL.flatMap(LocalImageSource.fileSize(for:)),
+            palette: MockPalette.imported[index % MockPalette.imported.count]
+        )
+    }
+
+    private func showLibraryImportedFolder() {
+        LightboxLibraryStore.prepareStorage()
+        temporarySource = nil
+
+        if !sources.contains(where: { $0.id == LibrarySource.favoritesID }) {
+            sources.insert(.favorites(rootURL: libraryFolder), at: 0)
+        }
+
+        selectedSourceID = LibrarySource.favoritesID
+        LibrarySourceStore.saveSelectedSourceID(selectedSourceID)
+        selectedFilter = .all
+        currentFolderURL = LightboxLibraryStore.favoritesImportedFolder
+        folderEntries = []
+        restartLibraryMonitor()
+    }
+
+    private func scheduleLibraryRefresh() {
+        Self.logger.info("refresh schedule debounce folder=\(self.currentFolderURL.path, privacy: .public) trash=\(self.isViewingTrash)")
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(260))
+            guard !Task.isCancelled else { return }
+            self?.refreshLibrary()
+        }
+    }
+
+    private func restartLibraryMonitor() {
+        libraryDirectoryMonitor?.stop()
+        let monitoredURL = isViewingTrash ? LightboxLibraryStore.primarySystemTrashFolder : currentFolderURL
+        if !isViewingTrash, selectedSource?.isLocalLibrary == false {
+            libraryDirectoryMonitor = nil
+            Self.logger.info("monitor skipped external source path=\(monitoredURL.path, privacy: .public)")
+            return
+        }
+
+        Self.logger.info("monitor restart path=\(monitoredURL.path, privacy: .public) trash=\(self.isViewingTrash)")
+        let monitor = DirectoryChangeMonitor(url: monitoredURL)
+        libraryDirectoryMonitor = monitor
+        monitor.start { [weak self] in
+            self?.scheduleLibraryRefresh()
+        }
+    }
+
+    private func mergeLibrarySnapshot(_ snapshot: [LightboxAsset]) {
+        let snapshotByPath = Dictionary(
+            snapshot.compactMap { asset -> (String, LightboxAsset)? in
+                guard let key = sourceKey(for: asset) else { return nil }
+                return (key, asset)
+            },
+            uniquingKeysWith: { existing, _ in existing }
+        )
+
+        var retainedKeys = Set<String>()
+        let retainedAssets = assets.compactMap { existing -> LightboxAsset? in
+            guard let key = sourceKey(for: existing),
+                  let refreshed = snapshotByPath[key]
+            else {
+                return nil
+            }
+
+            var existing = existing
+            existing.originalName = refreshed.originalName
+            existing.addedAt = refreshed.addedAt
+            existing.fileSize = refreshed.fileSize
+            if refreshed.metadataLoaded || !existing.metadataLoaded {
+                existing.width = refreshed.width
+                existing.height = refreshed.height
+                existing.tags = refreshed.tags
+                existing.metadataLoaded = refreshed.metadataLoaded
+            }
+            existing.sourceURL = refreshed.sourceURL
+            existing.palette = refreshed.palette
+            existing.deletedAt = refreshed.deletedAt
+            retainedKeys.insert(key)
+            return existing
+        }
+
+        let addedAssets = snapshot.filter { asset in
+            guard let key = sourceKey(for: asset) else { return true }
+            return !retainedKeys.contains(key)
+        }
+
+        assets = addedAssets + retainedAssets
+        removeDetachedSelection()
+    }
+
+    private func startAssetMetadataRefresh(
+        _ snapshot: [LightboxAsset],
+        folderURL: URL,
+        sourceID: LibrarySource.ID,
+        refreshID: Int,
+        metadataLimit: Int,
+        tagLimit: Int,
+        loadsFinderTags: Bool
+    ) {
+        let targets = snapshot.enumerated().compactMap { index, asset -> AssetMetadataTarget? in
+            let shouldLoadDimensions = index < metadataLimit && !asset.metadataLoaded
+            let shouldLoadTags = loadsFinderTags && index < tagLimit
+            guard (shouldLoadDimensions || shouldLoadTags), let url = asset.sourceURL else { return nil }
+            return AssetMetadataTarget(
+                id: asset.id,
+                url: url,
+                shouldLoadDimensions: shouldLoadDimensions,
+                shouldLoadTags: shouldLoadTags
+            )
+        }
+
+        guard !targets.isEmpty else {
+            Self.logger.info("refresh[\(refreshID)] metadata skipped no assets")
+            return
+        }
+
+        Self.logger.info("refresh[\(refreshID)] metadata begin total=\(targets.count) dimensionLimit=\(metadataLimit) tagLimit=\(tagLimit) tags=\(loadsFinderTags) folder=\(folderURL.path, privacy: .public)")
+
+        assetMetadataTask = Task.detached(priority: .background) { [weak self] in
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled else { return }
+            let startedAt = Date()
+            let dimensionIndexStore = LightboxIndexStore()
+            var batch: [AssetMetadataUpdate] = []
+            var processedCount = 0
+            let progressInterval = 160
+
+            for target in targets {
+                guard !Task.isCancelled else {
+                    Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
+                    return
+                }
+
+                let size = target.shouldLoadDimensions ? ImageProbe.dimensions(for: target.url) : nil
+                let tags = target.shouldLoadTags ? FinderTagStore.colorTags(for: target.url) : nil
+                processedCount += 1
+
+                if size != nil || tags != nil {
+                    batch.append(AssetMetadataUpdate(
+                        id: target.id,
+                        url: target.url,
+                        width: size?.width,
+                        height: size?.height,
+                        tags: tags
+                    ))
+                }
+
+                if batch.count >= 160 || processedCount % progressInterval == 0 {
+                    let updates = batch
+                    batch.removeAll(keepingCapacity: true)
+                    dimensionIndexStore.updateCachedDimensions(
+                        sourceID: sourceID,
+                        updates: updates.compactMap {
+                            guard let width = $0.width, let height = $0.height else { return nil }
+                            return IndexedAssetDimensions(url: $0.url, width: width, height: height)
+                        }
+                    )
+                    await MainActor.run {
+                        self?.applyAssetMetadataUpdates(
+                            updates,
+                            processedCount: processedCount,
+                            totalCount: targets.count,
+                            folderURL: folderURL,
+                            sourceID: sourceID,
+                            refreshID: refreshID
+                        )
+                    }
+                }
+
+                if processedCount % 80 == 0 {
+                    try? await Task.sleep(for: .milliseconds(6))
+                }
+            }
+
+            if !batch.isEmpty || processedCount > 0 {
+                dimensionIndexStore.updateCachedDimensions(
+                    sourceID: sourceID,
+                    updates: batch.compactMap {
+                        guard let width = $0.width, let height = $0.height else { return nil }
+                        return IndexedAssetDimensions(url: $0.url, width: width, height: height)
+                    }
+                )
+                await MainActor.run {
+                    self?.applyAssetMetadataUpdates(
+                        batch,
+                        processedCount: processedCount,
+                        totalCount: targets.count,
+                        folderURL: folderURL,
+                        sourceID: sourceID,
+                        refreshID: refreshID
+                    )
+                }
+            }
+
+            await MainActor.run {
+                self?.finishAssetMetadataRefresh(
+                    folderURL: folderURL,
+                    sourceID: sourceID,
+                    refreshID: refreshID,
+                    elapsed: Date().timeIntervalSince(startedAt)
+                )
+            }
+        }
+    }
+
+    private func scheduleVisibleSnapshotIndex(
+        source: LibrarySource,
+        folderURL: URL,
+        folders: [LibraryFolderEntry],
+        assets: [LightboxAsset],
+        refreshID: Int
+    ) {
+        indexWriteTask?.cancel()
+        indexWriteTask = Task.detached(priority: .utility) {
+            let startedAt = Date()
+            let store = LightboxIndexStore()
+            store.upsertSource(source)
+            store.replaceVisibleSnapshot(
+                source: source,
+                folderURL: folderURL,
+                folders: folders,
+                assets: assets
+            )
+            Self.logger.info("refresh[\(refreshID)] index scheduled write finished seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))")
+        }
+    }
+
+    private func applyAssetMetadataUpdates(
+        _ updates: [AssetMetadataUpdate],
+        processedCount: Int,
+        totalCount: Int,
+        folderURL: URL,
+        sourceID: LibrarySource.ID,
+        refreshID: Int
+    ) {
+        guard !isViewingTrash,
+              selectedSourceID == sourceID,
+              currentFolderURL.standardizedFileURL.path == folderURL.standardizedFileURL.path
+        else {
+            Self.logger.info("refresh[\(refreshID)] metadata batch ignored processed=\(processedCount)/\(totalCount)")
+            return
+        }
+
+        Self.logger.info("refresh[\(refreshID)] metadata batch processed=\(processedCount)/\(totalCount) updates=\(updates.count)")
+
+        let updatesByID = Dictionary(uniqueKeysWithValues: updates.map { ($0.id, $0) })
+        var nextAssets = assets
+        var changed = false
+
+        for index in nextAssets.indices {
+            guard let update = updatesByID[nextAssets[index].id] else { continue }
+            if let width = update.width, let height = update.height {
+                nextAssets[index].width = width
+                nextAssets[index].height = height
+                nextAssets[index].metadataLoaded = true
+            }
+            if let tags = update.tags {
+                nextAssets[index].tags = tags
+            }
+            changed = true
+        }
+
+        if changed {
+            assets = nextAssets
+        }
+    }
+
+    private func finishAssetMetadataRefresh(
+        folderURL: URL,
+        sourceID: LibrarySource.ID,
+        refreshID: Int,
+        elapsed: TimeInterval
+    ) {
+        guard !isViewingTrash,
+              selectedSourceID == sourceID,
+              currentFolderURL.standardizedFileURL.path == folderURL.standardizedFileURL.path
+        else {
+            Self.logger.info("refresh[\(refreshID)] metadata finish ignored")
+            return
+        }
+
+        Self.logger.info("refresh[\(refreshID)] metadata finish seconds=\(elapsed, format: .fixed(precision: 2))")
+    }
+
+    private func rebuildActiveAssets() {
+        let filtered: [LightboxAsset] = switch selectedFilter {
+        case .all:
+            sortedAssets(assets.filter { !$0.isDeleted })
+        case .tag(let tag):
+            sortedAssets(assets.filter { !$0.isDeleted && $0.tags.contains(tag) })
+        case .trash:
+            sortedAssets(assets.filter(\.isDeleted))
+        }
+
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            cachedActiveAssets = filtered
+            return
+        }
+
+        cachedActiveAssets = filtered.filter {
+            $0.originalName.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private func sortedAssets(_ items: [LightboxAsset]) -> [LightboxAsset] {
+        GalleryAssetSorter.sorted(items, field: sortField, direction: sortDirection)
+    }
+
+    private func removeDetachedSelection() {
+        let assetIDs = Set(assets.map(\.id))
+
+        if let selectedAssetID, !assetIDs.contains(selectedAssetID) {
+            self.selectedAssetID = nil
+        }
+
+        selectedAssetIDs = selectedAssetIDs.filter { assetIDs.contains($0) }
+        if let selectionAnchorID, !assetIDs.contains(selectionAnchorID) {
+            self.selectionAnchorID = firstVisibleID(in: selectedAssetIDs)
+        }
+
+        if let previewAssetID, !assetIDs.contains(previewAssetID) {
+            previewOpenTask?.cancel()
+            previewCloseTask?.cancel()
+            previewSourceRevealTask?.cancel()
+            self.previewAssetID = nil
+            previewSourceHiddenAssetID = nil
+            previewInteractionLayerReady = false
+            previewSourceFrame = nil
+            previewPhase = .closed
+            previewSessionID = UUID()
+            previewStepDirection = nil
+        }
+    }
+
+    private func update(_ asset: LightboxAsset, body: (inout LightboxAsset) -> Void) {
+        guard let index = assets.firstIndex(where: { $0.id == asset.id }) else { return }
+        body(&assets[index])
+    }
+
+    private func writeColorTags(_ tags: [String], to asset: inout LightboxAsset) {
+        let sortedTags = MacColorTag.sort(tags.filter(MacColorTag.isColorTag))
+        guard let url = asset.sourceURL else {
+            asset.tags = sortedTags
+            return
+        }
+
+        if FinderTagStore.setColorTags(sortedTags, for: url) {
+            asset.tags = sortedTags
+        }
+    }
+
+    private func sourceKey(for asset: LightboxAsset) -> String? {
+        asset.sourceURL?.standardizedFileURL.path
+    }
+
+    private func toggleSelection(_ asset: LightboxAsset) {
+        if selectedAssetIDs.contains(asset.id) {
+            selectedAssetIDs.remove(asset.id)
+            selectedAssetID = firstVisibleID(in: selectedAssetIDs)
+            if selectedAssetIDs.isEmpty {
+                selectionAnchorID = nil
+            }
+        } else {
+            selectedAssetIDs.insert(asset.id)
+            selectedAssetID = asset.id
+            selectionAnchorID = asset.id
+        }
+    }
+
+    private func selectRange(to asset: LightboxAsset, extending: Bool) {
+        let visibleIDs = activeAssets.map(\.id)
+        let anchorID = selectionAnchorID ?? selectedAssetID ?? firstVisibleID(in: selectedAssetIDs) ?? asset.id
+
+        guard let anchorIndex = visibleIDs.firstIndex(of: anchorID),
+              let targetIndex = visibleIDs.firstIndex(of: asset.id)
+        else {
+            replaceSelection(with: [asset.id], primary: asset.id, anchor: asset.id)
+            return
+        }
+
+        let bounds = min(anchorIndex, targetIndex)...max(anchorIndex, targetIndex)
+        let rangeIDs = Set(visibleIDs[bounds])
+        let newSelection = extending ? selectedAssetIDs.union(rangeIDs) : rangeIDs
+        replaceSelection(with: newSelection, primary: asset.id, anchor: anchorID)
+    }
+
+    private func replaceSelection(
+        with ids: Set<LightboxAsset.ID>,
+        primary: LightboxAsset.ID?,
+        anchor: LightboxAsset.ID?
+    ) {
+        selectedAssetIDs = ids
+        selectedAssetID = primary
+        selectionAnchorID = ids.isEmpty ? nil : anchor
+    }
+
+    private func firstVisibleID(in ids: Set<LightboxAsset.ID>) -> LightboxAsset.ID? {
+        activeAssets.first { ids.contains($0.id) }?.id
+    }
+
+    nonisolated private static func frameDescription(_ frame: CGRect?) -> String {
+        guard let frame else { return "nil" }
+        return String(format: "x=%.1f y=%.1f w=%.1f h=%.1f", frame.minX, frame.minY, frame.width, frame.height)
+    }
+
+    nonisolated private static func clickDescription(_ click: LightboxClickContext?, sourceFrame: CGRect?) -> String {
+        LightboxClickFormatter.describe(click, previewSpacePoint: click?.mappedTopLeftPoint(in: sourceFrame))
+    }
+
+    nonisolated private static func distance(from point: CGPoint, to frame: CGRect) -> CGFloat {
+        let dx: CGFloat
+        if point.x < frame.minX {
+            dx = frame.minX - point.x
+        } else if point.x > frame.maxX {
+            dx = point.x - frame.maxX
+        } else {
+            dx = 0
+        }
+
+        let dy: CGFloat
+        if point.y < frame.minY {
+            dy = frame.minY - point.y
+        } else if point.y > frame.maxY {
+            dy = point.y - frame.maxY
+        } else {
+            dy = 0
+        }
+
+        return hypot(dx, dy)
+    }
+
+    nonisolated private static func durationDescription(_ duration: Duration) -> String {
+        "\(duration)"
+    }
+}
+
+enum PreviewDirection {
+    case previous
+    case next
+
+    var rawValue: String {
+        switch self {
+        case .previous:
+            "previous"
+        case .next:
+            "next"
+        }
+    }
+}
+
+private struct AssetMetadataTarget: Sendable {
+    var id: LightboxAsset.ID
+    var url: URL
+    var shouldLoadDimensions: Bool
+    var shouldLoadTags: Bool
+}
+
+private struct AssetMetadataUpdate: Sendable {
+    var id: LightboxAsset.ID
+    var url: URL
+    var width: CGFloat?
+    var height: CGFloat?
+    var tags: [String]?
+}
+
+struct LibraryLoadingStatus: Equatable, Sendable {
+    enum Phase: Equatable, Sendable {
+        case scanning
+        case preparingPreviews
+    }
+
+    var phase: Phase
+    var processed: Int
+    var total: Int?
+}
+
+private enum PreviewPhase: String {
+    case closed
+    case opening
+    case open
+    case closing
+}
