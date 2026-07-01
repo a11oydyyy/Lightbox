@@ -1,0 +1,13 @@
+.DS_Store
+/.codex
+/.codex-memory
+/.build
+/dist
+/Packages
+xcuserdata/
+DerivedData/
+.env
+.env.*
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
