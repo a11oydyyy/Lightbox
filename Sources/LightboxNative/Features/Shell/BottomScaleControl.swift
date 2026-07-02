@@ -235,6 +235,10 @@ private struct BottomTagFilterStrip: View {
                 ) {
                     withAnimation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion)) {
                         appState.selectedFilter = appState.selectedFilter == .tag(tag.name) ? .all : .tag(tag.name)
+                    }
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
                         appState.clearSelection()
                     }
                 }

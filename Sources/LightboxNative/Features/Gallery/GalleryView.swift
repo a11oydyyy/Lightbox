@@ -182,17 +182,23 @@ struct GalleryView: View {
         }
     }
 
-    // Quiet empty state for a folder/library with nothing to show. Shown only
+    // Quiet empty state for a folder with nothing to show. Shown only
     // when there are no images and no subfolders, and we're not loading/trash.
     private var showsEmptyState: Bool {
         !appState.isViewingTrash
             && appState.libraryLoadingStatus == nil
+            && appState.searchStatus?.isSearching != true
             && appState.activeAssets.isEmpty
-            && (!appState.showFolderCards || appState.folderEntries.isEmpty)
+            && visibleFolderEntries.isEmpty
     }
 
     private var hasSearchQuery: Bool {
-        !appState.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        appState.hasSearchQuery
+    }
+
+    private var visibleFolderEntries: [LibraryFolderEntry] {
+        guard appState.showFolderCards, !appState.isViewingTrash else { return [] }
+        return appState.activeFolderEntries
     }
 
     private var emptyStateSymbol: String {
@@ -225,16 +231,21 @@ struct GalleryView: View {
             let thumbnailQuality = galleryThumbnailQuality(assetCount: activeAssets.count, performanceProfile: performanceProfile)
             let usesReducedHover = appState.libraryLoadingStatus != nil || performanceProfile.reducesHoverEffects
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
+            let visibleFolders = visibleFolderEntries
+            let searchGroups = appState.hasSearchQuery ? appState.searchAssetGroups : []
+            let shouldGroupSearchAssets = appState.hasSearchQuery && searchGroups.count > 1
+            let showsSearchLimitHint = appState.searchStatus?.limitReached == true
 
             ZStack(alignment: .trailing) {
                 ScrollView(.vertical) {
                     VStack(spacing: 0) {
                         ScrollOffsetProbe()
 
-                        if appState.showFolderCards && !appState.folderEntries.isEmpty && !appState.isViewingTrash {
+                        if !visibleFolders.isEmpty {
                             FolderRowView(
-                                folders: appState.folderEntries,
-                                showInFinderTitle: appState.localized(.showInFinder)
+                                folders: visibleFolders,
+                                showInFinderTitle: appState.localized(.showInFinder),
+                                showsRelativePath: appState.hasSearchQuery
                             ) { folder in
                                 appState.openFolder(folder)
                             } reveal: { folder in
@@ -247,19 +258,52 @@ struct GalleryView: View {
                             .background(FolderRowFrameProbe())
                         }
 
-                        assetGrid(
-                            activeAssets: activeAssets,
-                            viewportWidth: viewport.size.width,
-                            loadableAssetIDs: loadableAssetIDs,
-                            prioritizedAssetIDs: prioritizedAssetIDs,
-                            thumbnailQuality: thumbnailQuality,
-                            prefersFastRawThumbnails: prefersFastRawThumbnails,
-                            usesReducedHover: usesReducedHover,
-                            performanceProfile: performanceProfile,
-                            menuTitles: assetMenuTitles
-                        )
-                        .padding(.top, appState.folderEntries.isEmpty || appState.isViewingTrash || !appState.showFolderCards ? 70 : 0)
-                        .padding(.horizontal, horizontalPadding)
+                        if showsSearchLimitHint {
+                            SearchLimitHint(message: appState.localized(.searchResultsLimited))
+                                .padding(.top, visibleFolders.isEmpty ? 70 : 0)
+                                .padding(.horizontal, horizontalPadding)
+                                .padding(.bottom, 14)
+                        }
+
+                        Group {
+                            if shouldGroupSearchAssets {
+                                LazyVStack(spacing: 18) {
+                                    ForEach(searchGroups) { group in
+                                        VStack(alignment: .leading, spacing: 10) {
+                                            SearchGroupHeader(title: group.title, count: group.assets.count)
+                                                .padding(.horizontal, horizontalPadding)
+
+                                            assetGrid(
+                                                activeAssets: group.assets,
+                                                viewportWidth: viewport.size.width,
+                                                loadableAssetIDs: loadableAssetIDs,
+                                                prioritizedAssetIDs: prioritizedAssetIDs,
+                                                thumbnailQuality: thumbnailQuality,
+                                                prefersFastRawThumbnails: prefersFastRawThumbnails,
+                                                usesReducedHover: usesReducedHover,
+                                                performanceProfile: performanceProfile,
+                                                menuTitles: assetMenuTitles
+                                            )
+                                            .padding(.horizontal, horizontalPadding)
+                                        }
+                                    }
+                                }
+                            } else {
+                                assetGrid(
+                                    activeAssets: activeAssets,
+                                    viewportWidth: viewport.size.width,
+                                    loadableAssetIDs: loadableAssetIDs,
+                                    prioritizedAssetIDs: prioritizedAssetIDs,
+                                    thumbnailQuality: thumbnailQuality,
+                                    prefersFastRawThumbnails: prefersFastRawThumbnails,
+                                    usesReducedHover: usesReducedHover,
+                                    performanceProfile: performanceProfile,
+                                    menuTitles: assetMenuTitles
+                                )
+                                .padding(.horizontal, horizontalPadding)
+                            }
+                        }
+                        .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? 70 : 0)
                         .padding(.bottom, 92)
                         .background(ContentHeightProbe())
                         .opacity(contentVisible ? 1 : 0)
@@ -368,14 +412,26 @@ struct GalleryView: View {
                 }
 
                 if showsEmptyState {
-                    GalleryEmptyState(symbol: emptyStateSymbol, title: emptyStateTitle)
+                    GalleryEmptyState(
+                        symbol: emptyStateSymbol,
+                        title: emptyStateTitle
+                    )
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                         .padding(.top, 70)
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
                 }
+
+                if appState.searchStatus?.isSearching == true {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.regular)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                        .padding(.top, 70)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
             }
             .coordinateSpace(name: "GallerySelectionSpace")
-            .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.selectedAssetCount > 1)
             .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.libraryLoadingStatus)
             .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: showsEmptyState)
         }
@@ -714,16 +770,6 @@ struct GalleryView: View {
         } label: {
             Text(appState.localized(.showInFinder))
         }
-
-        Divider()
-
-        if !appState.isViewingTrash {
-            Button {
-                appState.showFileImporter = true
-            } label: {
-                Text(appState.localized(.importImages))
-            }
-        }
     }
 }
 
@@ -789,6 +835,71 @@ private struct GalleryEmptyState: View {
                 .foregroundStyle(.primary.opacity(0.46))
         }
         .allowsHitTesting(false)
+    }
+}
+
+private struct SearchGroupHeader: View {
+    var title: String
+    var count: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.70))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Text("\(count)")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.secondary.opacity(0.72))
+                .monospacedDigit()
+
+            Rectangle()
+                .fill(.secondary.opacity(0.16))
+                .frame(height: 1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct SearchLimitHint: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.lightboxGlassOpacity) private var glassOpacity
+
+    var message: String
+
+    var body: some View {
+        let materialOpacity = GlassTokens.floatingCapsuleMaterialOpacity(glassOpacity)
+        let fillOpacity = GlassTokens.floatingCapsuleFillOpacity(glassOpacity, colorScheme: colorScheme)
+        let strokeOpacity = GlassTokens.floatingCapsuleStrokeOpacity(glassOpacity)
+        let shadowOpacity = GlassTokens.floatingCapsuleShadowOpacity(glassOpacity)
+
+        HStack(spacing: 7) {
+            Image(systemName: "exclamationmark.circle")
+                .font(.system(size: 12, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(Color.primary.opacity(0.52))
+
+            Text(message)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.primary.opacity(0.66))
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .background(.ultraThinMaterial.opacity(materialOpacity), in: Capsule())
+        .background {
+            Capsule()
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(fillOpacity))
+        }
+        .overlay {
+            Capsule()
+                .stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
+        }
+        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 4)
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 
@@ -861,13 +972,14 @@ private struct FolderRowView: View {
 
     var folders: [LibraryFolderEntry]
     var showInFinderTitle: String
+    var showsRelativePath = false
     var open: (LibraryFolderEntry) -> Void
     var reveal: (LibraryFolderEntry) -> Void
 
-    // Width is user-controlled via the folder slider (bottom control). Equal
-    // min/max gives exact-width tiles; adaptive packs as many as fit.
+    // The slider controls the minimum tile width; adaptive columns then stretch
+    // to consume the row so wide windows do not leave a large blank gutter.
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: CGFloat(folderTileWidth), maximum: CGFloat(folderTileWidth)), spacing: 10, alignment: .leading)]
+        [GridItem(.adaptive(minimum: CGFloat(folderTileWidth)), spacing: 10, alignment: .leading)]
     }
 
     var body: some View {
@@ -884,15 +996,29 @@ private struct FolderRowView: View {
                             .symbolRenderingMode(.hierarchical)
                             .foregroundStyle(iconColor)
 
-                        Text(folder.name)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.primary.opacity(0.88))
-                            .lineLimit(2)
-                            .truncationMode(.middle)
-                            .multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(folder.name)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.primary.opacity(0.88))
+                                .lineLimit(showsRelativePath ? 1 : 2)
+                                .truncationMode(.middle)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            if showsRelativePath,
+                               !folder.relativePath.isEmpty,
+                               folder.relativePath != folder.name {
+                                Text(folder.relativePath)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.secondary.opacity(0.78))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
 
                         Spacer(minLength: 4)
+
+                        FolderTagDots(tags: folder.tags)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
@@ -950,6 +1076,28 @@ private struct FolderRowView: View {
         }
 
         return .black.opacity(0.06)
+    }
+}
+
+private struct FolderTagDots: View {
+    var tags: [String]
+
+    private var visibleTags: [MacColorTag] {
+        MacColorTag.all.filter { tags.contains($0.name) }
+    }
+
+    var body: some View {
+        HStack(spacing: MacTagDotMetrics.sidebarSpacing) {
+            ForEach(visibleTags.prefix(3)) { tag in
+                Circle()
+                    .fill(tag.color)
+                    .frame(
+                        width: MacTagDotMetrics.sidebarDotDiameter,
+                        height: MacTagDotMetrics.sidebarDotDiameter
+                    )
+            }
+        }
+        .frame(minWidth: visibleTags.isEmpty ? 0 : 19, alignment: .trailing)
     }
 }
 

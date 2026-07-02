@@ -25,6 +25,7 @@ struct SquareGridLayout: Layout {
             let y = bounds.minY + CGFloat(row) * (metrics.itemWidth + spacing)
             subviews[index].place(
                 at: CGPoint(x: x, y: y),
+                anchor: .topLeading,
                 proposal: ProposedViewSize(width: metrics.itemWidth, height: metrics.itemWidth)
             )
         }

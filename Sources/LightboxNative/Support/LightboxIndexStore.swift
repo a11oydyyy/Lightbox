@@ -14,6 +14,13 @@ struct IndexedAssetDimensions: Sendable {
     var height: CGFloat
 }
 
+struct IndexedAssetMetadata: Sendable {
+    var url: URL
+    var width: CGFloat?
+    var height: CGFloat?
+    var tags: [String]?
+}
+
 final class LightboxIndexStore {
     private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Index")
     private static let dimensionCacheVersion = 2
@@ -94,7 +101,8 @@ final class LightboxIndexStore {
                 fileSize: nil,
                 mtime: mtime,
                 width: nil,
-                height: nil
+                height: nil,
+                tags: folder.tags
             )
         }
 
@@ -122,6 +130,7 @@ final class LightboxIndexStore {
                 mtime: mtime,
                 width: asset.metadataLoaded ? Double(asset.width) : nil,
                 height: asset.metadataLoaded ? Double(asset.height) : nil,
+                tags: asset.tags,
                 metadataLoaded: asset.metadataLoaded
             )
             insertedAssets += 1
@@ -168,14 +177,29 @@ final class LightboxIndexStore {
     }
 
     func updateCachedDimensions(sourceID: String, updates: [IndexedAssetDimensions]) {
+        updateCachedMetadata(
+            sourceID: sourceID,
+            updates: updates.map {
+                IndexedAssetMetadata(
+                    url: $0.url,
+                    width: $0.width,
+                    height: $0.height,
+                    tags: nil
+                )
+            }
+        )
+    }
+
+    func updateCachedMetadata(sourceID: String, updates: [IndexedAssetMetadata]) {
         guard !updates.isEmpty else { return }
         let startedAt = Date()
         let sql = """
         UPDATE items
-        SET width = ?,
-            height = ?,
-            metadata_loaded = 1,
-            dimension_version = ?,
+        SET width = COALESCE(?, width),
+            height = COALESCE(?, height),
+            metadata_loaded = CASE WHEN ? = 1 THEN 1 ELSE metadata_loaded END,
+            dimension_version = CASE WHEN ? = 1 THEN ? ELSE dimension_version END,
+            tags = CASE WHEN ? = 1 THEN ? ELSE tags END,
             indexed_at = ?
         WHERE source_id = ?
           AND path = ?;
@@ -191,12 +215,17 @@ final class LightboxIndexStore {
             }
 
             withStatement(sql) { statement in
-                sqlite3_bind_double(statement, 1, Double(update.width))
-                sqlite3_bind_double(statement, 2, Double(update.height))
-                sqlite3_bind_int(statement, 3, Int32(Self.dimensionCacheVersion))
-                sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
-                bindText(sourceID, to: statement, at: 5)
-                bindText(update.url.standardizedFileURL.path, to: statement, at: 6)
+                let hasDimensions = update.width != nil && update.height != nil
+                bindDouble(update.width.map(Double.init), to: statement, at: 1)
+                bindDouble(update.height.map(Double.init), to: statement, at: 2)
+                sqlite3_bind_int(statement, 3, hasDimensions ? 1 : 0)
+                sqlite3_bind_int(statement, 4, hasDimensions ? 1 : 0)
+                sqlite3_bind_int(statement, 5, Int32(Self.dimensionCacheVersion))
+                sqlite3_bind_int(statement, 6, update.tags == nil ? 0 : 1)
+                bindText(Self.encodedTags(update.tags ?? []), to: statement, at: 7)
+                sqlite3_bind_double(statement, 8, Date().timeIntervalSince1970)
+                bindText(sourceID, to: statement, at: 9)
+                bindText(update.url.standardizedFileURL.path, to: statement, at: 10)
                 let result = sqlite3_step(statement)
                 if result == SQLITE_DONE, sqlite3_changes(database) > 0 {
                     updatedCount += 1
@@ -207,7 +236,7 @@ final class LightboxIndexStore {
         }
         exec("COMMIT;", context: "dimensions commit")
 
-        Self.logger.info("index dimensions updated source=\(sourceID, privacy: .public) rows=\(updatedCount)/\(updates.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
+        Self.logger.info("index metadata updated source=\(sourceID, privacy: .public) rows=\(updatedCount)/\(updates.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
     }
 
     private func openDatabase() {
@@ -249,6 +278,7 @@ final class LightboxIndexStore {
             file_size INTEGER,
             width REAL,
             height REAL,
+            tags TEXT NOT NULL DEFAULT '',
             metadata_loaded INTEGER NOT NULL DEFAULT 0,
             dimension_version INTEGER NOT NULL DEFAULT 0,
             indexed_at REAL NOT NULL
@@ -264,6 +294,12 @@ final class LightboxIndexStore {
             exec(
                 "ALTER TABLE items ADD COLUMN dimension_version INTEGER NOT NULL DEFAULT 0;",
                 context: "schema add dimension_version"
+            )
+        }
+        if !table("items", hasColumn: "tags") {
+            exec(
+                "ALTER TABLE items ADD COLUMN tags TEXT NOT NULL DEFAULT '';",
+                context: "schema add tags"
             )
         }
 
@@ -290,14 +326,15 @@ final class LightboxIndexStore {
         mtime: Date?,
         width: Double?,
         height: Double?,
+        tags: [String],
         metadataLoaded: Bool = false
     ) {
         let sql = """
         INSERT INTO items (
             id, source_id, path, relative_path, parent_path, is_directory,
-            mtime, file_size, width, height, metadata_loaded, dimension_version, indexed_at
+            mtime, file_size, width, height, tags, metadata_loaded, dimension_version, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             path = excluded.path,
             relative_path = excluded.relative_path,
@@ -307,6 +344,7 @@ final class LightboxIndexStore {
             file_size = excluded.file_size,
             width = excluded.width,
             height = excluded.height,
+            tags = excluded.tags,
             metadata_loaded = excluded.metadata_loaded,
             dimension_version = excluded.dimension_version,
             indexed_at = excluded.indexed_at;
@@ -323,9 +361,10 @@ final class LightboxIndexStore {
             bindInt64(fileSize, to: statement, at: 8)
             bindDouble(width, to: statement, at: 9)
             bindDouble(height, to: statement, at: 10)
-            sqlite3_bind_int(statement, 11, metadataLoaded ? 1 : 0)
-            sqlite3_bind_int(statement, 12, metadataLoaded ? Int32(Self.dimensionCacheVersion) : 0)
-            sqlite3_bind_double(statement, 13, Date().timeIntervalSince1970)
+            bindText(Self.encodedTags(tags), to: statement, at: 11)
+            sqlite3_bind_int(statement, 12, metadataLoaded ? 1 : 0)
+            sqlite3_bind_int(statement, 13, metadataLoaded ? Int32(Self.dimensionCacheVersion) : 0)
+            sqlite3_bind_double(statement, 14, Date().timeIntervalSince1970)
             stepDone(statement, context: "insert item")
         }
     }
@@ -454,6 +493,10 @@ final class LightboxIndexStore {
         }
 
         return String(cString: text)
+    }
+
+    private static func encodedTags(_ tags: [String]) -> String {
+        tags.joined(separator: "\n")
     }
 }
 

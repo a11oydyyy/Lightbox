@@ -88,15 +88,15 @@ enum GalleryAssetSorter {
         items.sorted { lhs, rhs in
             switch field {
             case .time:
-                compare(lhs.addedAt, rhs.addedAt, direction: direction) ?? tieBreak(lhs, rhs)
+                compare(lhs.addedAt, rhs.addedAt, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
             case .size:
-                compare(lhs.fileSize ?? 0, rhs.fileSize ?? 0, direction: direction) ?? tieBreak(lhs, rhs)
+                compare(lhs.fileSize ?? 0, rhs.fileSize ?? 0, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
             case .tag:
-                compareTag(lhs, rhs, direction: direction) ?? tieBreak(lhs, rhs)
+                compareTag(lhs, rhs, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
             case .fileName:
-                compareText(lhs.originalName, rhs.originalName, direction: direction) ?? tieBreak(lhs, rhs)
+                compareText(lhs.originalName, rhs.originalName, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
             case .type:
-                compareText(fileType(lhs), fileType(rhs), direction: direction) ?? tieBreak(lhs, rhs)
+                compareText(fileType(lhs), fileType(rhs), direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
             }
         }
     }
@@ -150,8 +150,14 @@ enum GalleryAssetSorter {
         return URL(fileURLWithPath: asset.originalName).pathExtension.lowercased()
     }
 
-    private static func tieBreak(_ lhs: LightboxAsset, _ rhs: LightboxAsset) -> Bool {
-        lhs.originalName.localizedStandardCompare(rhs.originalName) == .orderedAscending
+    private static func tieBreak(
+        _ lhs: LightboxAsset,
+        _ rhs: LightboxAsset,
+        direction: GallerySortDirection
+    ) -> Bool {
+        compareText(lhs.originalName, rhs.originalName, direction: direction)
+            ?? compareText(lhs.id, rhs.id, direction: direction)
+            ?? false
     }
 }
 
@@ -194,14 +200,4 @@ enum GalleryLayoutMode: String, Hashable {
         }
     }
 
-}
-
-struct ImportProgress: Equatable {
-    var processed: Int
-    var total: Int
-
-    var fraction: Double {
-        guard total > 0 else { return 0 }
-        return Double(processed) / Double(total)
-    }
 }

@@ -3,11 +3,18 @@ import OSLog
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct SearchAssetGroup: Identifiable, Equatable {
+    var id: String
+    var title: String
+    var assets: [LightboxAsset]
+}
+
 @MainActor
 final class AppState: ObservableObject {
     nonisolated private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "LibraryLoading")
     nonisolated private static let comparisonLogger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Comparison")
     nonisolated private static let previewLogger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Preview")
+    nonisolated private static let searchMetadataRefreshLimit = 240
     @Published var sidebarCollapsed = LightboxSettingsStore.defaultSidebarCollapsed {
         didSet {
             LightboxSettingsStore.saveSidebarCollapsed(sidebarCollapsed)
@@ -50,17 +57,22 @@ final class AppState: ObservableObject {
             rebuildActiveAssets()
         }
     }
-    @Published var libraryFolder: URL = LightboxLibraryStore.libraryFolder
     @Published var sources: [LibrarySource] = []
-    @Published var selectedSourceID: LibrarySource.ID = LibrarySource.favoritesID
+    @Published var selectedSourceID: LibrarySource.ID = LibrarySource.defaultStartupSource().id
     @Published private var temporarySource: LibrarySource?
-    @Published var currentFolderURL: URL = LightboxLibraryStore.favoritesFolder
+    @Published var currentFolderURL: URL = LibrarySource.defaultStartupSource().rootURL
     @Published var folderEntries: [LibraryFolderEntry] = []
     @Published var searchText = "" {
         didSet {
+            guard searchText != oldValue else { return }
+            clearSearchResults()
+            scheduleSearch()
             rebuildActiveAssets()
         }
     }
+    @Published private(set) var searchStatus: LightboxSearchStatus?
+    @Published private var searchResultFolderEntries: [LibraryFolderEntry]?
+    @Published private(set) var searchFocusGeneration = 0
     @Published var sortField: GallerySortField = .time {
         didSet {
             rebuildActiveAssets()
@@ -84,9 +96,6 @@ final class AppState: ObservableObject {
     @Published var compareTrayPulseID: LightboxAsset.ID?
     @Published var compareTrayRejectGeneration = 0
     @Published private var previewPhase: PreviewPhase = .closed
-    @Published var isDropTargeted = false
-    @Published var showFileImporter = false
-    @Published var importProgress: ImportProgress?
     @Published var libraryLoadingStatus: LibraryLoadingStatus?
     @Published var trashAccessDenied = false
     @Published var colorMode: LightboxColorMode = .system {
@@ -109,7 +118,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    private var importTask: Task<Void, Never>?
     private var previewOpenTask: Task<Void, Never>?
     private var previewCloseTask: Task<Void, Never>?
     private var previewSourceRevealTask: Task<Void, Never>?
@@ -117,13 +125,16 @@ final class AppState: ObservableObject {
     private var libraryLoadTask: Task<Void, Never>?
     private var assetMetadataTask: Task<Void, Never>?
     private var indexWriteTask: Task<Void, Never>?
+    private var searchTask: Task<Void, Never>?
     private var sharingPicker: NSSharingServicePicker?
     private var refreshSerial = 0
     private var libraryDirectoryMonitor: DirectoryChangeMonitor?
     private let trashDirectoryMonitor: DirectoryChangeMonitor
     private let indexStore = LightboxIndexStore()
     private var selectionAnchorID: LightboxAsset.ID?
-    private var cachedActiveAssets: [LightboxAsset] = []
+    @Published private var cachedActiveAssets: [LightboxAsset] = []
+    private var searchResultAssets: [LightboxAsset]?
+    private var previewAssetSnapshot: LightboxAsset?
     private var previewSpaceAssetFrames: [LightboxAsset.ID: CGRect] = [:]
     private var compareTrayPulseTask: Task<Void, Never>?
     private var compareTrayDragID: LightboxAsset.ID?
@@ -131,7 +142,6 @@ final class AppState: ObservableObject {
 
     init() {
         ImageCache.shared.removeAll()
-        LightboxLibraryStore.prepareStorage()
         colorMode = LightboxSettingsStore.loadColorMode()
         glassOpacity = LightboxSettingsStore.loadGlassOpacity()
         appLanguage = LightboxSettingsStore.loadLanguage()
@@ -139,11 +149,11 @@ final class AppState: ObservableObject {
         sidebarWidth = LightboxSettingsStore.loadSidebarWidth()
         sidebarVisibleLocationIDs = LightboxSettingsStore.loadSidebarVisibleLocationIDs()
         showFolderCards = LightboxSettingsStore.loadShowFolderCards()
-        let folder = LightboxLibraryStore.libraryFolder
         trashDirectoryMonitor = DirectoryChangeMonitor(url: LightboxLibraryStore.primarySystemTrashFolder)
-        let loadedSources = LibrarySourceStore.loadSources(favoritesRoot: folder)
-        let savedSourceID = LibrarySourceStore.selectedSourceID(default: LibrarySource.favoritesID)
-        var resolvedSource = loadedSources.first { $0.id == savedSourceID } ?? LibrarySource.favorites(rootURL: folder)
+        let loadedSources = LibrarySourceStore.loadSources()
+        let fallbackSource = LibrarySource.defaultStartupSource()
+        let savedSourceID = LibrarySourceStore.selectedSourceID(default: fallbackSource.id)
+        var resolvedSource = loadedSources.first { $0.id == savedSourceID } ?? fallbackSource
         var restoredTemporarySource: LibrarySource?
         var initialFolderURL = resolvedSource.rootURL
 
@@ -169,11 +179,16 @@ final class AppState: ObservableObject {
             }
         }
 
-        libraryFolder = folder
         sources = loadedSources
-        temporarySource = restoredTemporarySource
+        if loadedSources.contains(where: { sourceMatches($0, resolvedSource) }) {
+            temporarySource = restoredTemporarySource
+        } else {
+            temporarySource = restoredTemporarySource ?? resolvedSource
+        }
         selectedSourceID = resolvedSource.id
         currentFolderURL = initialFolderURL
+        LibrarySourceStore.saveSelectedSourceID(resolvedSource.id)
+        saveCurrentFolderSession()
         refreshLibrary()
         restartLibraryMonitor()
         trashDirectoryMonitor.start { [weak self] in
@@ -185,13 +200,13 @@ final class AppState: ObservableObject {
         libraryDirectoryMonitor?.stop()
         trashDirectoryMonitor.stop()
         refreshTask?.cancel()
-        importTask?.cancel()
         previewOpenTask?.cancel()
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
         libraryLoadTask?.cancel()
         assetMetadataTask?.cancel()
         indexWriteTask?.cancel()
+        searchTask?.cancel()
         compareTrayPulseTask?.cancel()
     }
 
@@ -201,6 +216,71 @@ final class AppState: ObservableObject {
 
     var isViewingTrash: Bool {
         selectedFilter == .trash
+    }
+
+    var hasSearchQuery: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var activeFolderEntries: [LibraryFolderEntry] {
+        guard !isViewingTrash else { return [] }
+        guard hasSearchQuery else { return sortedFolderEntries(folderEntries) }
+
+        let query = LightboxSearchQuery.parse(searchText)
+        guard !query.isEmpty else { return sortedFolderEntries(folderEntries) }
+
+        if let searchResultFolderEntries {
+            return sortedFolderEntries(searchResultFolderEntries)
+        }
+
+        return sortedFolderEntries(folderEntries.filter(query.matches))
+    }
+
+    var searchAssetGroups: [SearchAssetGroup] {
+        let activeAssets = activeAssets
+        guard hasSearchQuery, !activeAssets.isEmpty
+        else {
+            return [
+                SearchAssetGroup(
+                    id: currentFolderURL.standardizedFileURL.path,
+                    title: currentPathTitle,
+                    assets: activeAssets
+                )
+            ]
+        }
+
+        var grouped: [(path: String, title: String, assets: [LightboxAsset])] = []
+        var indexByPath: [String: Int] = [:]
+        for asset in activeAssets {
+            let folderURL = asset.sourceURL?.deletingLastPathComponent().standardizedFileURL ?? currentFolderURL
+            let path = folderURL.path
+            if let index = indexByPath[path] {
+                grouped[index].assets.append(asset)
+            } else {
+                indexByPath[path] = grouped.count
+                grouped.append((path, searchGroupTitle(for: folderURL), [asset]))
+            }
+        }
+
+        return grouped.map {
+            SearchAssetGroup(id: $0.path, title: $0.title, assets: $0.assets)
+        }
+    }
+
+    func focusSearch() {
+        searchFocusGeneration += 1
+    }
+
+    private func searchGroupTitle(for folderURL: URL) -> String {
+        if let source = bestSource(containing: folderURL) {
+            let relativePath = folderURL.relativePath(from: source.rootURL)
+            if relativePath.isEmpty {
+                return source.displayName
+            }
+            return relativePath
+        }
+
+        return folderURL.lastPathComponent.isEmpty ? folderURL.path : folderURL.lastPathComponent
     }
 
     var selectedSource: LibrarySource? {
@@ -373,17 +453,17 @@ final class AppState: ObservableObject {
 
     var selectedAsset: LightboxAsset? {
         guard let selectedAssetID else { return activeAssets.first }
-        return assets.first { $0.id == selectedAssetID }
+        return assetForCurrentPresentation(selectedAssetID)
     }
 
     var explicitlySelectedAsset: LightboxAsset? {
         guard let selectedAssetID else { return nil }
-        return assets.first { $0.id == selectedAssetID }
+        return assetForCurrentPresentation(selectedAssetID)
     }
 
     var canMoveSelectionToTrash: Bool {
         if !selectedAssetIDs.isEmpty {
-            return assets.contains { asset in
+            return activeAssets.contains { asset in
                 selectedAssetIDs.contains(asset.id) && !asset.isDeleted && asset.sourceURL != nil
             }
         }
@@ -394,7 +474,8 @@ final class AppState: ObservableObject {
 
     var previewAsset: LightboxAsset? {
         guard let previewAssetID else { return nil }
-        return assets.first { $0.id == previewAssetID }
+        return assetForCurrentPresentation(previewAssetID)
+            ?? (previewAssetSnapshot?.id == previewAssetID ? previewAssetSnapshot : nil)
     }
 
     var isComparing: Bool {
@@ -664,7 +745,7 @@ final class AppState: ObservableObject {
     func chooseSource(_ sourceID: LibrarySource.ID) {
         guard let source = sources.first(where: { $0.id == sourceID }) else { return }
         temporarySource = nil
-        activateSource(source, persistSelection: true)
+        activateSource(source)
     }
 
     func openSource(_ source: LibrarySource) {
@@ -687,12 +768,17 @@ final class AppState: ObservableObject {
         }
 
         if let source = bestSource(containing: standardizedURL) {
-            temporarySource = nil
-            activateSource(source, persistSelection: true, initialFolderURL: standardizedURL)
+            let pinnedSource = sources.first { sourceMatches($0, source) }
+            let sourceToActivate = pinnedSource ?? source
+            temporarySource = pinnedSource == nil ? source : nil
+            Self.logger.info("sidebar folder open requested path=\(standardizedURL.path, privacy: .public) source=\(sourceToActivate.id, privacy: .public) pinned=\(pinnedSource != nil, privacy: .public)")
+            activateSource(sourceToActivate, initialFolderURL: standardizedURL)
             return
         }
 
-        chooseTemporarySource(LibrarySourceStore.makeExternalSource(rootURL: standardizedURL))
+        let source = LibrarySourceStore.makeExternalSource(rootURL: standardizedURL)
+        Self.logger.info("sidebar folder open requested path=\(standardizedURL.path, privacy: .public) source=\(source.id, privacy: .public) pinned=false")
+        chooseTemporarySource(source)
     }
 
     func openTrashFromSidebar() {
@@ -704,12 +790,12 @@ final class AppState: ObservableObject {
     private func chooseTemporarySource(_ source: LibrarySource) {
         temporarySource = source
         indexStore.upsertSource(source)
-        activateSource(source, persistSelection: false)
+        activateSource(source)
     }
 
-    private func activateSource(_ source: LibrarySource, persistSelection: Bool, initialFolderURL: URL? = nil) {
+    private func activateSource(_ source: LibrarySource, initialFolderURL: URL? = nil) {
         selectedSourceID = source.id
-        LibrarySourceStore.saveSelectedSourceID(persistSelection ? source.id : LibrarySource.favoritesID)
+        LibrarySourceStore.saveSelectedSourceID(source.id)
         selectedFilter = .all
         currentFolderURL = initialFolderURL?.standardizedFileURL ?? source.rootURL
         saveCurrentFolderSession()
@@ -761,7 +847,7 @@ final class AppState: ObservableObject {
         LibrarySourceStore.saveExternalSources(sources)
         if wasSelected {
             temporarySource = source
-            LibrarySourceStore.saveSelectedSourceID(LibrarySource.favoritesID)
+            LibrarySourceStore.saveSelectedSourceID(source.id)
         }
     }
 
@@ -824,7 +910,8 @@ final class AppState: ObservableObject {
 
     private func bestSource(containing folderURL: URL) -> LibrarySource? {
         let folderPath = folderURL.standardizedFileURL.path
-        let candidates = sources.filter { source in
+        let allSources = sources + [temporarySource].compactMap { $0 }
+        let candidates = allSources.filter { source in
             let rootPath = source.rootURL.standardizedFileURL.path
             return folderPath == rootPath || folderPath.hasPrefix(rootPath + "/")
         }
@@ -841,11 +928,34 @@ final class AppState: ObservableObject {
 
     func openFolder(_ folder: LibraryFolderEntry) {
         Self.logger.info("folder open requested source=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
-        guard folder.sourceID == selectedSourceID else {
-            Self.logger.error("folder open rejected source mismatch folderSource=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
+        let standardizedURL = folder.url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            Self.logger.error("folder open rejected missing-or-not-directory path=\(standardizedURL.path, privacy: .public)")
             return
         }
-        openFolderURL(folder.url)
+
+        guard folder.sourceID == selectedSourceID else {
+            guard let source = sources.first(where: { $0.id == folder.sourceID }) else {
+                Self.logger.error("folder open rejected source mismatch folderSource=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
+                return
+            }
+            temporarySource = nil
+            selectedSourceID = source.id
+            LibrarySourceStore.saveSelectedSourceID(source.id)
+            selectedFilter = .all
+            currentFolderURL = standardizedURL
+            saveCurrentFolderSession()
+            clearSearchForNavigation()
+            clearSelection()
+            ImageCache.shared.cancelOutstandingRequests(reason: "open-folder")
+            restartLibraryMonitor()
+            refreshLibrary()
+            return
+        }
+        openFolderURL(standardizedURL)
     }
 
     func openBreadcrumb(_ breadcrumb: PathBreadcrumb) {
@@ -865,11 +975,20 @@ final class AppState: ObservableObject {
         selectedFilter = .all
         currentFolderURL = standardizedURL
         saveCurrentFolderSession()
-        searchText = ""
+        clearSearchForNavigation()
         clearSelection()
         ImageCache.shared.cancelOutstandingRequests(reason: "open-folder")
         restartLibraryMonitor()
         refreshLibrary()
+    }
+
+    private func clearSearchForNavigation() {
+        if hasSearchQuery {
+            searchText = ""
+        } else {
+            clearSearchResults()
+            rebuildActiveAssets()
+        }
     }
 
     func copyCurrentPathToClipboard() {
@@ -902,6 +1021,7 @@ final class AppState: ObservableObject {
         previewSourceHiddenAssetID = nil
         previewSourceFrame = sourceFrame
         previewAssetID = target.id
+        previewAssetSnapshot = target
         Self.previewLogger.info("preview show phase=\(previousPhase.rawValue, privacy: .public)->opening session=\(nextSessionID.uuidString, privacy: .public) asset=\(target.originalName, privacy: .public) frame=\(Self.frameDescription(sourceFrame), privacy: .public) folder=\(self.currentFolderURL.lastPathComponent, privacy: .public)")
         schedulePreviewOpenCompletion()
     }
@@ -928,6 +1048,12 @@ final class AppState: ObservableObject {
                 nextAssets[index].metadataLoaded = true
                 assets = nextAssets
             }
+            updatePresentedAssetDimensions(
+                asset.id,
+                width: dimensions.width,
+                height: dimensions.height,
+                metadataLoaded: true
+            )
 
             Self.previewLogger.info("preview dimensions resolved asset=\(asset.originalName, privacy: .public) width=\(dimensions.width, format: .fixed(precision: 0)) height=\(dimensions.height, format: .fixed(precision: 0))")
             return resolved
@@ -952,6 +1078,12 @@ final class AppState: ObservableObject {
             nextAssets[index].metadataLoaded = false
             assets = nextAssets
         }
+        updatePresentedAssetDimensions(
+            asset.id,
+            width: sourceFrame.width,
+            height: sourceFrame.height,
+            metadataLoaded: false
+        )
 
         Self.previewLogger.info("preview dimensions fallback-to-card asset=\(asset.originalName, privacy: .public) width=\(sourceFrame.width, format: .fixed(precision: 0)) height=\(sourceFrame.height, format: .fixed(precision: 0))")
         return fallback
@@ -1059,6 +1191,7 @@ final class AppState: ObservableObject {
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
         previewAssetID = nil
+        previewAssetSnapshot = nil
         previewSourceHiddenAssetID = nil
         previewInteractionLayerReady = false
         previewSourceFrame = nil
@@ -1133,6 +1266,36 @@ final class AppState: ObservableObject {
         return true
     }
 
+    private static func fileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                continuation.resume(returning: url(from: item))
+            }
+        }
+    }
+
+    nonisolated private static func url(from item: NSSecureCoding?) -> URL? {
+        if let url = item as? URL {
+            return url
+        }
+
+        if let data = item as? Data {
+            if let url = URL(dataRepresentation: data, relativeTo: nil) {
+                return url
+            }
+
+            if let string = String(data: data, encoding: .utf8) {
+                return URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+
+        if let string = item as? String {
+            return URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return nil
+    }
+
     func removeFromCompareTray(_ assetID: LightboxAsset.ID) {
         compareTrayAssets.removeAll { $0.id == assetID }
         if comparisonAssets.contains(where: { $0.id == assetID }) {
@@ -1160,6 +1323,7 @@ final class AppState: ObservableObject {
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
         previewAssetID = nil
+        previewAssetSnapshot = nil
         previewSourceHiddenAssetID = nil
         previewInteractionLayerReady = false
         previewSourceFrame = nil
@@ -1240,6 +1404,7 @@ final class AppState: ObservableObject {
         }
         previewSourceRevealTask?.cancel()
         previewAssetID = nil
+        previewAssetSnapshot = nil
         previewSourceHiddenAssetID = nil
         previewInteractionLayerReady = false
         selectedAssetID = nil
@@ -1300,6 +1465,7 @@ final class AppState: ObservableObject {
         previewSourceFrame = nil
         previewStepDirection = direction
         previewAssetID = nextAsset.id
+        previewAssetSnapshot = nextAsset
         Self.previewLogger.info("preview step direction=\(direction.rawValue, privacy: .public) asset=\(nextAsset.originalName, privacy: .public) session=\(self.previewSessionID.uuidString, privacy: .public)")
     }
 
@@ -1344,6 +1510,8 @@ final class AppState: ObservableObject {
         guard !removedIDs.isEmpty else { return }
 
         assets.removeAll { removedIDs.contains($0.id) }
+        searchResultAssets?.removeAll { removedIDs.contains($0.id) }
+        cachedActiveAssets.removeAll { removedIDs.contains($0.id) }
         selectedAssetIDs.subtract(removedIDs)
         if let selectedAssetID, removedIDs.contains(selectedAssetID) {
             self.selectedAssetID = firstVisibleID(in: selectedAssetIDs)
@@ -1360,6 +1528,7 @@ final class AppState: ObservableObject {
         for assetID in removedIDs {
             removeFromCompareTray(assetID)
         }
+        rebuildActiveAssets()
     }
 
     func restore(_ asset: LightboxAsset) {
@@ -1415,34 +1584,39 @@ final class AppState: ObservableObject {
         } else {
             targetIDs = [asset.id]
         }
-        let targetAssets = assets.filter { targetIDs.contains($0.id) }
+        let targetAssets = activeAssets.filter { targetIDs.contains($0.id) }
         let removesTag = !targetAssets.isEmpty && targetAssets.allSatisfy { $0.tags.contains(tag) }
-        var nextAssets = assets
-        var changed = false
+        let shouldClearCurrentFilter = shouldClearTagFilterAfterRemoving(tag, targetIDs: targetIDs)
+        var nextTagsByID: [LightboxAsset.ID: [String]] = [:]
 
-        for index in nextAssets.indices where targetIDs.contains(nextAssets[index].id) {
-            var nextTags = nextAssets[index].tags
+        for asset in targetAssets {
+            var nextTags = asset.tags
             if removesTag {
                 nextTags.removeAll { $0 == tag }
             } else if !nextTags.contains(tag) {
                 nextTags.append(tag)
             }
 
-            let previousTags = nextAssets[index].tags
-            writeColorTags(nextTags, to: &nextAssets[index])
-            if nextAssets[index].tags != previousTags {
-                changed = true
+            let sortedTags = MacColorTag.sort(nextTags.filter(MacColorTag.isColorTag))
+            if let url = asset.sourceURL,
+               !FinderTagStore.setColorTags(sortedTags, for: url) {
+                continue
             }
+            nextTagsByID[asset.id] = sortedTags
         }
 
-        if changed {
-            assets = nextAssets
-        }
+        applyTagCopies(nextTagsByID)
+        clearCurrentTagFilterIfNeeded(
+            shouldClearCurrentFilter,
+            removedTag: tag,
+            targetAssets: targetAssets,
+            updatedTagsByID: nextTagsByID
+        )
     }
 
     func selectedAssetTagCoverage(for tag: String) -> Double {
         guard MacColorTag.isColorTag(tag), !selectedAssetIDs.isEmpty else { return 0 }
-        let selectedAssets = assets.filter { selectedAssetIDs.contains($0.id) }
+        let selectedAssets = activeAssets.filter { selectedAssetIDs.contains($0.id) }
         guard !selectedAssets.isEmpty else { return 0 }
         let taggedCount = selectedAssets.filter { $0.tags.contains(tag) }.count
         return Double(taggedCount) / Double(selectedAssets.count)
@@ -1451,31 +1625,36 @@ final class AppState: ObservableObject {
     func toggleTagForSelection(_ tag: String) {
         guard MacColorTag.isColorTag(tag), !selectedAssetIDs.isEmpty else { return }
         let targetIDs = selectedAssetIDs
-        let selectedAssets = assets.filter { targetIDs.contains($0.id) }
+        let selectedAssets = activeAssets.filter { targetIDs.contains($0.id) }
         guard !selectedAssets.isEmpty else { return }
 
         let removesTag = selectedAssets.allSatisfy { $0.tags.contains(tag) }
-        var nextAssets = assets
-        var changed = false
+        let shouldClearCurrentFilter = shouldClearTagFilterAfterRemoving(tag, targetIDs: targetIDs)
+        var nextTagsByID: [LightboxAsset.ID: [String]] = [:]
 
-        for index in nextAssets.indices where targetIDs.contains(nextAssets[index].id) {
-            var nextTags = nextAssets[index].tags
+        for asset in selectedAssets {
+            var nextTags = asset.tags
             if removesTag {
                 nextTags.removeAll { $0 == tag }
             } else if !nextTags.contains(tag) {
                 nextTags.append(tag)
             }
 
-            let previousTags = nextAssets[index].tags
-            writeColorTags(nextTags, to: &nextAssets[index])
-            if nextAssets[index].tags != previousTags {
-                changed = true
+            let sortedTags = MacColorTag.sort(nextTags.filter(MacColorTag.isColorTag))
+            if let url = asset.sourceURL,
+               !FinderTagStore.setColorTags(sortedTags, for: url) {
+                continue
             }
+            nextTagsByID[asset.id] = sortedTags
         }
 
-        if changed {
-            assets = nextAssets
-        }
+        applyTagCopies(nextTagsByID)
+        clearCurrentTagFilterIfNeeded(
+            shouldClearCurrentFilter,
+            removedTag: tag,
+            targetAssets: selectedAssets,
+            updatedTagsByID: nextTagsByID
+        )
     }
 
     func revealInFinder(_ asset: LightboxAsset) {
@@ -1604,48 +1783,6 @@ final class AppState: ObservableObject {
         picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
     }
 
-    func chooseLibraryFolder() {
-        let panel = NSOpenPanel()
-        panel.title = localized(.chooseLibraryFolder)
-        panel.prompt = localized(.chooseLibraryFolder).replacingOccurrences(of: "...", with: "")
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = libraryFolder
-
-        guard panel.runModal() == .OK,
-              let url = panel.url
-        else {
-            return
-        }
-
-        setLibraryFolder(url)
-    }
-
-    func setLibraryFolder(_ url: URL) {
-        LightboxLibraryStore.setLibraryFolder(url)
-        libraryFolder = url.standardizedFileURL
-        temporarySource = nil
-        LightboxLibraryStore.prepareStorage()
-        sources = sources.map { source in
-            guard source.id == LibrarySource.favoritesID else { return source }
-            return .favorites(rootURL: libraryFolder)
-        }
-        if !sources.contains(where: { $0.id == LibrarySource.favoritesID }) {
-            sources.insert(.favorites(rootURL: libraryFolder), at: 0)
-        }
-        selectedSourceID = LibrarySource.favoritesID
-        LibrarySourceStore.saveSelectedSourceID(selectedSourceID)
-        currentFolderURL = libraryFolder
-        saveCurrentFolderSession()
-        searchText = ""
-        ImageCache.shared.removeAll()
-        restartLibraryMonitor()
-        refreshLibrary()
-        removeDetachedSelection()
-    }
-
     func refreshLibrary() {
         let cancelledRefreshTask = refreshTask != nil
         let cancelledLoadTask = libraryLoadTask != nil
@@ -1746,237 +1883,10 @@ final class AppState: ObservableObject {
                     tagLimit: snapshot.count,
                     loadsFinderTags: true
                 )
+                self.scheduleSearch()
                 Self.logger.info("refresh[\(refreshID)] apply complete applyTotal=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s folderEntries=\(self.folderEntries.count) storeAssets=\(self.assets.count) visibleSnapshotAssets=\(snapshot.count)")
             }
         }
-    }
-
-    func importSelectedFiles(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        importTask?.cancel()
-        importTask = Task { [weak self] in
-            await self?.simulateImport(urls: urls)
-        }
-    }
-
-    func handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard !providers.isEmpty else { return false }
-        if LightboxDragState.isDraggingAsset || providers.contains(where: Self.isInternalAssetDrag) {
-            isDropTargeted = false
-            return false
-        }
-
-        isDropTargeted = false
-        importTask?.cancel()
-        let targetFolder = LightboxLibraryStore.favoritesImportedFolder
-        importTask = Task { [weak self] in
-            let urls = await Self.importedURLs(from: providers, libraryFolder: targetFolder)
-            await self?.simulateImport(urls: urls, fallbackCount: urls.isEmpty ? providers.count : nil)
-        }
-        return true
-    }
-
-    private static func isInternalAssetDrag(_ provider: NSItemProvider) -> Bool {
-        provider.hasItemConformingToTypeIdentifier(LightboxPasteboardTypes.internalAssetDragIdentifier)
-    }
-
-    private static func importedURLs(from providers: [NSItemProvider], libraryFolder: URL) async -> [URL] {
-        var urls: [URL] = []
-
-        for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
-               let url = await fileURL(from: provider) {
-                urls.append(url)
-                continue
-            }
-
-            if let url = await imageRepresentationURL(from: provider, libraryFolder: libraryFolder) {
-                urls.append(url)
-            }
-        }
-
-        return urls
-    }
-
-    private static func fileURL(from provider: NSItemProvider) async -> URL? {
-        await withCheckedContinuation { continuation in
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                continuation.resume(returning: url(from: item))
-            }
-        }
-    }
-
-    private static func imageRepresentationURL(from provider: NSItemProvider, libraryFolder: URL) async -> URL? {
-        let imageTypeIdentifiers = provider.registeredTypeIdentifiers.filter { identifier in
-            UTType(identifier)?.conforms(to: .image) == true
-        }
-        let preferredName = await preferredFileName(from: provider)
-
-        for identifier in imageTypeIdentifiers {
-            if let url = await persistedFileRepresentation(
-                from: provider,
-                typeIdentifier: identifier,
-                libraryFolder: libraryFolder,
-                preferredName: preferredName
-            ) {
-                return url
-            }
-
-            if let data = await dataRepresentation(from: provider, typeIdentifier: identifier),
-               let url = ImportedImageStore.persist(
-                   data: data,
-                   suggestedName: preferredName,
-                    typeIdentifier: identifier,
-                    libraryFolder: libraryFolder
-               ) {
-                return url
-            }
-        }
-
-        return nil
-    }
-
-    private static func persistedFileRepresentation(
-        from provider: NSItemProvider,
-        typeIdentifier: String,
-        libraryFolder: URL,
-        preferredName: String?
-    ) async -> URL? {
-        await withCheckedContinuation { continuation in
-            provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, _ in
-                let persistedURL = url.flatMap {
-                    ImportedImageStore.persist(
-                        $0,
-                        libraryFolder: libraryFolder,
-                        preferredName: preferredName
-                    )
-                }
-                continuation.resume(returning: persistedURL)
-            }
-        }
-    }
-
-    private static func dataRepresentation(from provider: NSItemProvider, typeIdentifier: String) async -> Data? {
-        await withCheckedContinuation { continuation in
-            provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
-                continuation.resume(returning: data)
-            }
-        }
-    }
-
-    private static func preferredFileName(from provider: NSItemProvider) async -> String? {
-        if let suggestedName = sanitizedFileName(provider.suggestedName) {
-            return suggestedName
-        }
-
-        if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier),
-           let sourceURL = await urlItem(from: provider, typeIdentifier: UTType.url.identifier),
-           let name = sanitizedFileName(sourceURL.lastPathComponent) {
-            return name
-        }
-
-        return nil
-    }
-
-    private static func urlItem(from provider: NSItemProvider, typeIdentifier: String) async -> URL? {
-        await withCheckedContinuation { continuation in
-            provider.loadItem(forTypeIdentifier: typeIdentifier, options: nil) { item, _ in
-                continuation.resume(returning: url(from: item))
-            }
-        }
-    }
-
-    private static func sanitizedFileName(_ name: String?) -> String? {
-        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let trimmed, !trimmed.isEmpty else {
-            return nil
-        }
-
-        return URL(fileURLWithPath: trimmed).lastPathComponent
-    }
-
-    nonisolated private static func url(from item: NSSecureCoding?) -> URL? {
-        if let url = item as? URL {
-            return url
-        }
-
-        if let data = item as? Data {
-            if let url = URL(dataRepresentation: data, relativeTo: nil) {
-                return url
-            }
-
-            if let string = String(data: data, encoding: .utf8) {
-                return URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines))
-            }
-        }
-
-        if let string = item as? String {
-            return URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-
-        return nil
-    }
-
-    private func simulateImport(urls: [URL], fallbackCount: Int? = nil) async {
-        let total = max(urls.count, fallbackCount ?? 0)
-        guard total > 0 else { return }
-        showLibraryImportedFolder()
-        importProgress = ImportProgress(processed: 0, total: total)
-
-        for index in 0..<total {
-            if Task.isCancelled { return }
-            if let asset = makeImportedAsset(url: urls.indices.contains(index) ? urls[index] : nil, index: index) {
-                assets.insert(asset, at: 0)
-                selectedAssetIDs = []
-                selectionAnchorID = nil
-                selectedAssetID = asset.id
-            }
-            importProgress = ImportProgress(processed: index + 1, total: total)
-        }
-
-        try? await Task.sleep(for: .milliseconds(420))
-        importProgress = nil
-        refreshLibrary()
-    }
-
-    private func makeImportedAsset(url: URL?, index: Int) -> LightboxAsset? {
-        let importedURL = url.flatMap {
-            ImportedImageStore.persist($0, libraryFolder: LightboxLibraryStore.favoritesImportedFolder)
-        } ?? url
-        if let importedURL,
-           assets.contains(where: { $0.sourceURL?.standardizedFileURL.path == importedURL.standardizedFileURL.path }) {
-            return nil
-        }
-
-        let size = importedURL.flatMap(ImageProbe.dimensions) ?? MockLibrary.importFallbackSizes[index % MockLibrary.importFallbackSizes.count]
-        let name = importedURL?.lastPathComponent ?? "Dropped image \(index + 1)"
-        let addedAt = Date()
-        return LightboxAsset(
-            originalName: name,
-            width: size.width,
-            height: size.height,
-            tags: importedURL.map(FinderTagStore.colorTags) ?? [],
-            sourceURL: importedURL,
-            addedAt: addedAt,
-            fileSize: importedURL.flatMap(LocalImageSource.fileSize(for:)),
-            palette: MockPalette.imported[index % MockPalette.imported.count]
-        )
-    }
-
-    private func showLibraryImportedFolder() {
-        LightboxLibraryStore.prepareStorage()
-        temporarySource = nil
-
-        if !sources.contains(where: { $0.id == LibrarySource.favoritesID }) {
-            sources.insert(.favorites(rootURL: libraryFolder), at: 0)
-        }
-
-        selectedSourceID = LibrarySource.favoritesID
-        LibrarySourceStore.saveSelectedSourceID(selectedSourceID)
-        selectedFilter = .all
-        currentFolderURL = LightboxLibraryStore.favoritesImportedFolder
-        folderEntries = []
-        restartLibraryMonitor()
     }
 
     private func scheduleLibraryRefresh() {
@@ -2025,8 +1935,12 @@ final class AppState: ObservableObject {
 
             var existing = existing
             existing.originalName = refreshed.originalName
-            existing.addedAt = refreshed.addedAt
-            existing.fileSize = refreshed.fileSize
+            if refreshed.addedAt != .distantPast {
+                existing.addedAt = refreshed.addedAt
+            }
+            if refreshed.fileSize != nil {
+                existing.fileSize = refreshed.fileSize
+            }
             if refreshed.metadataLoaded || !existing.metadataLoaded {
                 existing.width = refreshed.width
                 existing.height = refreshed.height
@@ -2109,11 +2023,15 @@ final class AppState: ObservableObject {
                 if batch.count >= 160 || processedCount % progressInterval == 0 {
                     let updates = batch
                     batch.removeAll(keepingCapacity: true)
-                    dimensionIndexStore.updateCachedDimensions(
+                    dimensionIndexStore.updateCachedMetadata(
                         sourceID: sourceID,
-                        updates: updates.compactMap {
-                            guard let width = $0.width, let height = $0.height else { return nil }
-                            return IndexedAssetDimensions(url: $0.url, width: width, height: height)
+                        updates: updates.map {
+                            IndexedAssetMetadata(
+                                url: $0.url,
+                                width: $0.width,
+                                height: $0.height,
+                                tags: $0.tags
+                            )
                         }
                     )
                     await MainActor.run {
@@ -2134,11 +2052,15 @@ final class AppState: ObservableObject {
             }
 
             if !batch.isEmpty || processedCount > 0 {
-                dimensionIndexStore.updateCachedDimensions(
+                dimensionIndexStore.updateCachedMetadata(
                     sourceID: sourceID,
-                    updates: batch.compactMap {
-                        guard let width = $0.width, let height = $0.height else { return nil }
-                        return IndexedAssetDimensions(url: $0.url, width: width, height: height)
+                    updates: batch.map {
+                        IndexedAssetMetadata(
+                            url: $0.url,
+                            width: $0.width,
+                            height: $0.height,
+                            tags: $0.tags
+                        )
                     }
                 )
                 await MainActor.run {
@@ -2226,6 +2148,84 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func applySearchResultMetadataUpdates(
+        _ updates: [AssetMetadataUpdate],
+        sourceID: LibrarySource.ID,
+        folderPath: String,
+        searchText expectedSearchText: String
+    ) {
+        guard !updates.isEmpty,
+              !isViewingTrash,
+              selectedSourceID == sourceID,
+              currentFolderURL.standardizedFileURL.path == folderPath,
+              searchText.trimmingCharacters(in: .whitespacesAndNewlines) == expectedSearchText
+        else {
+            return
+        }
+
+        let updatesByID = Dictionary(uniqueKeysWithValues: updates.map { ($0.id, $0) })
+        var didChange = false
+
+        if var searchResultAssets {
+            for index in searchResultAssets.indices {
+                guard let update = updatesByID[searchResultAssets[index].id],
+                      let width = update.width,
+                      let height = update.height
+                else {
+                    continue
+                }
+                searchResultAssets[index].width = width
+                searchResultAssets[index].height = height
+                searchResultAssets[index].metadataLoaded = true
+                didChange = true
+            }
+            if didChange {
+                self.searchResultAssets = searchResultAssets
+            }
+        }
+
+        var assetsChanged = false
+        for index in assets.indices {
+            guard let update = updatesByID[assets[index].id],
+                  let width = update.width,
+                  let height = update.height
+            else {
+                continue
+            }
+            assets[index].width = width
+            assets[index].height = height
+            assets[index].metadataLoaded = true
+            assetsChanged = true
+        }
+
+        for index in cachedActiveAssets.indices {
+            guard let update = updatesByID[cachedActiveAssets[index].id],
+                  let width = update.width,
+                  let height = update.height
+            else {
+                continue
+            }
+            cachedActiveAssets[index].width = width
+            cachedActiveAssets[index].height = height
+            cachedActiveAssets[index].metadataLoaded = true
+            didChange = true
+        }
+
+        if let previewAssetSnapshot,
+           let update = updatesByID[previewAssetSnapshot.id],
+           let width = update.width,
+           let height = update.height {
+            self.previewAssetSnapshot?.width = width
+            self.previewAssetSnapshot?.height = height
+            self.previewAssetSnapshot?.metadataLoaded = true
+            didChange = true
+        }
+
+        if assetsChanged || didChange {
+            rebuildActiveAssets()
+        }
+    }
+
     private func finishAssetMetadataRefresh(
         folderURL: URL,
         sourceID: LibrarySource.ID,
@@ -2244,32 +2244,213 @@ final class AppState: ObservableObject {
     }
 
     private func rebuildActiveAssets() {
+        let query = LightboxSearchQuery.parse(searchText)
+        let sourceAssets = searchResultAssetsForActiveQuery ?? assets
         let filtered: [LightboxAsset] = switch selectedFilter {
         case .all:
-            sortedAssets(assets.filter { !$0.isDeleted })
+            sourceAssets.filter { !$0.isDeleted }
         case .tag(let tag):
-            sortedAssets(assets.filter { !$0.isDeleted && $0.tags.contains(tag) })
+            sourceAssets.filter { !$0.isDeleted && $0.tags.contains(tag) }
         case .trash:
-            sortedAssets(assets.filter(\.isDeleted))
+            sourceAssets.filter(\.isDeleted)
         }
 
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
-            cachedActiveAssets = filtered
+            cachedActiveAssets = sortedAssets(filtered)
             return
         }
 
-        cachedActiveAssets = filtered.filter {
-            $0.originalName.localizedCaseInsensitiveContains(query)
+        cachedActiveAssets = sortedAssets(filtered.filter(query.matches))
+    }
+
+    private var searchResultAssetsForActiveQuery: [LightboxAsset]? {
+        guard hasSearchQuery,
+              !isViewingTrash,
+              let searchResultAssets
+        else {
+            return nil
         }
+        return searchResultAssets
+    }
+
+    private func scheduleSearch() {
+        searchTask?.cancel()
+        clearSearchResults()
+        searchStatus = nil
+
+        let trimmedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSearchText.isEmpty,
+              !isViewingTrash,
+              let source = selectedSource
+        else {
+            return
+        }
+
+        let query = LightboxSearchQuery.parse(trimmedSearchText)
+        guard !query.isEmpty else { return }
+
+        let searchFolder = currentFolderURL
+        let sourceID = source.id
+        let sourceRootURL = source.rootURL
+        let currentFolderPath = currentFolderURL.standardizedFileURL.path
+        searchStatus = LightboxSearchStatus(isSearching: true)
+
+        searchTask = Task.detached(priority: .utility) { [weak self, query, searchFolder, sourceID, sourceRootURL, currentFolderPath, trimmedSearchText] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+
+            let result = LocalImageSource.searchAssets(
+                in: searchFolder,
+                sourceID: sourceID,
+                rootURL: sourceRootURL,
+                query: query,
+                recursive: true
+            )
+
+            let didApplySearchResults = await MainActor.run { () -> Bool in
+                guard let self,
+                      !Task.isCancelled,
+                      self.selectedSourceID == sourceID,
+                      self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedSearchText,
+                      self.currentFolderURL.standardizedFileURL.path == currentFolderPath
+                else {
+                    return false
+                }
+
+                self.searchResultAssets = result.assets
+                self.searchResultFolderEntries = result.folders
+                self.searchStatus = LightboxSearchStatus(isSearching: false, limitReached: result.limitReached)
+                self.rebuildActiveAssets()
+                return true
+            }
+            guard didApplySearchResults else { return }
+
+            let metadataTargets = result.assets
+                .prefix(Self.searchMetadataRefreshLimit)
+                .compactMap { asset -> AssetMetadataTarget? in
+                    guard !asset.metadataLoaded, let url = asset.sourceURL else { return nil }
+                    return AssetMetadataTarget(
+                        id: asset.id,
+                        url: url,
+                        shouldLoadDimensions: true,
+                        shouldLoadTags: false
+                    )
+                }
+            guard !metadataTargets.isEmpty else { return }
+
+            let metadataStore = LightboxIndexStore()
+            var batch: [AssetMetadataUpdate] = []
+            var processedCount = 0
+            for target in metadataTargets {
+                guard !Task.isCancelled else { return }
+                guard let size = ImageProbe.dimensions(for: target.url) else { continue }
+                processedCount += 1
+                batch.append(AssetMetadataUpdate(
+                    id: target.id,
+                    url: target.url,
+                    width: size.width,
+                    height: size.height,
+                    tags: nil
+                ))
+
+                if batch.count >= 48 {
+                    let updates = batch
+                    batch.removeAll(keepingCapacity: true)
+                    metadataStore.updateCachedMetadata(
+                        sourceID: sourceID,
+                        updates: updates.map {
+                            IndexedAssetMetadata(
+                                url: $0.url,
+                                width: $0.width,
+                                height: $0.height,
+                                tags: nil
+                            )
+                        }
+                    )
+                    await MainActor.run {
+                        self?.applySearchResultMetadataUpdates(
+                            updates,
+                            sourceID: sourceID,
+                            folderPath: currentFolderPath,
+                            searchText: trimmedSearchText
+                        )
+                    }
+                }
+
+                if processedCount % 32 == 0 {
+                    try? await Task.sleep(for: .milliseconds(4))
+                }
+            }
+
+            guard !batch.isEmpty else { return }
+            metadataStore.updateCachedMetadata(
+                sourceID: sourceID,
+                updates: batch.map {
+                    IndexedAssetMetadata(
+                        url: $0.url,
+                        width: $0.width,
+                        height: $0.height,
+                        tags: nil
+                    )
+                }
+            )
+            await MainActor.run {
+                self?.applySearchResultMetadataUpdates(
+                    batch,
+                    sourceID: sourceID,
+                    folderPath: currentFolderPath,
+                    searchText: trimmedSearchText
+                )
+            }
+        }
+    }
+
+    private func clearSearchResults() {
+        searchResultAssets = nil
+        searchResultFolderEntries = nil
     }
 
     private func sortedAssets(_ items: [LightboxAsset]) -> [LightboxAsset] {
         GalleryAssetSorter.sorted(items, field: sortField, direction: sortDirection)
     }
 
+    private func sortedFolderEntries(_ items: [LibraryFolderEntry]) -> [LibraryFolderEntry] {
+        LibraryFolderEntrySorter.sorted(items, field: sortField, direction: sortDirection)
+    }
+
+    private func assetForCurrentPresentation(_ assetID: LightboxAsset.ID) -> LightboxAsset? {
+        assets.first { $0.id == assetID }
+            ?? searchResultAssets?.first { $0.id == assetID }
+            ?? cachedActiveAssets.first { $0.id == assetID }
+    }
+
+    private func updatePresentedAssetDimensions(
+        _ assetID: LightboxAsset.ID,
+        width: CGFloat,
+        height: CGFloat,
+        metadataLoaded: Bool
+    ) {
+        if let index = searchResultAssets?.firstIndex(where: { $0.id == assetID }) {
+            searchResultAssets?[index].width = width
+            searchResultAssets?[index].height = height
+            searchResultAssets?[index].metadataLoaded = metadataLoaded
+        }
+
+        if let index = cachedActiveAssets.firstIndex(where: { $0.id == assetID }) {
+            cachedActiveAssets[index].width = width
+            cachedActiveAssets[index].height = height
+            cachedActiveAssets[index].metadataLoaded = metadataLoaded
+        }
+
+        if previewAssetSnapshot?.id == assetID {
+            previewAssetSnapshot?.width = width
+            previewAssetSnapshot?.height = height
+            previewAssetSnapshot?.metadataLoaded = metadataLoaded
+        }
+    }
+
     private func removeDetachedSelection() {
-        let assetIDs = Set(assets.map(\.id))
+        let assetIDs = Set((assets + (searchResultAssets ?? []) + cachedActiveAssets).map(\.id))
 
         if let selectedAssetID, !assetIDs.contains(selectedAssetID) {
             self.selectedAssetID = nil
@@ -2288,15 +2469,95 @@ final class AppState: ObservableObject {
             previewSourceHiddenAssetID = nil
             previewInteractionLayerReady = false
             previewSourceFrame = nil
+            previewAssetSnapshot = nil
             previewPhase = .closed
             previewSessionID = UUID()
             previewStepDirection = nil
         }
     }
 
+    private func shouldClearTagFilterAfterRemoving(
+        _ tag: String,
+        targetIDs: Set<LightboxAsset.ID>
+    ) -> Bool {
+        guard selectedFilter == .tag(tag), !activeAssets.isEmpty else { return false }
+        return activeAssets.allSatisfy { targetIDs.contains($0.id) }
+    }
+
+    private func clearCurrentTagFilterIfNeeded(
+        _ shouldClear: Bool,
+        removedTag tag: String,
+        targetAssets: [LightboxAsset],
+        updatedTagsByID: [LightboxAsset.ID: [String]]
+    ) {
+        guard shouldClear,
+              !targetAssets.isEmpty,
+              targetAssets.allSatisfy({ updatedTagsByID[$0.id]?.contains(tag) == false })
+        else {
+            return
+        }
+
+        selectedFilter = .all
+    }
+
     private func update(_ asset: LightboxAsset, body: (inout LightboxAsset) -> Void) {
-        guard let index = assets.firstIndex(where: { $0.id == asset.id }) else { return }
-        body(&assets[index])
+        var didUpdate = false
+        if let index = assets.firstIndex(where: { $0.id == asset.id }) {
+            body(&assets[index])
+            didUpdate = true
+        }
+        if var searchResultAssets,
+           let index = searchResultAssets.firstIndex(where: { $0.id == asset.id }) {
+            body(&searchResultAssets[index])
+            self.searchResultAssets = searchResultAssets
+            didUpdate = true
+        }
+        if let index = cachedActiveAssets.firstIndex(where: { $0.id == asset.id }) {
+            body(&cachedActiveAssets[index])
+            didUpdate = true
+        }
+        if var snapshot = previewAssetSnapshot, snapshot.id == asset.id {
+            body(&snapshot)
+            previewAssetSnapshot = snapshot
+            didUpdate = true
+        }
+        if didUpdate {
+            rebuildActiveAssets()
+        }
+    }
+
+    private func applyTagCopies(_ tagsByID: [LightboxAsset.ID: [String]]) {
+        guard !tagsByID.isEmpty else { return }
+
+        var nextAssets = assets
+        var changedAssets = false
+        for index in nextAssets.indices {
+            guard let tags = tagsByID[nextAssets[index].id] else { continue }
+            nextAssets[index].tags = tags
+            changedAssets = true
+        }
+        if changedAssets {
+            assets = nextAssets
+        }
+
+        if var searchResultAssets {
+            var changedSearchResults = false
+            for index in searchResultAssets.indices {
+                guard let tags = tagsByID[searchResultAssets[index].id] else { continue }
+                searchResultAssets[index].tags = tags
+                changedSearchResults = true
+            }
+            if changedSearchResults {
+                self.searchResultAssets = searchResultAssets
+            }
+        }
+
+        if let previewAssetSnapshot,
+           let tags = tagsByID[previewAssetSnapshot.id] {
+            self.previewAssetSnapshot?.tags = tags
+        }
+
+        rebuildActiveAssets()
     }
 
     private func writeColorTags(_ tags: [String], to asset: inout LightboxAsset) {

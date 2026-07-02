@@ -5,10 +5,8 @@ enum LibrarySourceStore {
     private static let selectedSourceKey = "Lightbox.full.selectedSource"
     private static let lastSessionKey = "Lightbox.full.lastSession"
 
-    static func loadSources(favoritesRoot: URL) -> [LibrarySource] {
-        let favorites = LibrarySource.favorites(rootURL: favoritesRoot)
-        let externalSources = loadExternalSources()
-        return [favorites] + externalSources
+    static func loadSources() -> [LibrarySource] {
+        loadExternalSources()
     }
 
     static func saveExternalSources(_ sources: [LibrarySource]) {

@@ -145,7 +145,6 @@ struct AssetCardView: View, Equatable {
                     .opacity(showsSelectionControl || isExplicitlySelected ? 1 : 0)
                     .padding(8)
                     .allowsHitTesting(false)
-                    .animation(MotionTokens.quick, value: showsSelectionControl)
                     .animation(MotionTokens.quick, value: isExplicitlySelected)
             }
             .overlay(alignment: .topTrailing) {
@@ -829,6 +828,15 @@ struct AssetImageView: View {
     }
 
     var body: some View {
+        GeometryReader { proxy in
+            imageContent
+                .frame(width: max(1, proxy.size.width), height: max(1, proxy.size.height))
+                .clipped()
+        }
+    }
+
+    @ViewBuilder
+    private var imageContent: some View {
         Group {
             if let image = loadedImage {
                 Image(nsImage: image)

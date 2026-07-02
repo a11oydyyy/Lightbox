@@ -159,6 +159,20 @@ import SQLite3
     #expect(appState.previewSpaceFrame(for: asset.id) == secondFrame)
 }
 
+@MainActor
+@Test func previewCanOpenAssetOutsideCurrentFolderSnapshot() async throws {
+    let appState = AppState()
+    let searchResultAsset = previewRouteAsset(id: "search-result-a", name: "result.jpg", addedAt: 0)
+
+    appState.assets = []
+    appState.showPreview(for: searchResultAsset, sourceFrame: CGRect(x: 40, y: 80, width: 120, height: 160))
+
+    #expect(appState.previewAssetID == searchResultAsset.id)
+    #expect(appState.previewAsset?.id == searchResultAsset.id)
+
+    appState.closePreview()
+}
+
 @Test func assetIDIsStableForFileURL() async throws {
     let url = URL(fileURLWithPath: "/tmp/lightbox/example.jpg")
     let first = LightboxAsset(
@@ -645,6 +659,141 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(GalleryAssetSorter.sorted(assets, field: .tag, direction: .ascending).map(\.originalName) == ["c.raw", "a.jpg", "b.png"])
     #expect(GalleryAssetSorter.sorted(assets, field: .tag, direction: .descending).map(\.originalName) == ["b.png", "a.jpg", "c.raw"])
     #expect(GalleryAssetSorter.sorted(assets, field: .type, direction: .ascending).map(\.originalName) == ["a.jpg", "b.png", "c.raw"])
+
+    let equalTimeAssets = assets.map {
+        LightboxAsset(
+            originalName: $0.originalName,
+            width: $0.width,
+            height: $0.height,
+            tags: $0.tags,
+            sourceURL: $0.sourceURL,
+            addedAt: Date(timeIntervalSince1970: 10),
+            fileSize: $0.fileSize,
+            palette: $0.palette
+        )
+    }
+    #expect(GalleryAssetSorter.sorted(equalTimeAssets, field: .time, direction: .ascending).map(\.originalName) == ["a.jpg", "b.png", "c.raw"])
+    #expect(GalleryAssetSorter.sorted(equalTimeAssets, field: .time, direction: .descending).map(\.originalName) == ["c.raw", "b.png", "a.jpg"])
+}
+
+@MainActor
+@Test func appStateRebuildsActiveAssetsWhenSortChanges() async throws {
+    let appState = AppState()
+    let older = LightboxAsset(
+        originalName: "b.png",
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: URL(fileURLWithPath: "/tmp/lightbox/b.png"),
+        addedAt: Date(timeIntervalSince1970: 10),
+        fileSize: 200,
+        palette: MockPalette.imported[0]
+    )
+    let newer = LightboxAsset(
+        originalName: "a.jpg",
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: URL(fileURLWithPath: "/tmp/lightbox/a.jpg"),
+        addedAt: Date(timeIntervalSince1970: 20),
+        fileSize: 100,
+        palette: MockPalette.imported[1]
+    )
+    let middle = LightboxAsset(
+        originalName: "c.raw",
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: URL(fileURLWithPath: "/tmp/lightbox/c.raw"),
+        addedAt: Date(timeIntervalSince1970: 15),
+        fileSize: 300,
+        palette: MockPalette.imported[2]
+    )
+
+    appState.assets = [older, newer, middle]
+
+    #expect(appState.activeAssets.map(\.originalName) == ["a.jpg", "c.raw", "b.png"])
+
+    appState.setSortField(.fileName)
+    #expect(appState.activeAssets.map(\.originalName) == ["c.raw", "b.png", "a.jpg"])
+
+    appState.toggleSortDirection()
+    #expect(appState.activeAssets.map(\.originalName) == ["a.jpg", "b.png", "c.raw"])
+}
+
+@MainActor
+@Test func appStateSortsActiveFoldersWhenSortDirectionChanges() async throws {
+    let appState = AppState()
+    let root = URL(fileURLWithPath: "/tmp/lightbox/source", isDirectory: true)
+    appState.folderEntries = [
+        LibraryFolderEntry(
+            sourceID: "source",
+            url: root.appendingPathComponent("Beta", isDirectory: true),
+            rootURL: root
+        ),
+        LibraryFolderEntry(
+            sourceID: "source",
+            url: root.appendingPathComponent("Alpha", isDirectory: true),
+            rootURL: root
+        )
+    ]
+
+    appState.sortField = .fileName
+    appState.sortDirection = .ascending
+    #expect(appState.activeFolderEntries.map(\.name) == ["Alpha", "Beta"])
+
+    appState.toggleSortDirection()
+    #expect(appState.activeFolderEntries.map(\.name) == ["Beta", "Alpha"])
+}
+
+@MainActor
+@Test func removingCurrentFilterTagFromAllVisibleAssetsClearsFilter() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxTagFilterTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let firstURL = root.appendingPathComponent("first.jpg")
+    let secondURL = root.appendingPathComponent("second.jpg")
+    try Data("first".utf8).write(to: firstURL)
+    try Data("second".utf8).write(to: secondURL)
+
+    let first = LightboxAsset(
+        originalName: "first.jpg",
+        width: 100,
+        height: 100,
+        tags: ["Red"],
+        sourceURL: firstURL,
+        addedAt: Date(timeIntervalSince1970: 10),
+        palette: MockPalette.imported[0]
+    )
+    let second = LightboxAsset(
+        originalName: "second.jpg",
+        width: 100,
+        height: 100,
+        tags: ["Red"],
+        sourceURL: secondURL,
+        addedAt: Date(timeIntervalSince1970: 20),
+        palette: MockPalette.imported[1]
+    )
+    let appState = AppState()
+    appState.assets = [first, second]
+    appState.selectedFilter = .tag("Red")
+
+    appState.selectedAssetIDs = [first.id]
+    appState.selectedAssetID = first.id
+    appState.toggleTagForSelection("Red")
+    #expect(appState.selectedFilter == .tag("Red"))
+    #expect(appState.activeAssets.map(\.id) == [second.id])
+
+    appState.selectedAssetIDs = [second.id]
+    appState.selectedAssetID = second.id
+    appState.toggleTagForSelection("Red")
+    #expect(appState.selectedFilter == .all)
+    #expect(Set(appState.activeAssets.map(\.id)) == Set([first.id, second.id]))
+    #expect(appState.activeAssets.allSatisfy { !$0.tags.contains("Red") })
 }
 
 @Test func localImageSourceRecognizesCommonRawFormats() async throws {
@@ -653,6 +802,213 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
         let url = URL(fileURLWithPath: "/tmp/lightbox/raw-sample.\(pathExtension)")
         #expect(LocalImageSource.isSupportedImageURL(url))
     }
+}
+
+@Test func searchQueryMatchesNamesOnly() async throws {
+    let asset = LightboxAsset(
+        originalName: "R0000305.JPG",
+        width: 6_000,
+        height: 4_000,
+        tags: ["Red"],
+        sourceURL: URL(fileURLWithPath: "/tmp/lightbox/R0000305.JPG"),
+        addedAt: .now,
+        fileSize: 12 * 1024 * 1024,
+        palette: MockPalette.imported[0],
+        metadataLoaded: true
+    )
+
+    let query = LightboxSearchQuery.parse("r000")
+
+    #expect(query.matches(asset))
+    #expect(!LightboxSearchQuery.parse("kind:jpg").matches(asset))
+    #expect(!LightboxSearchQuery.parse("tag:红色").matches(asset))
+}
+
+@Test func searchQueryFallsBackToFilenameForUnknownTokens() async throws {
+    let asset = LightboxAsset(
+        originalName: "camera:fuji-rose.jpg",
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: URL(fileURLWithPath: "/tmp/lightbox/camera:fuji-rose.jpg"),
+        addedAt: .now,
+        palette: MockPalette.imported[0]
+    )
+
+    #expect(LightboxSearchQuery.parse("camera:fuji").matches(asset))
+    #expect(!LightboxSearchQuery.parse("lens:canon").matches(asset))
+}
+
+@Test func searchQueryTreatsColonTokensAsNameTerms() async throws {
+    let query = LightboxSearchQuery.parse("rose tag:red camera:fuji width:>3000")
+    let asset = LightboxAsset(
+        originalName: "rose tag:red camera:fuji width:>3000.jpg",
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: URL(fileURLWithPath: "/tmp/lightbox/rose tag:red camera:fuji width:>3000.jpg"),
+        addedAt: .now,
+        palette: MockPalette.imported[0]
+    )
+
+    #expect(query.matches(asset))
+}
+
+@Test func searchStatusDefaultsToCompleteResults() async throws {
+    #expect(!LightboxSearchStatus(isSearching: false).limitReached)
+}
+
+@Test func searchQueryMatchesFolderNamesOnly() async throws {
+    let root = URL(fileURLWithPath: "/tmp/lightbox/source", isDirectory: true)
+    let folder = LibraryFolderEntry(
+        sourceID: "source",
+        url: root.appendingPathComponent("Trips/Rose Picks", isDirectory: true),
+        rootURL: root,
+        tags: ["Green"]
+    )
+
+    #expect(LightboxSearchQuery.parse("rose").matches(folder))
+    #expect(!LightboxSearchQuery.parse("trips").matches(folder))
+    #expect(!LightboxSearchQuery.parse("green").matches(folder))
+    #expect(!LightboxSearchQuery.parse("tag:green").matches(folder))
+}
+
+@Test func localImageSourceFastFolderSnapshotKeepsSortMetadata() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxSortMetadataTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let image = root.appendingPathComponent("rose.jpg")
+    try Data("image".utf8).write(to: image)
+
+    let source = LibrarySourceStore.makeExternalSource(rootURL: root)
+    let snapshot = LocalImageSource.loadFolderSnapshot(
+        in: root,
+        sourceID: source.id,
+        rootURL: root,
+        probeMetadata: false
+    )
+
+    let asset = try #require(snapshot.assets.first)
+    #expect(asset.fileSize == 5)
+    #expect(asset.addedAt != .distantPast)
+}
+
+@Test func localImageSourceSearchAssetsSupportsRecursiveFolderSearch() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxSearchTests-\(UUID().uuidString)", isDirectory: true)
+    let child = root.appendingPathComponent("child", isDirectory: true)
+    let nestedFolder = child.appendingPathComponent("rose-picks", isDirectory: true)
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let nestedMatch = child.appendingPathComponent("rose-red.jpg")
+    let nestedMiss = child.appendingPathComponent("rose-blue.png")
+    let ignored = child.appendingPathComponent("notes.txt")
+    try Data("image".utf8).write(to: nestedMatch)
+    try Data("image".utf8).write(to: nestedMiss)
+    try Data("notes".utf8).write(to: ignored)
+
+    let recursiveResult = LocalImageSource.searchAssets(
+        in: root,
+        sourceID: "source",
+        rootURL: root,
+        query: LightboxSearchQuery.parse("rose-red"),
+        recursive: true
+    )
+    let currentFolderResult = LocalImageSource.searchAssets(
+        in: root,
+        sourceID: "source",
+        rootURL: root,
+        query: LightboxSearchQuery.parse("rose-red"),
+        recursive: false
+    )
+    let folderResult = LocalImageSource.searchAssets(
+        in: root,
+        sourceID: "source",
+        rootURL: root,
+        query: LightboxSearchQuery.parse("rose-picks"),
+        recursive: true
+    )
+    let folderPreviewResult = LocalImageSource.searchFolders(
+        in: root,
+        sourceID: "source",
+        rootURL: root,
+        query: LightboxSearchQuery.parse("rose-picks"),
+        recursive: true
+    )
+
+    #expect(recursiveResult.assets.map(\.originalName) == ["rose-red.jpg"])
+    #expect(recursiveResult.visitedCount > 0)
+    #expect(!recursiveResult.limitReached)
+    #expect(currentFolderResult.assets.isEmpty)
+    #expect(folderResult.folders.map(\.name) == ["rose-picks"])
+    #expect(folderResult.assets.isEmpty)
+    #expect(folderPreviewResult.folders.map(\.name) == ["rose-picks"])
+    #expect(folderPreviewResult.assets.isEmpty)
+}
+
+@Test func localImageSourceSearchAssetsKeepsTagsAndContinuesAfterFolderLimit() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxSearchLimitTests-\(UUID().uuidString)", isDirectory: true)
+    let matchingFolder = root.appendingPathComponent("rose-folder", isDirectory: true)
+    let nested = root.appendingPathComponent("nested", isDirectory: true)
+    try FileManager.default.createDirectory(at: matchingFolder, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let image = nested.appendingPathComponent("rose-photo.jpg")
+    try Data("image".utf8).write(to: image)
+    #expect(FinderTagStore.setColorTags(["Red"], for: image))
+
+    let result = LocalImageSource.searchAssets(
+        in: root,
+        sourceID: "source",
+        rootURL: root,
+        query: LightboxSearchQuery.parse("rose"),
+        recursive: true,
+        maxResults: 10,
+        maxFolderResults: 0
+    )
+
+    #expect(result.limitReached)
+    #expect(result.folders.isEmpty)
+    #expect(result.assets.map(\.originalName) == ["rose-photo.jpg"])
+    #expect(result.assets.first?.tags == ["Red"])
+    #expect(result.assets.first?.fileSize == 5)
+    #expect(result.assets.first?.addedAt != .distantPast)
+}
+
+@Test func localImageSourceLoadsFolderTagsWithoutAssetMetadataProbe() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxFolderTagTests-\(UUID().uuidString)", isDirectory: true)
+    let taggedFolder = root.appendingPathComponent("RoseMorning", isDirectory: true)
+    try FileManager.default.createDirectory(at: taggedFolder, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    #expect(FinderTagStore.setColorTags(["Red"], for: taggedFolder))
+
+    let source = LibrarySourceStore.makeExternalSource(rootURL: root)
+    let snapshot = LocalImageSource.loadFolderSnapshot(
+        in: root,
+        sourceID: source.id,
+        rootURL: root,
+        probeMetadata: false
+    )
+
+    let folder = try #require(snapshot.folders.first { $0.url == taggedFolder.standardizedFileURL })
+    #expect(folder.tags == ["Red"])
+    #expect(snapshot.assets.isEmpty)
 }
 
 @Test func localImageSourceLoadsSystemTrashImagesFromFolders() async throws {
@@ -754,6 +1110,73 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(loaded.sourceKind == .external)
     #expect(loaded.sourceRootURL == sourceRoot.standardizedFileURL)
     #expect(loaded.folderURL == folderURL.standardizedFileURL)
+}
+
+@Test func librarySourceStoreDoesNotInjectLegacyFavoritesSource() async throws {
+    let defaults = UserDefaults.standard
+    let key = "Lightbox.full.externalSources"
+    let previous = defaults.data(forKey: key)
+    defer {
+        if let previous {
+            defaults.set(previous, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxExternalSourceTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let external = LibrarySourceStore.makeExternalSource(rootURL: root)
+    LibrarySourceStore.saveExternalSources([LibrarySource.favorites(rootURL: root), external])
+
+    let loaded = LibrarySourceStore.loadSources()
+
+    #expect(loaded == [external])
+    #expect(!loaded.contains { $0.kind == .favorites })
+}
+
+@MainActor
+@Test func sidebarOpenKeepsTemporarySourceWhenEnteringChildFolder() async throws {
+    let defaults = UserDefaults.standard
+    let savedSelectedSource = defaults.string(forKey: "Lightbox.full.selectedSource")
+    let savedLastSession = defaults.data(forKey: "Lightbox.full.lastSession")
+    defer {
+        if let savedSelectedSource {
+            defaults.set(savedSelectedSource, forKey: "Lightbox.full.selectedSource")
+        } else {
+            defaults.removeObject(forKey: "Lightbox.full.selectedSource")
+        }
+
+        if let savedLastSession {
+            defaults.set(savedLastSession, forKey: "Lightbox.full.lastSession")
+        } else {
+            defaults.removeObject(forKey: "Lightbox.full.lastSession")
+        }
+    }
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxTemporarySourceTests-\(UUID().uuidString)", isDirectory: true)
+    let child = root.appendingPathComponent("Nested", isDirectory: true)
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let appState = AppState()
+    appState.sources = []
+    appState.openSidebarFolder(root)
+    let temporarySourceID = try #require(appState.selectedSource?.id)
+
+    appState.openSidebarFolder(child)
+
+    #expect(appState.selectedSource?.id == temporarySourceID)
+    #expect(appState.selectedSource?.rootURL == root.standardizedFileURL)
+    #expect(appState.currentFolderURL == child.standardizedFileURL)
 }
 
 @Test func fastThumbnailOptionsPreferEmbeddedPreviews() async throws {

@@ -96,6 +96,10 @@ struct SidebarToggleButton: View {
     private func choose(_ filter: LibraryFilter) {
         withAnimation(MotionTokens.ifAllowed(.easeOut(duration: 0.24), reduceMotion: reduceMotion)) {
             appState.selectedFilter = filter
+        }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
             appState.clearSelection()
         }
     }

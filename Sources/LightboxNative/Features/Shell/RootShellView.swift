@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct RootShellView: View {
     @EnvironmentObject private var appState: AppState
@@ -47,13 +46,6 @@ struct RootShellView: View {
         usesCompatibilitySidebarMotion ? sidebarContentVisible : !appState.sidebarCollapsed
     }
 
-    // Temporarily disabled. Keep the drop import implementation in AppState for a future restore.
-    private let allowsExternalDropImport = false
-
-    private var externalDropTypes: [UTType] {
-        allowsExternalDropImport ? [.image, .fileURL] : []
-    }
-
     var body: some View {
         ZStack {
             AppBackdrop()
@@ -98,18 +90,6 @@ struct RootShellView: View {
                             )
                         )
 
-                    if appState.isDropTargeted {
-                        DropOverlay()
-                            .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                    }
-
-                    if let progress = appState.importProgress {
-                        ImportProgressPill(progress: progress)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                            .padding(.top, 18)
-                            .padding(.trailing, 18)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -186,18 +166,6 @@ struct RootShellView: View {
             overlayChromeRevealTask?.cancel()
             sidebarToggleTask?.cancel()
             sidebarVisibilityTask?.cancel()
-        }
-        .fileImporter(
-            isPresented: $appState.showFileImporter,
-            allowedContentTypes: [.image],
-            allowsMultipleSelection: true
-        ) { result in
-            if case .success(let urls) = result {
-                appState.importSelectedFiles(urls)
-            }
-        }
-        .onDrop(of: externalDropTypes, isTargeted: $appState.isDropTargeted) { providers in
-            appState.handleDrop(providers: providers)
         }
     }
 
