@@ -66,7 +66,6 @@ enum LightboxTextKey: String, CaseIterable {
     case alreadyUpToDateStatus
     case checkForUpdates
     case checkingForUpdates
-    case chooseLibraryFolder
     case clear
     case clearCompareTray
     case close
@@ -83,7 +82,6 @@ enum LightboxTextKey: String, CaseIterable {
     case dark
     case defaultApp
     case downloadingUpdate
-    case dropImagesToImport
     case english
     case github
     case githubReleases
@@ -92,12 +90,10 @@ enum LightboxTextKey: String, CaseIterable {
     case folderTileWidth
     case grid
     case hoverGlow
-    case importImages
     case installUpdate
     case installingUpdate
     case japanese
     case language
-    case library
     case light
     case liquidGlassOpacity
     case masonry
@@ -118,6 +114,7 @@ enum LightboxTextKey: String, CaseIterable {
     case restore
     case scanningFolder
     case search
+    case searchResultsLimited
     case settings
     case share
     case showInFinder
@@ -343,14 +340,13 @@ enum LightboxLocalization {
         .addSelectedToCompareTray: "Add Selected to Compare Tray",
         .addToCompareTray: "Add to Compare Tray",
         .appearance: "Appearance",
-        .appDescription: "Native image library and comparison workspace.",
+        .appDescription: "Native image browser and comparison workspace.",
         .assetMenu: "Asset",
         .alreadyUpToDate: "Lightbox is up to date",
         .alreadyUpToDateMessage: "You are on the latest version (%@).",
         .alreadyUpToDateStatus: "Current: %@",
         .checkForUpdates: "Check for Updates",
         .checkingForUpdates: "Checking...",
-        .chooseLibraryFolder: "Choose Library Folder...",
         .clear: "Clear",
         .clearCompareTray: "Clear Compare Tray",
         .close: "Close",
@@ -367,7 +363,6 @@ enum LightboxLocalization {
         .dark: "Dark",
         .defaultApp: "Default",
         .downloadingUpdate: "Downloading update...",
-        .dropImagesToImport: "Drop images to import",
         .english: "English",
         .github: "GitHub",
         .githubReleases: "GitHub Releases",
@@ -376,12 +371,10 @@ enum LightboxLocalization {
         .folderTileWidth: "Folder tile width",
         .grid: "Grid",
         .hoverGlow: "Hover Glow",
-        .importImages: "Import Images...",
         .installUpdate: "Install Update",
         .installingUpdate: "Installing update...",
         .japanese: "日本語",
         .language: "Language",
-        .library: "Library",
         .light: "Light",
         .liquidGlassOpacity: "Liquid Glass Opacity",
         .masonry: "Masonry",
@@ -402,6 +395,7 @@ enum LightboxLocalization {
         .restore: "Restore",
         .scanningFolder: "Scanning folder",
         .search: "Search",
+        .searchResultsLimited: "Some results are hidden. Narrow the search.",
         .settings: "Settings",
         .share: "Share...",
         .showInFinder: "Show in Finder",
@@ -446,14 +440,13 @@ enum LightboxLocalization {
         .addSelectedToCompareTray: "加入对比暂存区",
         .addToCompareTray: "加入对比暂存区",
         .appearance: "外观",
-        .appDescription: "原生图片图库与对比工作区。",
+        .appDescription: "原生图片浏览与对比工作区。",
         .assetMenu: "图片",
         .alreadyUpToDate: "Lightbox 已是最新版",
         .alreadyUpToDateMessage: "当前已经是最新版本（%@）。",
         .alreadyUpToDateStatus: "当前版本：%@",
         .checkForUpdates: "检查更新",
         .checkingForUpdates: "正在检查...",
-        .chooseLibraryFolder: "选择图库目录...",
         .clear: "清除",
         .clearCompareTray: "清空对比暂存区",
         .close: "关闭",
@@ -470,7 +463,6 @@ enum LightboxLocalization {
         .dark: "深色",
         .defaultApp: "默认",
         .downloadingUpdate: "正在下载更新...",
-        .dropImagesToImport: "松开以导入图片",
         .english: "English",
         .github: "GitHub",
         .githubReleases: "GitHub Releases",
@@ -479,18 +471,16 @@ enum LightboxLocalization {
         .folderTileWidth: "文件夹胶囊宽度",
         .grid: "网格",
         .hoverGlow: "悬停光晕",
-        .importImages: "导入图片...",
         .installUpdate: "安装更新",
         .installingUpdate: "正在安装更新...",
         .japanese: "日本語",
         .language: "语言",
-        .library: "图库",
         .light: "浅色",
         .liquidGlassOpacity: "Liquid Glass 透明度",
         .masonry: "瀑布流",
         .moveToTrash: "移到废纸篓",
         .noImagesHere: "这里还没有图片",
-        .noMatches: "没有匹配的图片",
+        .noMatches: "没有匹配结果",
         .openFilters: "打开筛选",
         .openFolder: "添加文件夹...",
         .openFullDiskAccess: "打开完全磁盘访问权限",
@@ -505,6 +495,7 @@ enum LightboxLocalization {
         .restore: "恢复",
         .scanningFolder: "正在扫描文件夹",
         .search: "搜索",
+        .searchResultsLimited: "结果可能不完整，请缩小关键词",
         .settings: "设置",
         .share: "分享...",
         .showInFinder: "在 Finder 中显示",
@@ -549,14 +540,13 @@ enum LightboxLocalization {
         .addSelectedToCompareTray: "選択項目を比較トレイに追加",
         .addToCompareTray: "比較トレイに追加",
         .appearance: "外観",
-        .appDescription: "ネイティブ画像ライブラリと比較ワークスペース。",
+        .appDescription: "ネイティブ画像ブラウザと比較ワークスペース。",
         .assetMenu: "画像",
         .alreadyUpToDate: "Lightbox は最新です",
         .alreadyUpToDateMessage: "現在のバージョンは最新です（%@）。",
         .alreadyUpToDateStatus: "現在: %@",
         .checkForUpdates: "アップデートを確認",
         .checkingForUpdates: "確認中...",
-        .chooseLibraryFolder: "ライブラリフォルダを選択...",
         .clear: "クリア",
         .clearCompareTray: "比較トレイをクリア",
         .close: "閉じる",
@@ -573,7 +563,6 @@ enum LightboxLocalization {
         .dark: "ダーク",
         .defaultApp: "デフォルト",
         .downloadingUpdate: "アップデートをダウンロード中...",
-        .dropImagesToImport: "画像をドロップして読み込む",
         .english: "English",
         .github: "GitHub",
         .githubReleases: "GitHub Releases",
@@ -582,18 +571,16 @@ enum LightboxLocalization {
         .folderTileWidth: "フォルダの幅",
         .grid: "グリッド",
         .hoverGlow: "ホバーグロー",
-        .importImages: "画像を読み込む...",
         .installUpdate: "アップデートをインストール",
         .installingUpdate: "アップデートをインストール中...",
         .japanese: "日本語",
         .language: "言語",
-        .library: "ライブラリ",
         .light: "ライト",
         .liquidGlassOpacity: "Liquid Glass の透明度",
         .masonry: "メイソンリー",
         .moveToTrash: "ゴミ箱に移動",
         .noImagesHere: "ここには画像がありません",
-        .noMatches: "一致する画像がありません",
+        .noMatches: "一致する項目がありません",
         .openFilters: "フィルタを開く",
         .openFolder: "フォルダを追加...",
         .openFullDiskAccess: "フルディスクアクセスを開く",
@@ -608,6 +595,7 @@ enum LightboxLocalization {
         .restore: "復元",
         .scanningFolder: "フォルダをスキャン中",
         .search: "検索",
+        .searchResultsLimited: "一部の結果が非表示です。検索語を絞り込んでください。",
         .settings: "設定",
         .share: "共有...",
         .showInFinder: "Finder に表示",

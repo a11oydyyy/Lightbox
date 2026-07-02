@@ -38,34 +38,6 @@ enum LocalImageSource {
         supportedImageExtensions.contains(url.pathExtension.lowercased())
     }
 
-    static func loadAssets(libraryFolder: URL) -> [LightboxAsset] {
-        let sources = imageURLs(in: libraryFolder).map {
-            (url: $0, isDeleted: false)
-        } + LightboxLibraryStore.systemTrashFolders.flatMap { trashFolder in
-            imageURLs(in: trashFolder, recursive: false)
-        }.map {
-            (url: $0, isDeleted: true)
-        }
-
-        return sources.enumerated().map { index, source in
-            let url = source.url
-            let size = ImageProbe.dimensions(for: url) ?? MockLibrary.importFallbackSizes[index % MockLibrary.importFallbackSizes.count]
-            let addedAt = addedDate(for: url) ?? .distantPast
-            return LightboxAsset(
-                originalName: url.lastPathComponent,
-                width: size.width,
-                height: size.height,
-                tags: FinderTagStore.colorTags(for: url),
-                sourceURL: url,
-                addedAt: addedAt,
-                fileSize: fileSize(for: url),
-                palette: MockPalette.imported[index % MockPalette.imported.count],
-                deletedAt: source.isDeleted ? addedAt : nil
-            )
-        }
-        .sorted(by: sortByAddedDate)
-    }
-
     static func loadAssets(
         in folder: URL,
         isDeleted: Bool = false,
@@ -137,6 +109,97 @@ enum LocalImageSource {
         return SystemTrashSnapshot(assets: assets, inaccessibleFolders: inaccessibleFolders)
     }
 
+    static func searchFolders(
+        in folder: URL,
+        sourceID: LibrarySource.ID,
+        rootURL: URL,
+        query: LightboxSearchQuery,
+        recursive: Bool,
+        maxResults: Int = 300,
+        maxVisited: Int = 20_000
+    ) -> LightboxSearchScanResult {
+        let startedAt = Date()
+        var folders: [LibraryFolderEntry] = []
+        folders.reserveCapacity(min(maxResults, 64))
+        var visitedCount = 0
+        var limitReached = false
+
+        func visit(_ url: URL) {
+            guard !Task.isCancelled else { return }
+            visitedCount += 1
+            if visitedCount > maxVisited {
+                limitReached = true
+                return
+            }
+
+            guard query.mayMatchFolderName(url.lastPathComponent) else {
+                return
+            }
+
+            let folder = LibraryFolderEntry(
+                sourceID: sourceID,
+                url: url.standardizedFileURL,
+                rootURL: rootURL.standardizedFileURL,
+                tags: []
+            )
+            guard query.matches(folder) else { return }
+            if folders.count < maxResults {
+                folders.append(folder)
+                return
+            }
+
+            limitReached = true
+        }
+
+        func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
+            let posix = posixDirectoryEntries(in: folder, options: [.skipsHiddenFiles]).urls
+            if !posix.isEmpty { return posix }
+            return directoryChildren(
+                in: folder,
+                includingPropertiesForKeys: [],
+                options: [.skipsHiddenFiles]
+            ).map { POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil) }
+        }
+
+        func isDirectory(_ entry: POSIXDirectoryEntry) -> Bool {
+            if let isDirectory = entry.isDirectory {
+                return isDirectory
+            }
+            let values = try? entry.url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if values?.isSymbolicLink == true {
+                return false
+            }
+            return values?.isDirectory == true
+        }
+
+        if recursive {
+            var stack = [folder.standardizedFileURL]
+            while let directory = stack.popLast() {
+                guard !Task.isCancelled, !limitReached else { break }
+                for entry in directoryEntries(in: directory) {
+                    guard !Task.isCancelled, !limitReached else { break }
+                    guard isDirectory(entry) else { continue }
+                    visit(entry.url)
+                    stack.append(entry.url)
+                }
+            }
+        } else {
+            for entry in directoryEntries(in: folder) {
+                guard isDirectory(entry) else { continue }
+                visit(entry.url)
+            }
+        }
+
+        let sortedFolders = sortedSearchFolders(folders)
+        logger.info("folder-search complete path=\(folder.path, privacy: .public) recursive=\(recursive) visited=\(visitedCount) folders=\(sortedFolders.count) limit=\(limitReached) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+        return LightboxSearchScanResult(
+            assets: [],
+            folders: sortedFolders,
+            visitedCount: visitedCount,
+            limitReached: limitReached
+        )
+    }
+
     static func loadFolderSnapshot(
         in folder: URL,
         sourceID: LibrarySource.ID,
@@ -146,37 +209,27 @@ enum LocalImageSource {
         cachedDimensions: [String: CachedAssetDimensions] = [:]
     ) -> LocalFolderSnapshot {
         let readStartedAt = Date()
-        let urls: [URL]
-        do {
-            urls = try FileManager.default.contentsOfDirectory(
-                at: folder,
-                includingPropertiesForKeys: folderSnapshotResourceKeys,
+        var entries = posixDirectoryEntries(in: folder.standardizedFileURL, options: [.skipsHiddenFiles]).urls
+        if entries.isEmpty {
+            entries = directoryChildrenResult(
+                in: folder,
+                includingPropertiesForKeys: [],
                 options: [.skipsHiddenFiles]
-            )
-        } catch {
-            let elapsed = Date().timeIntervalSince(readStartedAt)
-            logger.error("folder-scan read failed path=\(folder.path, privacy: .public) seconds=\(elapsed, format: .fixed(precision: 2)) error=\(String(describing: error), privacy: .public)")
-            return LocalFolderSnapshot(
-                entryCount: 0,
-                folders: [],
-                assets: [],
-                directoryReadSeconds: elapsed,
-                classificationSeconds: 0,
-                metadataProbeSeconds: 0,
-                sortSeconds: 0
-            )
+            ).urls.map { POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil) }
         }
         let directoryReadSeconds = Date().timeIntervalSince(readStartedAt)
+        let classificationKeys = Set(folderSnapshotClassificationKeys(probeMetadata: probeMetadata))
 
         var folders: [LibraryFolderEntry] = []
         var assets: [LightboxAsset] = []
-        folders.reserveCapacity(min(urls.count, 64))
-        assets.reserveCapacity(urls.count)
+        folders.reserveCapacity(min(entries.count, 64))
+        assets.reserveCapacity(entries.count)
 
         let classifyStartedAt = Date()
-        for url in urls {
-            let values = try? url.resourceValues(forKeys: Set(folderSnapshotResourceKeys))
-            if values?.isDirectory == true {
+        for entry in entries {
+            let url = entry.url
+            let values = try? url.resourceValues(forKeys: classificationKeys)
+            if entry.isDirectory ?? (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
                 folders.append(LibraryFolderEntry(
                     sourceID: sourceID,
                     url: url.standardizedFileURL,
@@ -187,6 +240,9 @@ enum LocalImageSource {
             }
 
             guard isSupportedImageURL(url) else {
+                continue
+            }
+            if let isRegularFile = entry.isRegularFile, !isRegularFile {
                 continue
             }
 
@@ -249,10 +305,10 @@ enum LocalImageSource {
         }
         let metadataProbeSeconds = Date().timeIntervalSince(metadataProbeStartedAt)
 
-        logger.info("folder-scan complete path=\(folder.path, privacy: .public) probe=\(probeMetadata) cachedDimensions=\(cachedDimensions.count) initialProbe=\(metadataProbeCount)/\(initialMetadataLimit) entries=\(urls.count) folders=\(sortedFolders.count) assets=\(sortedAssets.count) read=\(directoryReadSeconds, format: .fixed(precision: 2))s classify=\(classificationSeconds, format: .fixed(precision: 2))s metadataProbe=\(metadataProbeSeconds, format: .fixed(precision: 2))s sort=\(sortSeconds, format: .fixed(precision: 2))s")
+        logger.info("folder-scan complete path=\(folder.path, privacy: .public) probe=\(probeMetadata) cachedDimensions=\(cachedDimensions.count) initialProbe=\(metadataProbeCount)/\(initialMetadataLimit) entries=\(entries.count) folders=\(sortedFolders.count) assets=\(sortedAssets.count) read=\(directoryReadSeconds, format: .fixed(precision: 2))s classify=\(classificationSeconds, format: .fixed(precision: 2))s metadataProbe=\(metadataProbeSeconds, format: .fixed(precision: 2))s sort=\(sortSeconds, format: .fixed(precision: 2))s")
 
         return LocalFolderSnapshot(
-            entryCount: urls.count,
+            entryCount: entries.count,
             folders: sortedFolders,
             assets: sortedAssets,
             directoryReadSeconds: directoryReadSeconds,
@@ -260,6 +316,177 @@ enum LocalImageSource {
             metadataProbeSeconds: metadataProbeSeconds,
             sortSeconds: sortSeconds
         )
+    }
+
+    static func searchAssets(
+        in folder: URL,
+        sourceID: LibrarySource.ID,
+        rootURL: URL,
+        query: LightboxSearchQuery,
+        recursive: Bool,
+        maxResults: Int = 2_000,
+        maxFolderResults: Int = 300,
+        maxVisited: Int = 20_000
+    ) -> LightboxSearchScanResult {
+        let startedAt = Date()
+
+        var assets: [LightboxAsset] = []
+        assets.reserveCapacity(min(maxResults, 256))
+        var folders: [LibraryFolderEntry] = []
+        folders.reserveCapacity(min(maxFolderResults, 64))
+        var visitedCount = 0
+        var traversalLimitReached = false
+        var resultLimitReached = false
+
+        func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
+            let posix = posixDirectoryEntries(in: folder, options: [.skipsHiddenFiles]).urls
+            if !posix.isEmpty { return posix }
+            return directoryChildren(
+                in: folder,
+                includingPropertiesForKeys: [],
+                options: [.skipsHiddenFiles]
+            ).map { POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil) }
+        }
+
+        func isDirectory(_ entry: POSIXDirectoryEntry) -> Bool {
+            if let isDirectory = entry.isDirectory {
+                return isDirectory
+            }
+            let values = try? entry.url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if values?.isSymbolicLink == true {
+                return false
+            }
+            return values?.isDirectory == true
+        }
+
+        func visit(_ entry: POSIXDirectoryEntry, knownIsDirectory: Bool? = nil) -> Bool {
+            guard !Task.isCancelled else { return true }
+            let url = entry.url
+            visitedCount += 1
+            if visitedCount > maxVisited {
+                traversalLimitReached = true
+                resultLimitReached = true
+                return true
+            }
+
+            let mayMatchFolder = query.mayMatchFolderName(url.lastPathComponent)
+            let mayMatchAsset = isSupportedImageURL(url) && query.mayMatchAssetName(url.lastPathComponent)
+            guard mayMatchFolder || mayMatchAsset else {
+                return false
+            }
+
+            let entryIsDirectory = knownIsDirectory ?? isDirectory(entry)
+            if entryIsDirectory {
+                guard mayMatchFolder else { return false }
+                let folder = LibraryFolderEntry(
+                    sourceID: sourceID,
+                    url: url.standardizedFileURL,
+                    rootURL: rootURL.standardizedFileURL,
+                    tags: []
+                )
+                guard query.matches(folder) else { return false }
+                if folders.count < maxFolderResults {
+                    folders.append(folder)
+                } else {
+                    resultLimitReached = true
+                }
+                return false
+            }
+
+            guard mayMatchAsset else { return false }
+            if let isRegularFile = entry.isRegularFile, !isRegularFile { return false }
+
+            let fallbackSize = MockLibrary.importFallbackSizes[assets.count % MockLibrary.importFallbackSizes.count]
+            let values = try? url.resourceValues(forKeys: [
+                .addedToDirectoryDateKey,
+                .creationDateKey,
+                .contentModificationDateKey,
+                .fileSizeKey
+            ])
+            let asset = LightboxAsset(
+                originalName: url.lastPathComponent,
+                width: fallbackSize.width,
+                height: fallbackSize.height,
+                tags: FinderTagStore.colorTags(for: url),
+                sourceURL: url,
+                addedAt: addedDate(from: values) ?? .distantPast,
+                fileSize: fileSize(from: values),
+                palette: MockPalette.imported[assets.count % MockPalette.imported.count],
+                metadataLoaded: false
+            )
+
+            guard query.matches(asset) else { return false }
+            assets.append(asset)
+            if assets.count >= maxResults {
+                traversalLimitReached = true
+                resultLimitReached = true
+                return true
+            }
+            return false
+        }
+
+        if recursive {
+            var stack = [folder.standardizedFileURL]
+            while let directory = stack.popLast() {
+                guard !Task.isCancelled, !traversalLimitReached else { break }
+                for entry in directoryEntries(in: directory) {
+                    guard !Task.isCancelled, !traversalLimitReached else { break }
+                    let entryIsDirectory = isDirectory(entry)
+                    if entryIsDirectory {
+                        if visit(entry, knownIsDirectory: true) {
+                            break
+                        }
+                        stack.append(entry.url)
+                    } else if visit(entry, knownIsDirectory: false) {
+                        break
+                    }
+                }
+            }
+        } else {
+            for entry in directoryEntries(in: folder) {
+                if visit(entry) {
+                    break
+                }
+            }
+        }
+
+        let sortedAssets = assets.sorted { lhs, rhs in
+            let lhsParent = lhs.sourceURL?.deletingLastPathComponent().path ?? ""
+            let rhsParent = rhs.sourceURL?.deletingLastPathComponent().path ?? ""
+            if lhsParent != rhsParent {
+                return lhsParent.localizedStandardCompare(rhsParent) == .orderedAscending
+            }
+            return lhs.originalName.localizedStandardCompare(rhs.originalName) == .orderedAscending
+        }
+        let sortedFolders = sortedSearchFolders(folders)
+        logger.info("search scan complete path=\(folder.path, privacy: .public) recursive=\(recursive) visited=\(visitedCount) folders=\(sortedFolders.count) results=\(sortedAssets.count) limit=\(resultLimitReached) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+        return LightboxSearchScanResult(
+            assets: sortedAssets,
+            folders: sortedFolders,
+            visitedCount: visitedCount,
+            limitReached: resultLimitReached
+        )
+    }
+
+    private static func folderSnapshotClassificationKeys(probeMetadata: Bool) -> [URLResourceKey] {
+        guard probeMetadata else {
+            return [
+                .isDirectoryKey,
+                .addedToDirectoryDateKey,
+                .creationDateKey,
+                .contentModificationDateKey,
+                .fileSizeKey
+            ]
+        }
+        return folderSnapshotResourceKeys
+    }
+
+    private static func sortedSearchFolders(
+        _ folders: [LibraryFolderEntry]
+    ) -> [LibraryFolderEntry] {
+        folders.sorted {
+            return $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+        }
     }
 
     static func imageURLs(in folder: URL) -> [URL] {
@@ -311,6 +538,12 @@ enum LocalImageSource {
     private struct DirectoryChildrenResult {
         var urls: [URL]
         var accessDenied: Bool
+    }
+
+    private struct POSIXDirectoryEntry {
+        var url: URL
+        var isDirectory: Bool?
+        var isRegularFile: Bool?
     }
 
     private static func directoryChildrenResult(
@@ -373,17 +606,28 @@ enum LocalImageSource {
         in folder: URL,
         options: FileManager.DirectoryEnumerationOptions
     ) -> DirectoryChildrenResult {
+        let entries = posixDirectoryEntries(in: folder, options: options)
+        return DirectoryChildrenResult(
+            urls: entries.urls.map(\.url),
+            accessDenied: entries.accessDenied
+        )
+    }
+
+    private static func posixDirectoryEntries(
+        in folder: URL,
+        options: FileManager.DirectoryEnumerationOptions
+    ) -> (urls: [POSIXDirectoryEntry], accessDenied: Bool) {
         let path = folder.path
         guard let directory = opendir(path) else {
             let accessDenied = errno == EACCES || errno == EPERM
             logger.error("directory posix read failed path=\(path, privacy: .public) errno=\(errno)")
-            return DirectoryChildrenResult(urls: [], accessDenied: accessDenied)
+            return ([], accessDenied)
         }
         defer {
             closedir(directory)
         }
 
-        var names: [String] = []
+        var entries: [POSIXDirectoryEntry] = []
         while let entry = readdir(directory) {
             let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) {
@@ -393,13 +637,32 @@ enum LocalImageSource {
             guard name != ".", name != ".." else {
                 continue
             }
-            names.append(name)
+            guard !(options.contains(.skipsHiddenFiles) && name.hasPrefix(".")) else {
+                continue
+            }
+
+            let type = entry.pointee.d_type
+            let isDirectory: Bool?
+            let isRegularFile: Bool?
+            switch type {
+            case UInt8(DT_DIR):
+                isDirectory = true
+                isRegularFile = false
+            case UInt8(DT_REG):
+                isDirectory = false
+                isRegularFile = true
+            default:
+                isDirectory = nil
+                isRegularFile = nil
+            }
+            entries.append(POSIXDirectoryEntry(
+                url: folder.appendingPathComponent(name),
+                isDirectory: isDirectory,
+                isRegularFile: isRegularFile
+            ))
         }
 
-        return DirectoryChildrenResult(
-            urls: childURLs(from: names, folder: folder, options: options),
-            accessDenied: false
-        )
+        return (entries, false)
     }
 
     static func folders(in folder: URL, sourceID: LibrarySource.ID, rootURL: URL) -> [LibraryFolderEntry] {

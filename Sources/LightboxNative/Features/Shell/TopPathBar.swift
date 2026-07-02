@@ -9,6 +9,9 @@ struct TopPathBar: View {
     @State private var isSortMenuPresented = false
     private static let selectionLeadingInset: CGFloat = 9
     private static let selectionTrailingInset: CGFloat = 13
+    private static let collapsedSearchWidth: CGFloat = 36
+    private static let expandedSearchWidth: CGFloat = 224
+    private static let searchTextFieldWidth: CGFloat = 142
 
     private var isSelecting: Bool {
         appState.selectedAssetCount > 1
@@ -24,7 +27,7 @@ struct TopPathBar: View {
             let sidebarWidth: CGFloat = isSelecting ? 0 : 36
             let sidebarGap: CGFloat = isSelecting ? 0 : 8
             let leadingControlsWidth = sidebarWidth + sidebarGap
-            let searchWidth: CGFloat = isSearchExpanded ? 212 : 36
+            let searchWidth: CGFloat = isSearchExpanded ? Self.expandedSearchWidth : Self.collapsedSearchWidth
             let searchGap: CGFloat = 8
             let sortWidth: CGFloat = 36
             let sortGap: CGFloat = 8
@@ -65,10 +68,12 @@ struct TopPathBar: View {
             .frame(maxWidth: .infinity, alignment: .center)
         }
         .frame(height: 40)
-        .animation(MotionTokens.ifAllowed(MotionTokens.previewChrome, reduceMotion: reduceMotion), value: isSelecting)
         .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.currentPathTitle)
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.breadcrumbs)
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: isSearchExpanded)
+        .onChange(of: appState.searchFocusGeneration) { _ in
+            expandSearch()
+        }
     }
 
     private func primaryCapsule(width: CGFloat, isSelecting: Bool) -> some View {
@@ -115,8 +120,8 @@ struct TopPathBar: View {
         content()
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
             .opacity(isVisible ? 1 : 0)
-            .blur(radius: isVisible || reduceMotion ? 0 : 8)
-            .compositingGroup()
+            .offset(y: isVisible || reduceMotion ? 0 : 1.5)
+            .animation(MotionTokens.ifAllowed(.easeOut(duration: 0.12), reduceMotion: reduceMotion), value: isVisible)
             .allowsHitTesting(isVisible)
     }
 
@@ -151,11 +156,11 @@ struct TopPathBar: View {
 
                 BreadcrumbStrip()
                     .layoutPriority(1)
-                    // Blur/fade the breadcrumb content in place on path change so
+                    // Fade the breadcrumb content in place on path change so
                     // going up a level doesn't hard-swap the "…"/crumbs while the
                     // capsule width eases independently.
                     .id(appState.currentFolderURL.standardizedFileURL.path)
-                    .transition(.lightboxBlurReplace)
+                    .transition(.opacity)
             }
         }
         .fixedSize(horizontal: true, vertical: false)
@@ -246,7 +251,7 @@ struct TopPathBar: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(TopPathBarColor.strongText)
                     .focused($isSearchFocused)
-                    .frame(width: 142)
+                    .frame(width: Self.searchTextFieldWidth)
                     .transition(.opacity.combined(with: .move(edge: .trailing)))
 
                 Button {
@@ -267,7 +272,7 @@ struct TopPathBar: View {
         .padding(.leading, 5)
         .padding(.trailing, isSearchExpanded ? 7 : 5)
         .frame(height: 36)
-        .frame(width: isSearchExpanded ? 212 : 36)
+        .frame(width: isSearchExpanded ? Self.expandedSearchWidth : Self.collapsedSearchWidth)
         .topBarGlass(Capsule())
         .shadow(color: .black.opacity(topBarShadowOpacity), radius: 8, y: 3)
     }
@@ -619,7 +624,7 @@ private struct SourceMenuButton: View {
     @State private var menuUnpinnedSourceIDs: Set<LibrarySource.ID> = []
 
     private var title: String {
-        appState.selectedSource?.displayName ?? appState.localized(.library)
+        appState.selectedSource?.displayName ?? "Lightbox"
     }
 
     private var pinnedSources: [LibrarySource] {

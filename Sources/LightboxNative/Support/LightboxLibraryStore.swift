@@ -4,36 +4,12 @@ import OSLog
 
 enum LightboxLibraryStore {
     private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "LibraryStore")
-    private static let libraryFolderKey = "Lightbox.libraryFolder"
-    private static let migratedLegacyImportsKey = "Lightbox.migratedLegacyImports"
     private static let trashRestoreDestinationsKey = "Lightbox.trashRestoreDestinations"
-
-    static var applicationSupportFolder: URL {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Lightbox", isDirectory: true)
-    }
 
     static var cacheFolder: URL {
         FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Lightbox", isDirectory: true)
-    }
-
-    static var defaultLibraryFolder: URL {
-        applicationSupportFolder.appendingPathComponent("Library", isDirectory: true)
-    }
-
-    static var favoritesFolder: URL {
-        libraryFolder
-    }
-
-    static var favoritesImportedFolder: URL {
-        favoritesFolder.appendingPathComponent("Imported", isDirectory: true)
-    }
-
-    static var legacyImportsFolder: URL {
-        applicationSupportFolder.appendingPathComponent("Imports", isDirectory: true)
     }
 
     static var primarySystemTrashFolder: URL {
@@ -64,57 +40,6 @@ enum LightboxLibraryStore {
 
     static var indexDatabaseURL: URL {
         cacheFolder.appendingPathComponent("Lightbox.sqlite", isDirectory: false)
-    }
-
-    static var libraryFolder: URL {
-        guard let path = UserDefaults.standard.string(forKey: libraryFolderKey),
-              !path.isEmpty
-        else {
-            return defaultLibraryFolder
-        }
-
-        return URL(fileURLWithPath: path, isDirectory: true)
-    }
-
-    static func setLibraryFolder(_ url: URL) {
-        UserDefaults.standard.set(url.standardizedFileURL.path, forKey: libraryFolderKey)
-    }
-
-    static func prepareStorage() {
-        createDirectory(defaultLibraryFolder)
-        createDirectory(libraryFolder)
-        createDirectory(favoritesImportedFolder)
-        migrateLegacyImagesIfNeeded()
-    }
-
-    static func copyIntoLibrary(_ sourceURL: URL, libraryFolder: URL, preferredName: String? = nil) -> URL? {
-        copyImage(sourceURL, into: libraryFolder, preferredName: preferredName)
-    }
-
-    static func copyDataIntoLibrary(
-        _ data: Data,
-        suggestedName: String?,
-        pathExtension: String,
-        libraryFolder: URL
-    ) -> URL? {
-        createDirectory(libraryFolder)
-
-        let sourceName = sanitizedFileName(suggestedName) ?? "Image"
-        let source = URL(fileURLWithPath: sourceName)
-        let extensionToUse = source.pathExtension.isEmpty ? pathExtension : source.pathExtension
-        let baseName = source.deletingPathExtension().lastPathComponent
-        let destination = uniqueDestination(
-            baseName: baseName,
-            pathExtension: extensionToUse,
-            folder: libraryFolder
-        )
-
-        do {
-            try data.write(to: destination, options: .atomic)
-            return destination
-        } catch {
-            return nil
-        }
     }
 
     static func moveToSystemTrash(_ sourceURL: URL) -> Bool {
@@ -265,57 +190,6 @@ enum LightboxLibraryStore {
         url.standardizedFileURL.path
     }
 
-    private static func migrateLegacyImagesIfNeeded() {
-        let defaults = UserDefaults.standard
-
-        if !defaults.bool(forKey: migratedLegacyImportsKey) {
-            copyImages(from: legacyImportsFolder, into: defaultLibraryFolder)
-            defaults.set(true, forKey: migratedLegacyImportsKey)
-        }
-
-    }
-
-    private static func copyImages(from sourceFolder: URL, into destinationFolder: URL) {
-        for url in LocalImageSource.imageURLs(in: sourceFolder) {
-            _ = copyImage(url, into: destinationFolder)
-        }
-    }
-
-    private static func copyImage(_ sourceURL: URL, into folder: URL, preferredName: String? = nil) -> URL? {
-        let source = sourceURL.standardizedFileURL
-        guard FileManager.default.fileExists(atPath: source.path) else {
-            return nil
-        }
-
-        if source.path.hasPrefix(folder.standardizedFileURL.path + "/") {
-            return source
-        }
-
-        let didAccess = source.startAccessingSecurityScopedResource()
-        defer {
-            if didAccess {
-                source.stopAccessingSecurityScopedResource()
-            }
-        }
-
-        createDirectory(folder)
-        let preferredURL = sanitizedFileName(preferredName).map { URL(fileURLWithPath: $0) }
-        let sourceName = preferredURL ?? source
-        let pathExtension = sourceName.pathExtension.isEmpty ? source.pathExtension : sourceName.pathExtension
-        let destination = uniqueDestination(
-            baseName: sourceName.deletingPathExtension().lastPathComponent,
-            pathExtension: pathExtension,
-            folder: folder
-        )
-
-        do {
-            try FileManager.default.copyItem(at: source, to: destination)
-            return destination
-        } catch {
-            return nil
-        }
-    }
-
     private static func uniqueDestination(baseName: String, pathExtension: String, folder: URL) -> URL {
         let cleanBaseName = baseName.isEmpty ? "Image" : baseName
         var candidate = folder.appendingPathComponent(cleanBaseName, isDirectory: false)
@@ -333,22 +207,6 @@ enum LightboxLibraryStore {
         }
 
         return candidate
-    }
-
-    private static func sanitizedFileName(_ name: String?) -> String? {
-        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let trimmed, !trimmed.isEmpty else {
-            return nil
-        }
-
-        return URL(fileURLWithPath: trimmed).lastPathComponent
-    }
-
-    private static func createDirectory(_ url: URL) {
-        try? FileManager.default.createDirectory(
-            at: url,
-            withIntermediateDirectories: true
-        )
     }
 
     private static func isExistingDirectory(_ url: URL) -> Bool {

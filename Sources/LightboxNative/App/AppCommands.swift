@@ -6,6 +6,13 @@ struct LightboxCommands: Commands {
     var body: some Commands {
         CommandGroup(after: .newItem) {
             Button {
+                appState.focusSearch()
+            } label: {
+                Label(appState.localized(.search), systemImage: "magnifyingglass")
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+
+            Button {
                 appState.refreshLibrary()
             } label: {
                 Label(appState.localized(.refreshLibrary), systemImage: "arrow.clockwise")
