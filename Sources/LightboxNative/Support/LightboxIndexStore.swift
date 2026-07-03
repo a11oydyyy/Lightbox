@@ -21,6 +21,11 @@ struct IndexedAssetMetadata: Sendable {
     var tags: [String]?
 }
 
+struct IndexedVisibleSnapshot: Sendable {
+    var folders: [LibraryFolderEntry]
+    var assets: [LightboxAsset]
+}
+
 final class LightboxIndexStore {
     private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Index")
     private static let dimensionCacheVersion = 2
@@ -174,6 +179,65 @@ final class LightboxIndexStore {
 
         Self.logger.info("index dimensions read source=\(sourceID, privacy: .public) parent=\(parentPath, privacy: .public) count=\(dimensions.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
         return dimensions
+    }
+
+    func cachedVisibleSnapshot(source: LibrarySource, folderURL: URL) -> IndexedVisibleSnapshot? {
+        let startedAt = Date()
+        let folderPath = folderURL.standardizedFileURL.path
+        let sql = """
+        SELECT path, is_directory, file_size, mtime, width, height, tags, metadata_loaded
+        FROM items
+        WHERE source_id = ?
+          AND parent_path = ?
+        ORDER BY is_directory DESC, relative_path ASC;
+        """
+        var folders: [LibraryFolderEntry] = []
+        var assets: [LightboxAsset] = []
+
+        withStatement(sql) { statement in
+            bindText(source.id, to: statement, at: 1)
+            bindText(folderPath, to: statement, at: 2)
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let path = columnText(statement, at: 0) else { continue }
+                let url = URL(fileURLWithPath: path)
+                let tags = Self.decodedTags(columnText(statement, at: 6) ?? "")
+                let isDirectory = sqlite3_column_int(statement, 1) == 1
+                if isDirectory {
+                    folders.append(LibraryFolderEntry(
+                        sourceID: source.id,
+                        url: url.standardizedFileURL,
+                        rootURL: source.rootURL.standardizedFileURL,
+                        tags: tags
+                    ))
+                    continue
+                }
+
+                let width = nullableDouble(statement, at: 4).map { CGFloat($0) }
+                let height = nullableDouble(statement, at: 5).map { CGFloat($0) }
+                let metadataLoaded = sqlite3_column_int(statement, 7) == 1
+                    && (width ?? 0) > 0
+                    && (height ?? 0) > 0
+                assets.append(LightboxAsset(
+                    originalName: url.lastPathComponent,
+                    width: metadataLoaded ? width ?? 1 : 1,
+                    height: metadataLoaded ? height ?? 1 : 1,
+                    tags: tags,
+                    sourceURL: url,
+                    addedAt: nullableDate(statement, at: 3) ?? .distantPast,
+                    fileSize: nullableInt64(statement, at: 2),
+                    palette: MockPalette.imported[assets.count % MockPalette.imported.count],
+                    metadataLoaded: metadataLoaded
+                ))
+            }
+        }
+
+        guard !folders.isEmpty || !assets.isEmpty else {
+            return nil
+        }
+
+        Self.logger.info("index visible snapshot read source=\(source.id, privacy: .public) parent=\(folderPath, privacy: .public) folders=\(folders.count) assets=\(assets.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
+        return IndexedVisibleSnapshot(folders: folders, assets: assets)
     }
 
     func updateCachedDimensions(sourceID: String, updates: [IndexedAssetDimensions]) {
@@ -475,6 +539,24 @@ final class LightboxIndexStore {
         sqlite3_bind_int64(statement, index, value)
     }
 
+    private func nullableDate(_ statement: OpaquePointer?, at index: Int32) -> Date? {
+        nullableDouble(statement, at: index).map(Date.init(timeIntervalSince1970:))
+    }
+
+    private func nullableDouble(_ statement: OpaquePointer?, at index: Int32) -> Double? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else {
+            return nil
+        }
+        return sqlite3_column_double(statement, index)
+    }
+
+    private func nullableInt64(_ statement: OpaquePointer?, at index: Int32) -> Int64? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else {
+            return nil
+        }
+        return sqlite3_column_int64(statement, index)
+    }
+
     private func modificationTime(for url: URL) -> Date? {
         try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
@@ -497,6 +579,10 @@ final class LightboxIndexStore {
 
     private static func encodedTags(_ tags: [String]) -> String {
         tags.joined(separator: "\n")
+    }
+
+    private static func decodedTags(_ tags: String) -> [String] {
+        tags.split(separator: "\n").map(String.init)
     }
 }
 

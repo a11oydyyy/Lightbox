@@ -166,7 +166,7 @@ struct AssetCardView: View, Equatable {
             .compositingGroup()
             .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
             .scaleEffect(isComparePulse ? 1.006 : 1)
-            .hover3D(isReduced: usesReducedHover)
+            .hover3D(isReduced: usesReducedHover, isEnabled: isInteractionEnabled)
             .overlay {
                 AssetInteractionLayer(
                     debugSurface: "gallery-card",
@@ -852,6 +852,7 @@ struct AssetImageView: View {
             imageRequest?.cancel()
             imageRequest = nil
             guard loadsImage else {
+                loadedImage = nil
                 requestID = UUID()
                 return
             }
@@ -880,6 +881,7 @@ struct AssetImageView: View {
         .onDisappear {
             imageRequest?.cancel()
             imageRequest = nil
+            loadedImage = nil
             requestID = UUID()
         }
     }

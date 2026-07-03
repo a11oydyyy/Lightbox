@@ -43,9 +43,8 @@ enum FinderTagStore {
     ]
 
     static func colorTags(for url: URL) -> [String] {
-        let resourceTags = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
         let xattrTags = rawUserTags(for: url)
-        let tags = (resourceTags + xattrTags).compactMap { colorTagName(from: $0) }
+        let tags = xattrTags.compactMap { colorTagName(from: $0) }
         return MacColorTag.sort(Array(Set(tags)))
     }
 

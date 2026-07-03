@@ -273,6 +273,47 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(cached[imageURL.standardizedFileURL.path]?.height == 654)
 }
 
+@Test func indexStoreReturnsVisibleSnapshot() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let databaseURL = root.appendingPathComponent("index.sqlite")
+    let imageURL = root.appendingPathComponent("cached.jpg")
+    let folderURL = root.appendingPathComponent("Nested", isDirectory: true)
+    try Data("cached".utf8).write(to: imageURL)
+    try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+
+    let source = LibrarySource.favorites(rootURL: root)
+    let folder = LibraryFolderEntry(sourceID: source.id, url: folderURL, rootURL: root, tags: ["Red"])
+    let asset = LightboxAsset(
+        originalName: imageURL.lastPathComponent,
+        width: 321,
+        height: 654,
+        tags: ["Blue"],
+        sourceURL: imageURL,
+        addedAt: .now,
+        fileSize: 6,
+        palette: MockPalette.imported[0],
+        metadataLoaded: true
+    )
+
+    let store = LightboxIndexStore(databaseURL: databaseURL)
+    store.replaceVisibleSnapshot(source: source, folderURL: root, folders: [folder], assets: [asset])
+
+    let snapshot = try #require(store.cachedVisibleSnapshot(source: source, folderURL: root))
+    #expect(snapshot.folders.map(\.url.standardizedFileURL.path) == [folderURL.standardizedFileURL.path])
+    #expect(snapshot.folders.first?.tags == ["Red"])
+    #expect(snapshot.assets.map(\.sourceURL?.standardizedFileURL.path) == [imageURL.standardizedFileURL.path])
+    #expect(snapshot.assets.first?.width == 321)
+    #expect(snapshot.assets.first?.height == 654)
+    #expect(snapshot.assets.first?.tags == ["Blue"])
+    #expect(snapshot.assets.first?.metadataLoaded == true)
+}
+
 @Test func indexStoreDoesNotReturnFallbackDimensions() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -451,6 +492,142 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(cache.cacheURL(for: sourceURL, quality: .preview) == nil)
 }
 
+@Test @MainActor func imageCacheMemoryResetKeepsThumbnailDiskCache() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sourceURL = root.appendingPathComponent("source.jpg", isDirectory: false)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("source".utf8).write(to: sourceURL)
+
+    let diskCache = ThumbnailDiskCache(folder: root.appendingPathComponent("thumbnails", isDirectory: true))
+    let image = try #require(makeTestImage())
+    let cache = ImageCache(diskCache: diskCache) { _, _ in image }
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .thumbnailFast) { decodedImage in
+            #expect(decodedImage != nil)
+            continuation.resume()
+        }
+    }
+    #expect(diskCache.image(for: sourceURL, quality: .thumbnailFast) != nil)
+
+    cache.removeMemoryObjects(reason: "test")
+
+    #expect(diskCache.image(for: sourceURL, quality: .thumbnailFast) != nil)
+}
+
+@Test @MainActor func imageCacheThumbnailMemoryResetKeepsPreviewAndComparisonCaches() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sourceURL = root.appendingPathComponent("source.jpg", isDirectory: false)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("source".utf8).write(to: sourceURL)
+
+    let thumbnailImage = try #require(makeTestImage(size: 8))
+    let previewImage = try #require(makeTestImage(size: 24))
+    let comparisonImage = try #require(makeTestImage(size: 16))
+    let cache = ImageCache(diskCache: ThumbnailDiskCache(folder: root.appendingPathComponent("thumbnails", isDirectory: true))) { _, quality in
+        switch quality {
+        case .preview:
+            previewImage
+        case .comparison:
+            comparisonImage
+        default:
+            thumbnailImage
+        }
+    }
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .thumbnailFast) { decodedImage in
+            #expect(decodedImage?.size.width == 8)
+            continuation.resume()
+        }
+    }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .preview) { decodedImage in
+            #expect(decodedImage?.size.width == 24)
+            continuation.resume()
+        }
+    }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .comparison) { decodedImage in
+            #expect(decodedImage?.size.width == 16)
+            continuation.resume()
+        }
+    }
+
+    cache.removeThumbnailMemoryObjects(reason: "test")
+
+    #expect(cache.bestCachedImage(for: sourceURL, quality: .thumbnailFast) == nil)
+    #expect(cache.bestCachedImage(for: sourceURL, quality: .preview)?.size.width == 24)
+    #expect(cache.bestCachedImage(for: sourceURL, quality: .comparison)?.size.width == 16)
+}
+
+@Test @MainActor func imageCacheSourceMemoryResetClearsComparisonButKeepsPreviewCache() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sourceURL = root.appendingPathComponent("source.jpg", isDirectory: false)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("source".utf8).write(to: sourceURL)
+
+    let thumbnailImage = try #require(makeTestImage(size: 8))
+    let previewImage = try #require(makeTestImage(size: 24))
+    let comparisonImage = try #require(makeTestImage(size: 16))
+    let comparisonDecodeCount = TestCounter()
+    let cache = ImageCache(diskCache: ThumbnailDiskCache(folder: root.appendingPathComponent("thumbnails", isDirectory: true))) { _, quality in
+        switch quality {
+        case .preview:
+            return previewImage
+        case .comparison:
+            comparisonDecodeCount.increment()
+            return comparisonImage
+        default:
+            return thumbnailImage
+        }
+    }
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .thumbnailFast) { decodedImage in
+            #expect(decodedImage?.size.width == 8)
+            continuation.resume()
+        }
+    }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .preview) { decodedImage in
+            #expect(decodedImage?.size.width == 24)
+            continuation.resume()
+        }
+    }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .comparison) { decodedImage in
+            #expect(decodedImage?.size.width == 16)
+            continuation.resume()
+        }
+    }
+    #expect(comparisonDecodeCount.count == 1)
+
+    cache.removeSourceMemoryObjects(reason: "test")
+
+    #expect(cache.bestCachedImage(for: sourceURL, quality: .thumbnailFast) == nil)
+    #expect(cache.bestCachedImage(for: sourceURL, quality: .preview)?.size.width == 24)
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: sourceURL, quality: .comparison) { decodedImage in
+            #expect(decodedImage?.size.width == 16)
+            continuation.resume()
+        }
+    }
+    #expect(comparisonDecodeCount.count == 2)
+}
+
 @Test func imageCacheTelemetrySummarizesThumbnailHitRate() async throws {
     let telemetry = ImageCacheTelemetry(summaryInterval: 2)
 
@@ -588,12 +765,115 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(compatibility.maxPrioritizedAssetCount == 24)
     #expect(!normal.reducesHoverEffects)
     #expect(compatibility.reducesHoverEffects)
-    #expect(normal.thumbnailQuality(assetCount: 101, isExternalSource: false) == .thumbnail)
-    #expect(compatibility.thumbnailQuality(assetCount: 101, isExternalSource: false) == .thumbnailBalanced)
-    #expect(compatibility.thumbnailQuality(assetCount: 300, isExternalSource: false) == .thumbnailFast)
+    #expect(normal.thumbnailQuality(assetCount: 101, usesConservativeExternalLoading: false) == .thumbnail)
+    #expect(normal.thumbnailQuality(assetCount: 79, usesConservativeExternalLoading: true) == .thumbnail)
+    #expect(normal.thumbnailQuality(assetCount: 80, usesConservativeExternalLoading: true) == .thumbnailBalanced)
+    #expect(normal.thumbnailQuality(assetCount: 320, usesConservativeExternalLoading: true) == .thumbnailFast)
+    #expect(compatibility.thumbnailQuality(assetCount: 101, usesConservativeExternalLoading: false) == .thumbnailBalanced)
+    #expect(compatibility.thumbnailQuality(assetCount: 300, usesConservativeExternalLoading: false) == .thumbnailFast)
+    #expect(normal.permitsFullThumbnailPromotion(assetCount: 79, usesConservativeExternalLoading: true))
+    #expect(!normal.permitsFullThumbnailPromotion(assetCount: 80, usesConservativeExternalLoading: true))
+    #expect(normal.permitsFullThumbnailPromotion(assetCount: 300, usesConservativeExternalLoading: false))
+    #expect(!compatibility.permitsFullThumbnailPromotion(assetCount: 12, usesConservativeExternalLoading: false))
     #expect(
         compatibility.preloadMargin(viewportHeight: 1_000, prefersFastRawThumbnails: false)
         < normal.preloadMargin(viewportHeight: 1_000, prefersFastRawThumbnails: false)
+    )
+}
+
+@Test func userFolderExternalSourcesKeepLocalImageLoadingPolicy() async throws {
+    let fileManager = FileManager.default
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let gr3x = LibrarySource(
+        id: "gr3x",
+        name: "GR3X",
+        rootURL: home.appendingPathComponent("Pictures/GR3X", isDirectory: true),
+        kind: .external
+    )
+    let nas = LibrarySource(
+        id: "nas",
+        name: "NAS",
+        rootURL: URL(fileURLWithPath: "/Volumes/home/Photos", isDirectory: true),
+        kind: .external
+    )
+    let outsideHomeTarget = fileManager.temporaryDirectory
+        .appendingPathComponent("LightboxSymlinkTarget-\(UUID().uuidString)", isDirectory: true)
+    let homeSymlink = home
+        .appendingPathComponent("Library/Caches/LightboxSymlinkSource-\(UUID().uuidString)", isDirectory: true)
+    try fileManager.createDirectory(at: outsideHomeTarget, withIntermediateDirectories: true)
+    try fileManager.createSymbolicLink(at: homeSymlink, withDestinationURL: outsideHomeTarget)
+    defer {
+        try? fileManager.removeItem(at: homeSymlink)
+        try? fileManager.removeItem(at: outsideHomeTarget)
+    }
+    let symlinkedExternal = LibrarySource(
+        id: "symlinked-external",
+        name: "Symlinked External",
+        rootURL: homeSymlink,
+        kind: .external
+    )
+    let profile = GalleryPerformanceProfile(isCompatibilityMode: false)
+
+    #expect(!gr3x.usesConservativeExternalLoading)
+    #expect(nas.usesConservativeExternalLoading)
+    #expect(symlinkedExternal.usesConservativeExternalLoading)
+    #expect(
+        profile.thumbnailQuality(
+            assetCount: 120,
+            usesConservativeExternalLoading: gr3x.usesConservativeExternalLoading
+        ) == .thumbnail
+    )
+    #expect(
+        profile.thumbnailQuality(
+            assetCount: 120,
+            usesConservativeExternalLoading: nas.usesConservativeExternalLoading
+        ) == .thumbnailBalanced
+    )
+    #expect(
+        profile.permitsFullThumbnailPromotion(
+            assetCount: 120,
+            usesConservativeExternalLoading: gr3x.usesConservativeExternalLoading
+        )
+    )
+    #expect(
+        !profile.permitsFullThumbnailPromotion(
+            assetCount: 120,
+            usesConservativeExternalLoading: nas.usesConservativeExternalLoading
+        )
+    )
+}
+
+@Test func assetMetadataRefreshPolicyLimitsExternalAssetTagsDuringNormalBrowsing() async throws {
+    let local = AssetMetadataRefreshPolicy(usesConservativeExternalLoading: false)
+    let external = AssetMetadataRefreshPolicy(usesConservativeExternalLoading: true)
+    let externalTagFilter = AssetMetadataRefreshPolicy(
+        usesConservativeExternalLoading: true,
+        requiresCompleteAssetTags: true
+    )
+
+    #expect(local.dimensionLimit(assetCount: 110) == 110)
+    #expect(local.tagLimit(assetCount: 110) == 110)
+    #expect(local.startDelayMilliseconds == 650)
+    #expect(external.dimensionLimit(assetCount: 110) == 4)
+    #expect(external.dimensionLimit(assetCount: 3) == 3)
+    #expect(external.tagLimit(assetCount: 110) == 12)
+    #expect(external.tagLimit(assetCount: 20) == 12)
+    #expect(external.startDelayMilliseconds == 1_600)
+    #expect(externalTagFilter.tagLimit(assetCount: 110) == 110)
+}
+
+@Test func libraryRefreshPolicyDelaysExternalScanWhenCachedSnapshotExists() async throws {
+    #expect(
+        LibraryRefreshPolicy(usesConservativeExternalLoading: true, hasCachedVisibleSnapshot: true).scanStartDelayMilliseconds
+        == 1_200
+    )
+    #expect(
+        LibraryRefreshPolicy(usesConservativeExternalLoading: true, hasCachedVisibleSnapshot: false).scanStartDelayMilliseconds
+        == 0
+    )
+    #expect(
+        LibraryRefreshPolicy(usesConservativeExternalLoading: false, hasCachedVisibleSnapshot: true).scanStartDelayMilliseconds
+        == 0
     )
 }
 
@@ -603,9 +883,17 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
     #expect(compatibility.thumbnailCountLimit < normal.thumbnailCountLimit)
     #expect(compatibility.thumbnailTotalCostLimit < normal.thumbnailTotalCostLimit)
+    #expect(compatibility.previewCountLimit < normal.previewCountLimit)
+    #expect(compatibility.previewTotalCostLimit < normal.previewTotalCostLimit)
     #expect(compatibility.comparisonCountLimit < normal.comparisonCountLimit)
     #expect(compatibility.comparisonTotalCostLimit < normal.comparisonTotalCostLimit)
     #expect(compatibility.decodeConcurrency < normal.decodeConcurrency)
+}
+
+@Test func imageDecodePriorityMapsLowPriorityWorkToUtilityQoS() async throws {
+    #expect(ImageDecodePriority.high.qualityOfService == .userInitiated)
+    #expect(ImageDecodePriority.normal.qualityOfService == .userInitiated)
+    #expect(ImageDecodePriority.low.qualityOfService == .utility)
 }
 
 @Test func imageProbeSwapsDimensionsForRotatedOrientations() async throws {
@@ -1011,6 +1299,44 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(snapshot.assets.isEmpty)
 }
 
+@Test func sidebarFolderTagCacheReadsAndStoresFolderTags() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxSidebarTagCacheTests-\(UUID().uuidString)", isDirectory: true)
+    let taggedFolder = root.appendingPathComponent("RoseMorning", isDirectory: true)
+    try FileManager.default.createDirectory(at: taggedFolder, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    #expect(FinderTagStore.setColorTags(["Red"], for: taggedFolder))
+
+    let cache = SidebarFolderTagCache()
+    #expect(await cache.tags(for: taggedFolder) == ["Red"])
+
+    cache.store(["Blue"], for: taggedFolder)
+    #expect(cache.cachedTags(for: taggedFolder) == ["Blue"])
+}
+
+@Test func sidebarFolderTagCacheEvictsOldEntriesAndClears() async throws {
+    let cache = SidebarFolderTagCache(maxEntries: 2)
+    let first = URL(fileURLWithPath: "/tmp/lightbox-sidebar-tags-first", isDirectory: true)
+    let second = URL(fileURLWithPath: "/tmp/lightbox-sidebar-tags-second", isDirectory: true)
+    let third = URL(fileURLWithPath: "/tmp/lightbox-sidebar-tags-third", isDirectory: true)
+
+    cache.store(["Red"], for: first)
+    cache.store(["Blue"], for: second)
+    cache.store(["Green"], for: third)
+
+    #expect(cache.cachedTags(for: first) == nil)
+    #expect(cache.cachedTags(for: second) == ["Blue"])
+    #expect(cache.cachedTags(for: third) == ["Green"])
+
+    cache.clear()
+
+    #expect(cache.cachedTags(for: second) == nil)
+    #expect(cache.cachedTags(for: third) == nil)
+}
+
 @Test func localImageSourceLoadsSystemTrashImagesFromFolders() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxSystemTrashTests-\(UUID().uuidString)", isDirectory: true)
@@ -1188,6 +1514,8 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(options[kCGImageSourceCreateThumbnailFromImageIfAbsent] as? Bool == true)
     #expect(options[kCGImageSourceCreateThumbnailFromImageAlways] == nil)
     #expect(options[kCGImageSourceThumbnailMaxPixelSize] as? Int == 512)
+    #expect(options[kCGImageSourceShouldCache] as? Bool == false)
+    #expect(options[kCGImageSourceShouldCacheImmediately] as? Bool == true)
 }
 
 @Test func visibleThumbnailOptionsForceFullImageDownsample() async throws {
@@ -1199,6 +1527,14 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(options[kCGImageSourceCreateThumbnailFromImageAlways] as? Bool == true)
     #expect(options[kCGImageSourceCreateThumbnailFromImageIfAbsent] == nil)
     #expect(options[kCGImageSourceThumbnailMaxPixelSize] as? Int == 1024)
+    #expect(options[kCGImageSourceShouldCache] as? Bool == false)
+    #expect(options[kCGImageSourceShouldCacheImmediately] as? Bool == true)
+}
+
+@Test func imageSourceOptionsAvoidImageIOPersistentCache() async throws {
+    let options = ImageCache.imageSourceOptions()
+
+    #expect(options[kCGImageSourceShouldCache] as? Bool == false)
 }
 
 @Test func glowColorHexUsesSRGBComponentsWithoutChannelDrift() async throws {
@@ -1300,11 +1636,11 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(!LightboxUpdateChecker.isVersion("v1.3.0", newerThan: "1.3.1"))
 }
 
-private func makeTestImage() -> NSImage? {
+private func makeTestImage(size: Int = 8) -> NSImage? {
     guard let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil,
-        pixelsWide: 8,
-        pixelsHigh: 8,
+        pixelsWide: size,
+        pixelsHigh: size,
         bitsPerSample: 8,
         samplesPerPixel: 4,
         hasAlpha: true,
@@ -1316,9 +1652,26 @@ private func makeTestImage() -> NSImage? {
         return nil
     }
 
-    let image = NSImage(size: NSSize(width: 8, height: 8))
+    let image = NSImage(size: NSSize(width: size, height: size))
     image.addRepresentation(bitmap)
     return image
+}
+
+private final class TestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func increment() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
 }
 
 private func sampleReleaseData(tag: String) throws -> Data {
