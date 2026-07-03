@@ -20,6 +20,14 @@ struct LibrarySource: Identifiable, Codable, Hashable, Sendable {
         kind == .favorites
     }
 
+    var usesConservativeExternalLoading: Bool {
+        guard !isLocalLibrary else { return false }
+
+        let rootPath = rootURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.resolvingSymlinksInPath().path
+        return !(rootPath == homePath || rootPath.hasPrefix(homePath + "/"))
+    }
+
     var displayName: String {
         if isLocalLibrary {
             return Self.localLibraryDisplayName

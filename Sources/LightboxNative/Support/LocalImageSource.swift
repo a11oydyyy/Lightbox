@@ -205,6 +205,7 @@ enum LocalImageSource {
         sourceID: LibrarySource.ID,
         rootURL: URL,
         probeMetadata: Bool = true,
+        probeFolderTags: Bool = true,
         initialMetadataLimit: Int = 0,
         cachedDimensions: [String: CachedAssetDimensions] = [:]
     ) -> LocalFolderSnapshot {
@@ -234,7 +235,7 @@ enum LocalImageSource {
                     sourceID: sourceID,
                     url: url.standardizedFileURL,
                     rootURL: rootURL.standardizedFileURL,
-                    tags: FinderTagStore.colorTags(for: url)
+                    tags: probeFolderTags ? FinderTagStore.colorTags(for: url) : []
                 ))
                 continue
             }
@@ -666,22 +667,20 @@ enum LocalImageSource {
     }
 
     static func folders(in folder: URL, sourceID: LibrarySource.ID, rootURL: URL) -> [LibraryFolderEntry] {
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: folder,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-
-        return urls.compactMap { url in
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+        let entries = posixDirectoryEntries(in: folder.standardizedFileURL, options: [.skipsHiddenFiles]).urls
+        return entries.compactMap { entry in
+            let isDirectory = entry.isDirectory
+                ?? (try? entry.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory)
+                ?? false
+            guard isDirectory else {
                 return nil
             }
 
             return LibraryFolderEntry(
                 sourceID: sourceID,
-                url: url.standardizedFileURL,
+                url: entry.url.standardizedFileURL,
                 rootURL: rootURL.standardizedFileURL,
-                tags: FinderTagStore.colorTags(for: url)
+                tags: []
             )
         }
         .sorted { lhs, rhs in

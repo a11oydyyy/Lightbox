@@ -9,6 +9,7 @@ final class ImageCache: @unchecked Sendable {
     private nonisolated static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "ImageDecode")
 
     private let cache = NSCache<NSString, NSImage>()
+    private let previewCache = NSCache<NSString, NSImage>()
     private let comparisonCache = NSCache<NSString, NSImage>()
     private var decodeQueue: OperationQueue
     private let memoryProfile: ImageCacheMemoryProfile
@@ -32,6 +33,8 @@ final class ImageCache: @unchecked Sendable {
         decodeQueue = Self.makeDecodeQueue(memoryProfile: memoryProfile)
         cache.countLimit = memoryProfile.thumbnailCountLimit
         cache.totalCostLimit = memoryProfile.thumbnailTotalCostLimit
+        previewCache.countLimit = memoryProfile.previewCountLimit
+        previewCache.totalCostLimit = memoryProfile.previewTotalCostLimit
         comparisonCache.countLimit = memoryProfile.comparisonCountLimit
         comparisonCache.totalCostLimit = memoryProfile.comparisonTotalCostLimit
     }
@@ -39,10 +42,35 @@ final class ImageCache: @unchecked Sendable {
     func removeAll() {
         let (nextGeneration, pending) = resetDecodeQueue()
         cache.removeAllObjects()
+        previewCache.removeAllObjects()
         comparisonCache.removeAllObjects()
         diskCache.removeAll()
         telemetry.reset()
         Self.logger.info("cache clear generation=\(nextGeneration) cancelledPending=\(pending)")
+    }
+
+    func removeMemoryObjects(reason: String) {
+        let (nextGeneration, pending) = resetDecodeQueue()
+        cache.removeAllObjects()
+        previewCache.removeAllObjects()
+        comparisonCache.removeAllObjects()
+        telemetry.reset()
+        Self.logger.info("memory cache clear reason=\(reason, privacy: .public) generation=\(nextGeneration) cancelledPending=\(pending)")
+    }
+
+    func removeThumbnailMemoryObjects(reason: String) {
+        let (nextGeneration, pending) = resetDecodeQueue()
+        cache.removeAllObjects()
+        telemetry.reset()
+        Self.logger.info("thumbnail memory cache clear reason=\(reason, privacy: .public) generation=\(nextGeneration) cancelledPending=\(pending)")
+    }
+
+    func removeSourceMemoryObjects(reason: String) {
+        let (nextGeneration, pending) = resetDecodeQueue()
+        cache.removeAllObjects()
+        comparisonCache.removeAllObjects()
+        telemetry.reset()
+        Self.logger.info("source memory cache clear reason=\(reason, privacy: .public) generation=\(nextGeneration) cancelledPending=\(pending)")
     }
 
     func cancelOutstandingRequests(reason: String) {
@@ -61,14 +89,13 @@ final class ImageCache: @unchecked Sendable {
         requestLock.unlock()
         let pending = max(decodeQueue.operationCount, pendingSubscriberCount)
         decodeQueue.cancelAllOperations()
-        decodeQueue = Self.makeDecodeQueue(memoryProfile: memoryProfile)
         return (nextGeneration, pending)
     }
 
     private static func makeDecodeQueue(memoryProfile: ImageCacheMemoryProfile = .current) -> OperationQueue {
         let queue = OperationQueue()
         queue.name = "Lightbox.ImageDecode"
-        queue.qualityOfService = .userInitiated
+        queue.qualityOfService = .default
         queue.maxConcurrentOperationCount = memoryProfile.decodeConcurrency
         return queue
     }
@@ -156,33 +183,57 @@ final class ImageCache: @unchecked Sendable {
 
         let operation = BlockOperation()
         operation.queuePriority = priority.queuePriority
+        operation.qualityOfService = priority.qualityOfService
         let queuedAt = Date()
         operation.addExecutionBlock { [weak self, weak operation] in
             guard let self else { return }
-            guard operation?.isCancelled == false else { return }
             let startedAt = Date()
-            let diskImage = quality.usesDiskCache ? self.diskCache.image(for: url, quality: quality) : nil
-            let image = diskImage ?? self.decodeImage(url, quality)
-            if diskImage == nil, let image, quality.usesDiskCache {
-                self.diskCache.store(image, for: url, quality: quality)
+
+            let decodeResult: (image: NSImage?, usedDiskCache: Bool, cacheSource: ImageCacheTelemetrySource)? = autoreleasepool {
+                guard operation?.isCancelled == false,
+                      self.currentGeneration() == requestGeneration
+                else {
+                    return nil
+                }
+
+                let diskImage = quality.usesDiskCache ? self.diskCache.image(for: url, quality: quality) : nil
+                guard operation?.isCancelled == false,
+                      self.currentGeneration() == requestGeneration
+                else {
+                    return nil
+                }
+
+                let image = diskImage ?? self.decodeImage(url, quality)
+                guard operation?.isCancelled == false,
+                      self.currentGeneration() == requestGeneration
+                else {
+                    return nil
+                }
+
+                if diskImage == nil, let image, quality.usesDiskCache {
+                    self.diskCache.store(image, for: url, quality: quality)
+                }
+
+                let cacheSource: ImageCacheTelemetrySource
+                if diskImage != nil {
+                    cacheSource = .diskHit
+                } else if image != nil {
+                    cacheSource = .decoded
+                } else {
+                    cacheSource = .failure
+                }
+
+                return (image, diskImage != nil, cacheSource)
             }
-            let cacheSource: ImageCacheTelemetrySource
-            if diskImage != nil {
-                cacheSource = .diskHit
-            } else if image != nil {
-                cacheSource = .decoded
-            } else {
-                cacheSource = .failure
-            }
-            guard operation?.isCancelled == false else { return }
-            if let snapshot = self.telemetry.record(cacheSource, quality: quality) {
+            guard let decodeResult else { return }
+            if let snapshot = self.telemetry.record(decodeResult.cacheSource, quality: quality) {
                 Self.logThumbnailCacheSummary(snapshot)
             }
             let finishedAt = Date()
             let waitSeconds = startedAt.timeIntervalSince(queuedAt)
             let decodeSeconds = finishedAt.timeIntervalSince(startedAt)
-            let usedDiskCache = diskImage != nil
-            let shouldLog = requestID <= 8 || image == nil || waitSeconds > 0.75 || decodeSeconds > 0.55
+            let shouldLog = requestID <= 8 || decodeResult.image == nil || waitSeconds > 0.75 || decodeSeconds > 0.55
+            let usedDiskCache = decodeResult.usedDiskCache
 
             Task { @MainActor in
                 guard self.currentGeneration() == requestGeneration else {
@@ -191,6 +242,7 @@ final class ImageCache: @unchecked Sendable {
                     }
                     return
                 }
+                let image = decodeResult.image
                 if let image {
                     self.store(image, forKey: key, quality: quality)
                 }
@@ -321,11 +373,18 @@ final class ImageCache: @unchecked Sendable {
     }
 
     private func cache(for quality: ImageCacheQuality) -> NSCache<NSString, NSImage> {
-        quality == .comparison ? comparisonCache : cache
+        switch quality {
+        case .preview:
+            previewCache
+        case .comparison:
+            comparisonCache
+        default:
+            cache
+        }
     }
 
     private static func downsampledImage(for url: URL, quality: ImageCacheQuality) -> NSImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, imageSourceOptions() as CFDictionary) else {
             return nil
         }
 
@@ -344,6 +403,12 @@ final class ImageCache: @unchecked Sendable {
         )
     }
 
+    static func imageSourceOptions() -> [CFString: Any] {
+        [
+            kCGImageSourceShouldCache: false
+        ]
+    }
+
     static func thumbnailCreationOptions(
         maxPixelSize: Int,
         prefersEmbeddedPreview: Bool
@@ -351,7 +416,7 @@ final class ImageCache: @unchecked Sendable {
         var options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-            kCGImageSourceShouldCache: true,
+            kCGImageSourceShouldCache: false,
             kCGImageSourceShouldCacheImmediately: true
         ]
         if prefersEmbeddedPreview {
@@ -384,6 +449,14 @@ struct ImageCacheMemoryProfile: Equatable {
 
     var thumbnailTotalCostLimit: Int {
         (isCompatibilityMode ? 96 : 180) * 1024 * 1024
+    }
+
+    var previewCountLimit: Int {
+        isCompatibilityMode ? 3 : 5
+    }
+
+    var previewTotalCostLimit: Int {
+        (isCompatibilityMode ? 96 : 160) * 1024 * 1024
     }
 
     var comparisonCountLimit: Int {
@@ -621,6 +694,15 @@ enum ImageDecodePriority: Equatable {
             .normal
         case .low:
             .low
+        }
+    }
+
+    var qualityOfService: QualityOfService {
+        switch self {
+        case .high, .normal:
+            .userInitiated
+        case .low:
+            .utility
         }
     }
 

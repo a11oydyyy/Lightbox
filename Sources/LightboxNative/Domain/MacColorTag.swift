@@ -62,6 +62,9 @@ enum MacTagDotMetrics {
 
     static let sidebarDotDiameter: CGFloat = 5
     static let sidebarSpacing: CGFloat = 2
+    static let folderCardDotDiameter: CGFloat = 8
+    static let folderCardSpacing: CGFloat = 4
+    static let folderCardStrokeWidth: CGFloat = 0.65
 
     static let selectionHitWidth: CGFloat = 22
     static let selectionHeight: CGFloat = 26

@@ -9,6 +9,46 @@ struct SearchAssetGroup: Identifiable, Equatable {
     var assets: [LightboxAsset]
 }
 
+struct AssetMetadataRefreshPolicy: Equatable {
+    static let externalDimensionLimit = 4
+    static let externalAssetTagLimit = 12
+    static let localStartDelayMilliseconds = 650
+    static let externalStartDelayMilliseconds = 1_600
+
+    var usesConservativeExternalLoading: Bool
+    var requiresCompleteAssetTags = false
+
+    func dimensionLimit(assetCount: Int) -> Int {
+        usesConservativeExternalLoading ? min(assetCount, Self.externalDimensionLimit) : assetCount
+    }
+
+    func tagLimit(assetCount: Int) -> Int {
+        if !usesConservativeExternalLoading || requiresCompleteAssetTags {
+            return assetCount
+        }
+        return min(assetCount, Self.externalAssetTagLimit)
+    }
+
+    var startDelayMilliseconds: Int {
+        usesConservativeExternalLoading ? Self.externalStartDelayMilliseconds : Self.localStartDelayMilliseconds
+    }
+}
+
+private struct SidebarVolumeObserverToken: @unchecked Sendable {
+    var value: NSObjectProtocol
+}
+
+struct LibraryRefreshPolicy: Equatable {
+    static let externalCachedSnapshotScanDelayMilliseconds = 1_200
+
+    var usesConservativeExternalLoading: Bool
+    var hasCachedVisibleSnapshot: Bool
+
+    var scanStartDelayMilliseconds: Int {
+        usesConservativeExternalLoading && hasCachedVisibleSnapshot ? Self.externalCachedSnapshotScanDelayMilliseconds : 0
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     nonisolated private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "LibraryLoading")
@@ -32,8 +72,11 @@ final class AppState: ObservableObject {
     @Published var sidebarVisibleLocationIDs: Set<SidebarLocationID> = LightboxSettingsStore.defaultSidebarLocationIDs {
         didSet {
             LightboxSettingsStore.saveSidebarVisibleLocationIDs(sidebarVisibleLocationIDs)
+            refreshSidebarDestinations()
         }
     }
+    @Published private(set) var sidebarLocations: [SidebarLocationID] = []
+    @Published private(set) var sidebarVolumes: [SidebarVolume] = []
     @Published var showFolderCards = LightboxSettingsStore.defaultShowFolderCards {
         didSet {
             LightboxSettingsStore.saveShowFolderCards(showFolderCards)
@@ -139,9 +182,10 @@ final class AppState: ObservableObject {
     private var compareTrayPulseTask: Task<Void, Never>?
     private var compareTrayDragID: LightboxAsset.ID?
     private let compareTrayLimit = 8
+    private var sidebarVolumeObserverTokens: [SidebarVolumeObserverToken] = []
 
     init() {
-        ImageCache.shared.removeAll()
+        ImageCache.shared.removeMemoryObjects(reason: "app-init")
         colorMode = LightboxSettingsStore.loadColorMode()
         glassOpacity = LightboxSettingsStore.loadGlassOpacity()
         appLanguage = LightboxSettingsStore.loadLanguage()
@@ -189,6 +233,8 @@ final class AppState: ObservableObject {
         currentFolderURL = initialFolderURL
         LibrarySourceStore.saveSelectedSourceID(resolvedSource.id)
         saveCurrentFolderSession()
+        refreshSidebarDestinations()
+        startSidebarVolumeMonitoring()
         refreshLibrary()
         restartLibraryMonitor()
         trashDirectoryMonitor.start { [weak self] in
@@ -208,6 +254,9 @@ final class AppState: ObservableObject {
         indexWriteTask?.cancel()
         searchTask?.cancel()
         compareTrayPulseTask?.cancel()
+        for token in sidebarVolumeObserverTokens {
+            NSWorkspace.shared.notificationCenter.removeObserver(token.value)
+        }
     }
 
     var activeAssets: [LightboxAsset] {
@@ -305,14 +354,31 @@ final class AppState: ObservableObject {
         sources.filter { !$0.isLocalLibrary }
     }
 
-    var sidebarLocations: [SidebarLocationID] {
-        SidebarLocationID.allCases.filter { location in
-            sidebarVisibleLocationIDs.contains(location) && location.defaultURL.map { FileManager.default.fileExists(atPath: $0.path) } == true
+    private func refreshSidebarDestinations() {
+        sidebarLocations = Self.makeSidebarLocations(visibleLocationIDs: sidebarVisibleLocationIDs)
+        sidebarVolumes = Self.makeSidebarVolumes(visibleLocationIDs: sidebarVisibleLocationIDs)
+    }
+
+    private func startSidebarVolumeMonitoring() {
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    self?.refreshSidebarDestinations()
+                }
+            }
+            sidebarVolumeObserverTokens.append(SidebarVolumeObserverToken(value: token))
         }
     }
 
-    var sidebarVolumes: [SidebarVolume] {
-        guard sidebarVisibleLocationIDs.contains(.volumes) else { return [] }
+    private static func makeSidebarLocations(visibleLocationIDs: Set<SidebarLocationID>) -> [SidebarLocationID] {
+        SidebarLocationID.allCases.filter { location in
+            visibleLocationIDs.contains(location) && location.defaultURL.map { FileManager.default.fileExists(atPath: $0.path) } == true
+        }
+    }
+
+    private static func makeSidebarVolumes(visibleLocationIDs: Set<SidebarLocationID>) -> [SidebarVolume] {
+        guard visibleLocationIDs.contains(.volumes) else { return [] }
         let keys: [URLResourceKey] = [.volumeNameKey, .isVolumeKey]
         let urls = FileManager.default.mountedVolumeURLs(
             includingResourceValuesForKeys: keys,
@@ -794,6 +860,7 @@ final class AppState: ObservableObject {
     }
 
     private func activateSource(_ source: LibrarySource, initialFolderURL: URL? = nil) {
+        let previousSourceID = selectedSourceID
         selectedSourceID = source.id
         LibrarySourceStore.saveSelectedSourceID(source.id)
         selectedFilter = .all
@@ -801,7 +868,10 @@ final class AppState: ObservableObject {
         saveCurrentFolderSession()
         searchText = ""
         clearSelection()
-        ImageCache.shared.cancelOutstandingRequests(reason: "choose-source")
+        if previousSourceID != source.id {
+            SidebarFolderTagCache.shared.clear()
+        }
+        ImageCache.shared.removeSourceMemoryObjects(reason: "choose-source")
         restartLibraryMonitor()
         refreshLibrary()
     }
@@ -950,7 +1020,7 @@ final class AppState: ObservableObject {
             saveCurrentFolderSession()
             clearSearchForNavigation()
             clearSelection()
-            ImageCache.shared.cancelOutstandingRequests(reason: "open-folder")
+            ImageCache.shared.removeThumbnailMemoryObjects(reason: "open-folder")
             restartLibraryMonitor()
             refreshLibrary()
             return
@@ -977,7 +1047,7 @@ final class AppState: ObservableObject {
         saveCurrentFolderSession()
         clearSearchForNavigation()
         clearSelection()
-        ImageCache.shared.cancelOutstandingRequests(reason: "open-folder")
+        ImageCache.shared.removeThumbnailMemoryObjects(reason: "open-folder")
         restartLibraryMonitor()
         refreshLibrary()
     }
@@ -1830,7 +1900,22 @@ final class AppState: ObservableObject {
         }
 
         let folderURL = currentFolderURL
+        let hasCachedVisibleSnapshot = applyCachedVisibleSnapshotIfAvailable(source: source, folderURL: folderURL, refreshID: refreshID)
+        let usesConservativeExternalLoading = source.usesConservativeExternalLoading
+        let refreshPolicy = LibraryRefreshPolicy(
+            usesConservativeExternalLoading: usesConservativeExternalLoading,
+            hasCachedVisibleSnapshot: hasCachedVisibleSnapshot
+        )
         libraryLoadTask = Task.detached(priority: .userInitiated) { [weak self, source] in
+            let scanDelayMilliseconds = refreshPolicy.scanStartDelayMilliseconds
+            if scanDelayMilliseconds > 0 {
+                Self.logger.info("refresh[\(refreshID)] scan delayed cachedSnapshot=true delayMs=\(scanDelayMilliseconds) folder=\(folderURL.path, privacy: .public)")
+                try? await Task.sleep(for: .milliseconds(scanDelayMilliseconds))
+                guard !Task.isCancelled else {
+                    Self.logger.info("refresh[\(refreshID)] scan delay cancelled folder=\(folderURL.path, privacy: .public)")
+                    return
+                }
+            }
             let startedAt = Date()
             Self.logger.info("refresh[\(refreshID)] scan task start source=\(source.id, privacy: .public) sourceKind=\(source.kind.rawValue, privacy: .public) folder=\(folderURL.path, privacy: .public)")
             let cachedDimensions = LightboxIndexStore().cachedDimensions(
@@ -1842,7 +1927,8 @@ final class AppState: ObservableObject {
                 sourceID: source.id,
                 rootURL: source.rootURL,
                 probeMetadata: false,
-                initialMetadataLimit: source.isLocalLibrary ? 120 : 32,
+                probeFolderTags: !usesConservativeExternalLoading,
+                initialMetadataLimit: usesConservativeExternalLoading ? 0 : 120,
                 cachedDimensions: cachedDimensions
             )
             let folders = directorySnapshot.folders
@@ -1873,20 +1959,64 @@ final class AppState: ObservableObject {
                     assets: snapshot,
                     refreshID: refreshID
                 )
-                let dimensionRefreshLimit = source.isLocalLibrary ? snapshot.count : min(snapshot.count, 900)
+                let requiresCompleteAssetTags: Bool
+                if case .tag = self.selectedFilter {
+                    requiresCompleteAssetTags = true
+                } else {
+                    requiresCompleteAssetTags = false
+                }
+                let metadataPolicy = AssetMetadataRefreshPolicy(
+                    usesConservativeExternalLoading: usesConservativeExternalLoading,
+                    requiresCompleteAssetTags: requiresCompleteAssetTags
+                )
                 self.startAssetMetadataRefresh(
                     snapshot,
                     folderURL: folderURL,
                     sourceID: source.id,
                     refreshID: refreshID,
-                    metadataLimit: dimensionRefreshLimit,
-                    tagLimit: snapshot.count,
-                    loadsFinderTags: true
+                    metadataLimit: metadataPolicy.dimensionLimit(assetCount: snapshot.count),
+                    tagLimit: metadataPolicy.tagLimit(assetCount: snapshot.count),
+                    loadsFinderTags: true,
+                    startDelayMilliseconds: metadataPolicy.startDelayMilliseconds
                 )
                 self.scheduleSearch()
                 Self.logger.info("refresh[\(refreshID)] apply complete applyTotal=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s folderEntries=\(self.folderEntries.count) storeAssets=\(self.assets.count) visibleSnapshotAssets=\(snapshot.count)")
             }
         }
+    }
+
+    private func applyCachedVisibleSnapshotIfAvailable(
+        source: LibrarySource,
+        folderURL: URL,
+        refreshID: Int
+    ) -> Bool {
+        if let snapshot = indexStore.cachedVisibleSnapshot(source: source, folderURL: folderURL) {
+            folderEntries = snapshot.folders
+            mergeLibrarySnapshot(snapshot.assets)
+            Self.logger.info("refresh[\(refreshID)] cached snapshot applied folders=\(snapshot.folders.count) assets=\(snapshot.assets.count) folder=\(folderURL.path, privacy: .public)")
+            return true
+        }
+
+        guard !visibleContentMatches(folderURL: folderURL) else {
+            Self.logger.info("refresh[\(refreshID)] cached snapshot unavailable keeping-current-content folder=\(folderURL.path, privacy: .public)")
+            return false
+        }
+
+        folderEntries = []
+        mergeLibrarySnapshot([])
+        Self.logger.info("refresh[\(refreshID)] cached snapshot unavailable cleared-stale-content folder=\(folderURL.path, privacy: .public)")
+        return false
+    }
+
+    private func visibleContentMatches(folderURL: URL) -> Bool {
+        let folderPath = folderURL.standardizedFileURL.path
+        let assetsMatch = assets.allSatisfy { asset in
+            asset.sourceURL?.deletingLastPathComponent().standardizedFileURL.path == folderPath
+        }
+        let foldersMatch = folderEntries.allSatisfy { folder in
+            folder.url.deletingLastPathComponent().standardizedFileURL.path == folderPath
+        }
+        return assetsMatch && foldersMatch
     }
 
     private func scheduleLibraryRefresh() {
@@ -1902,7 +2032,7 @@ final class AppState: ObservableObject {
     private func restartLibraryMonitor() {
         libraryDirectoryMonitor?.stop()
         let monitoredURL = isViewingTrash ? LightboxLibraryStore.primarySystemTrashFolder : currentFolderURL
-        if !isViewingTrash, selectedSource?.isLocalLibrary == false {
+        if !isViewingTrash, selectedSource?.usesConservativeExternalLoading == true {
             libraryDirectoryMonitor = nil
             Self.logger.info("monitor skipped external source path=\(monitoredURL.path, privacy: .public)")
             return
@@ -1970,7 +2100,8 @@ final class AppState: ObservableObject {
         refreshID: Int,
         metadataLimit: Int,
         tagLimit: Int,
-        loadsFinderTags: Bool
+        loadsFinderTags: Bool,
+        startDelayMilliseconds: Int
     ) {
         let targets = snapshot.enumerated().compactMap { index, asset -> AssetMetadataTarget? in
             let shouldLoadDimensions = index < metadataLimit && !asset.metadataLoaded
@@ -1989,10 +2120,10 @@ final class AppState: ObservableObject {
             return
         }
 
-        Self.logger.info("refresh[\(refreshID)] metadata begin total=\(targets.count) dimensionLimit=\(metadataLimit) tagLimit=\(tagLimit) tags=\(loadsFinderTags) folder=\(folderURL.path, privacy: .public)")
+        Self.logger.info("refresh[\(refreshID)] metadata begin total=\(targets.count) dimensionLimit=\(metadataLimit) tagLimit=\(tagLimit) tags=\(loadsFinderTags) delayMs=\(startDelayMilliseconds) folder=\(folderURL.path, privacy: .public)")
 
         assetMetadataTask = Task.detached(priority: .background) { [weak self] in
-            try? await Task.sleep(for: .milliseconds(650))
+            try? await Task.sleep(for: .milliseconds(startDelayMilliseconds))
             guard !Task.isCancelled else { return }
             let startedAt = Date()
             let dimensionIndexStore = LightboxIndexStore()
@@ -2006,17 +2137,25 @@ final class AppState: ObservableObject {
                     return
                 }
 
-                let size = target.shouldLoadDimensions ? ImageProbe.dimensions(for: target.url) : nil
-                let tags = target.shouldLoadTags ? FinderTagStore.colorTags(for: target.url) : nil
+                let metadata = autoreleasepool {
+                    (
+                        size: target.shouldLoadDimensions ? ImageProbe.dimensions(for: target.url) : nil,
+                        tags: target.shouldLoadTags ? FinderTagStore.colorTags(for: target.url) : nil
+                    )
+                }
+                guard !Task.isCancelled else {
+                    Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
+                    return
+                }
                 processedCount += 1
 
-                if size != nil || tags != nil {
+                if metadata.size != nil || metadata.tags != nil {
                     batch.append(AssetMetadataUpdate(
                         id: target.id,
                         url: target.url,
-                        width: size?.width,
-                        height: size?.height,
-                        tags: tags
+                        width: metadata.size?.width,
+                        height: metadata.size?.height,
+                        tags: metadata.tags
                     ))
                 }
 
@@ -2043,6 +2182,10 @@ final class AppState: ObservableObject {
                             sourceID: sourceID,
                             refreshID: refreshID
                         )
+                    }
+                    guard !Task.isCancelled else {
+                        Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
+                        return
                     }
                 }
 
@@ -2072,6 +2215,10 @@ final class AppState: ObservableObject {
                         sourceID: sourceID,
                         refreshID: refreshID
                     )
+                }
+                guard !Task.isCancelled else {
+                    Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
+                    return
                 }
             }
 

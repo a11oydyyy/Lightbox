@@ -122,24 +122,29 @@ struct GalleryPerformanceProfile: Equatable {
         return viewportHeight * multiplier
     }
 
-    func thumbnailQuality(assetCount: Int, isExternalSource: Bool) -> ImageCacheQuality {
+    func thumbnailQuality(assetCount: Int, usesConservativeExternalLoading: Bool) -> ImageCacheQuality {
         if isCompatibilityMode {
-            if assetCount >= 260 || (isExternalSource && assetCount >= 160) {
+            if assetCount >= 260 || (usesConservativeExternalLoading && assetCount >= 160) {
                 return .thumbnailFast
             }
-            if assetCount >= 80 || (isExternalSource && assetCount >= 48) {
+            if assetCount >= 80 || (usesConservativeExternalLoading && assetCount >= 48) {
                 return .thumbnailBalanced
             }
             return .thumbnail
         }
 
-        if assetCount >= 700 || (isExternalSource && assetCount >= 320) {
+        if assetCount >= 700 || (usesConservativeExternalLoading && assetCount >= 320) {
             return .thumbnailFast
         }
-        if assetCount >= 240 || (isExternalSource && assetCount >= 120) {
+        if assetCount >= 240 || (usesConservativeExternalLoading && assetCount >= 80) {
             return .thumbnailBalanced
         }
         return .thumbnail
+    }
+
+    func permitsFullThumbnailPromotion(assetCount: Int, usesConservativeExternalLoading: Bool) -> Bool {
+        guard !isCompatibilityMode else { return false }
+        return !(usesConservativeExternalLoading && assetCount >= 80)
     }
 }
 
@@ -229,6 +234,10 @@ struct GalleryView: View {
                 maxPrioritizedAssetCount: performanceProfile.maxPrioritizedAssetCount
             )
             let thumbnailQuality = galleryThumbnailQuality(assetCount: activeAssets.count, performanceProfile: performanceProfile)
+            let permitsFullThumbnailPromotion = galleryPermitsFullThumbnailPromotion(
+                assetCount: activeAssets.count,
+                performanceProfile: performanceProfile
+            )
             let usesReducedHover = appState.libraryLoadingStatus != nil || performanceProfile.reducesHoverEffects
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
@@ -279,6 +288,7 @@ struct GalleryView: View {
                                                 loadableAssetIDs: loadableAssetIDs,
                                                 prioritizedAssetIDs: prioritizedAssetIDs,
                                                 thumbnailQuality: thumbnailQuality,
+                                                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                                                 prefersFastRawThumbnails: prefersFastRawThumbnails,
                                                 usesReducedHover: usesReducedHover,
                                                 performanceProfile: performanceProfile,
@@ -295,6 +305,7 @@ struct GalleryView: View {
                                     loadableAssetIDs: loadableAssetIDs,
                                     prioritizedAssetIDs: prioritizedAssetIDs,
                                     thumbnailQuality: thumbnailQuality,
+                                    permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                                     prefersFastRawThumbnails: prefersFastRawThumbnails,
                                     usesReducedHover: usesReducedHover,
                                     performanceProfile: performanceProfile,
@@ -313,6 +324,7 @@ struct GalleryView: View {
                     }
                 }
                 .scrollIndicators(.hidden)
+                .id(navigationToken)
                 .coordinateSpace(name: "GalleryScroll")
                 .contextMenu {
                     backgroundContextMenu
@@ -345,6 +357,10 @@ struct GalleryView: View {
                     lastViewportWidth = viewport.size.width
                 }
                 .onChange(of: navigationToken) { _ in
+                    assetFrames = [:]
+                    folderRowFrame = nil
+                    selectionRect = nil
+                    appState.updatePreviewSpaceAssetFrames([:])
                     playContentEntrance()
                 }
                 .onChange(of: viewport.size.width) { width in
@@ -518,6 +534,7 @@ struct GalleryView: View {
         }
 
         guard frames.count == assetFrames.count,
+              Set(frames.keys) == Set(assetFrames.keys),
               let previousTop = assetFrames.values.map(\.minY).min(),
               let nextTop = frames.values.map(\.minY).min(),
               let previousWidth = assetFrames.values.first?.width,
@@ -545,12 +562,23 @@ struct GalleryView: View {
     }
 
     private func galleryThumbnailQuality(assetCount: Int, performanceProfile: GalleryPerformanceProfile) -> ImageCacheQuality {
-        let isExternalSource = appState.selectedSource?.isLocalLibrary == false
-        return performanceProfile.thumbnailQuality(assetCount: assetCount, isExternalSource: isExternalSource)
+        let usesConservativeExternalLoading = appState.selectedSource?.usesConservativeExternalLoading == true
+        return performanceProfile.thumbnailQuality(
+            assetCount: assetCount,
+            usesConservativeExternalLoading: usesConservativeExternalLoading
+        )
+    }
+
+    private func galleryPermitsFullThumbnailPromotion(assetCount: Int, performanceProfile: GalleryPerformanceProfile) -> Bool {
+        let usesConservativeExternalLoading = appState.selectedSource?.usesConservativeExternalLoading == true
+        return performanceProfile.permitsFullThumbnailPromotion(
+            assetCount: assetCount,
+            usesConservativeExternalLoading: usesConservativeExternalLoading
+        )
     }
 
     private func prefersFastRawThumbnails(activeAssets: [LightboxAsset]) -> Bool {
-        guard appState.selectedSource?.isLocalLibrary == false,
+        guard appState.selectedSource?.usesConservativeExternalLoading == true,
               activeAssets.count >= 500
         else {
             return false
@@ -583,6 +611,7 @@ struct GalleryView: View {
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
         thumbnailQuality: ImageCacheQuality,
+        permitsFullThumbnailPromotion: Bool,
         prefersFastRawThumbnails: Bool,
         usesReducedHover: Bool,
         performanceProfile: GalleryPerformanceProfile,
@@ -604,6 +633,7 @@ struct GalleryView: View {
                                 loadableAssetIDs: loadableAssetIDs,
                                 prioritizedAssetIDs: prioritizedAssetIDs,
                                 thumbnailQuality: thumbnailQuality,
+                                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                                 prefersFastRawThumbnails: prefersFastRawThumbnails,
                                 usesReducedHover: usesReducedHover,
                                 performanceProfile: performanceProfile,
@@ -631,6 +661,7 @@ struct GalleryView: View {
                         loadableAssetIDs: loadableAssetIDs,
                         prioritizedAssetIDs: prioritizedAssetIDs,
                         thumbnailQuality: thumbnailQuality,
+                        permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                         prefersFastRawThumbnails: prefersFastRawThumbnails,
                         usesReducedHover: usesReducedHover,
                         performanceProfile: performanceProfile,
@@ -650,6 +681,7 @@ struct GalleryView: View {
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
         thumbnailQuality: ImageCacheQuality,
+        permitsFullThumbnailPromotion: Bool,
         prefersFastRawThumbnails: Bool,
         usesReducedHover: Bool,
         performanceProfile: GalleryPerformanceProfile,
@@ -670,7 +702,7 @@ struct GalleryView: View {
                 baseQuality: thumbnailQuality,
                 isPrioritized: prioritizedAssetIDs.contains(asset.id),
                 prefersFastRawThumbnails: prefersFastRawThumbnails,
-                permitsFullThumbnailPromotion: !performanceProfile.isCompatibilityMode
+                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion
             ),
             loadsImage: loadableAssetIDs.contains(asset.id),
             compareTrayLabel: appState.compareTrayLabel(for: asset.id),
@@ -969,6 +1001,7 @@ private struct LightboxLoadingSpinner: View {
 private struct FolderRowView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("Lightbox.folderTileWidth") private var folderTileWidth: Double = 180
+    private static let bulkFolderInteractionThreshold = 160
 
     var folders: [LibraryFolderEntry]
     var showInFinderTitle: String
@@ -983,77 +1016,145 @@ private struct FolderRowView: View {
     }
 
     var body: some View {
+        let usesBulkInteractionMode = folders.count >= Self.bulkFolderInteractionThreshold
         LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
             ForEach(folders) { folder in
-                let tint = folderTint(folder)
-                let iconColor = tint?.opacity(0.92) ?? Color.secondary
-                Button {
-                    open(folder)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 15, weight: .medium))
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(iconColor)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(folder.name)
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.primary.opacity(0.88))
-                                .lineLimit(showsRelativePath ? 1 : 2)
-                                .truncationMode(.middle)
-                                .multilineTextAlignment(.leading)
-                                .fixedSize(horizontal: false, vertical: true)
-
-                            if showsRelativePath,
-                               !folder.relativePath.isEmpty,
-                               folder.relativePath != folder.name {
-                                Text(folder.relativePath)
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.secondary.opacity(0.78))
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                        }
-
-                        Spacer(minLength: 4)
-
-                        FolderTagDots(tags: folder.tags)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
-                    .background {
-                        RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
-                            .fill(folderFillColor(tint))
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
-                            .stroke(folderStrokeColor(tint), lineWidth: 0.7)
-                    }
-                    .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
-                }
-                .buttonStyle(LightboxButtonHoverStyle(
-                    shape: RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous),
-                    hoverScale: 1.018,
-                    glowOpacity: 0.13
-                ))
-                .contextMenu {
-                    Button {
-                        reveal(folder)
-                    } label: {
-                        Text(showInFinderTitle)
-                    }
-                }
-                .help(folder.name)
+                FolderCardView(
+                    folder: folder,
+                    showInFinderTitle: showInFinderTitle,
+                    showsRelativePath: showsRelativePath,
+                    usesBulkInteractionMode: usesBulkInteractionMode,
+                    open: open,
+                    reveal: reveal
+                )
             }
         }
-        .animation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion), value: folderTileWidth)
+        .transaction { transaction in
+            if usesBulkInteractionMode {
+                transaction.animation = nil
+            }
+        }
+        .animation(
+            usesBulkInteractionMode ? nil : MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion),
+            value: folderTileWidth
+        )
+    }
+}
+
+private struct FolderCardView: View {
+    var folder: LibraryFolderEntry
+    var showInFinderTitle: String
+    var showsRelativePath: Bool
+    var usesBulkInteractionMode: Bool
+    var open: (LibraryFolderEntry) -> Void
+    var reveal: (LibraryFolderEntry) -> Void
+
+    @State private var loadedTags: [String]?
+
+    private var resolvedTags: [String] {
+        MacColorTag.sort((loadedTags ?? folder.tags).filter(MacColorTag.isColorTag))
     }
 
-    private func folderTint(_ folder: LibraryFolderEntry) -> Color? {
-        let sortedNames = MacColorTag.sort(folder.tags.filter(MacColorTag.isColorTag))
-        guard let firstName = sortedNames.first,
+    private var tagLoadID: String {
+        "\(folder.url.standardizedFileURL.path):\(folder.tags.joined(separator: ","))"
+    }
+
+    var body: some View {
+        let tags = resolvedTags
+        let tint = folderTint(tags)
+        let iconColor = tint?.opacity(0.92) ?? Color.secondary
+
+        Button {
+            open(folder)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 15, weight: .medium))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(iconColor)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(folder.name)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.primary.opacity(0.88))
+                        .lineLimit(showsRelativePath ? 1 : 2)
+                        .truncationMode(.middle)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if showsRelativePath,
+                       !folder.relativePath.isEmpty,
+                       folder.relativePath != folder.name {
+                        Text(folder.relativePath)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary.opacity(0.78))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+
+                Spacer(minLength: 4)
+
+                FolderTagDots(tags: tags)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
+                    .fill(folderFillColor(tint))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
+                    .stroke(folderStrokeColor(tint), lineWidth: 0.7)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
+        }
+        .buttonStyle(LightboxButtonHoverStyle(
+            shape: RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous),
+            hoverScale: usesBulkInteractionMode ? 1.0 : 1.018,
+            glowOpacity: usesBulkInteractionMode ? 0.04 : 0.13
+        ))
+        .contextMenu {
+            Button {
+                reveal(folder)
+            } label: {
+                Text(showInFinderTitle)
+            }
+        }
+        .help(folder.name)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(folderAccessibilityLabel(tags))
+        .task(id: tagLoadID) {
+            await loadTagsIfNeeded()
+        }
+    }
+
+    private func loadTagsIfNeeded() async {
+        let inlineTags = MacColorTag.sort(folder.tags.filter(MacColorTag.isColorTag))
+        if !inlineTags.isEmpty {
+            loadedTags = inlineTags
+            return
+        }
+
+        if let cached = SidebarFolderTagCache.shared.cachedTags(for: folder.url) {
+            loadedTags = cached
+            return
+        }
+
+        let tags = await SidebarFolderTagCache.shared.tags(for: folder.url)
+        guard !Task.isCancelled else { return }
+        loadedTags = tags
+    }
+
+    private func folderAccessibilityLabel(_ tags: [String]) -> String {
+        let sortedTags = MacColorTag.sort(tags.filter(MacColorTag.isColorTag))
+        guard !sortedTags.isEmpty else { return folder.name }
+        return ([folder.name] + sortedTags).joined(separator: ", ")
+    }
+
+    private func folderTint(_ tags: [String]) -> Color? {
+        guard let firstName = tags.first,
               let tag = MacColorTag.all.first(where: { $0.name == firstName })
         else {
             return nil
@@ -1092,12 +1193,18 @@ private struct FolderTagDots: View {
                 Circle()
                     .fill(tag.color)
                     .frame(
-                        width: MacTagDotMetrics.sidebarDotDiameter,
-                        height: MacTagDotMetrics.sidebarDotDiameter
+                        width: MacTagDotMetrics.folderCardDotDiameter,
+                        height: MacTagDotMetrics.folderCardDotDiameter
                     )
+                    .overlay {
+                        Circle()
+                            .stroke(.white.opacity(0.78), lineWidth: MacTagDotMetrics.folderCardStrokeWidth)
+                    }
+                    .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
             }
         }
-        .frame(minWidth: visibleTags.isEmpty ? 0 : 19, alignment: .trailing)
+        .frame(minWidth: visibleTags.isEmpty ? 0 : 30, alignment: .trailing)
+        .allowsHitTesting(false)
     }
 }
 

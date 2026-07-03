@@ -4,6 +4,7 @@ struct GlassSidebar: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expandedPaths: Set<String> = []
+    @State private var expandedSourceID: LibrarySource.ID?
     @State private var recentlyUnpinnedSources: [LibrarySource] = []
 
     private var visiblePinnedSources: [LibrarySource] {
@@ -17,6 +18,8 @@ struct GlassSidebar: View {
     }
 
     var body: some View {
+        let selectedFolderPath = selectedFolderPath
+
         VStack(spacing: 0) {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 15) {
@@ -27,6 +30,7 @@ struct GlassSidebar: View {
                                     title: source.displayName,
                                     url: source.rootURL,
                                     systemImage: "folder",
+                                    selectedFolderPath: selectedFolderPath,
                                     isPinned: appState.isFolderPinned(source.rootURL),
                                     isRecentlyUnpinned: recentlyUnpinnedSources.contains(where: { $0.id == source.id }),
                                     togglePin: {
@@ -49,6 +53,7 @@ struct GlassSidebar: View {
                                         sourceID: "location:\(location.rawValue)",
                                         systemImage: location.systemImage,
                                         depth: 0,
+                                        selectedFolderPath: selectedFolderPath,
                                         expandedPaths: $expandedPaths,
                                         isPinned: appState.isFolderPinned(url),
                                         isRecentlyUnpinned: false,
@@ -71,6 +76,7 @@ struct GlassSidebar: View {
                                     sourceID: "volume:\(volume.id)",
                                     systemImage: "externaldrive",
                                     depth: 0,
+                                    selectedFolderPath: selectedFolderPath,
                                     expandedPaths: $expandedPaths,
                                     isPinned: appState.isFolderPinned(volume.url),
                                     isRecentlyUnpinned: false,
@@ -102,12 +108,21 @@ struct GlassSidebar: View {
         .padding(.leading, 10)
         .padding(.vertical, 14)
         .onAppear {
-            expandCurrentPathChain()
+            updateExpandedPathsForNavigation()
+        }
+        .onChange(of: appState.selectedSourceID) { _ in
+            expandedSourceID = nil
+            expandedPaths = []
         }
         .onChange(of: appState.currentFolderURL) { _ in
-            expandCurrentPathChain()
+            updateExpandedPathsForNavigation()
         }
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.currentFolderURL)
+    }
+
+    private var selectedFolderPath: String? {
+        guard !appState.isViewingTrash else { return nil }
+        return appState.currentFolderURL.standardizedFileURL.path
     }
 
     private func title(for location: SidebarLocationID) -> String {
@@ -146,10 +161,25 @@ struct GlassSidebar: View {
         }
     }
 
-    private func expandCurrentPathChain() {
-        guard !appState.isViewingTrash else { return }
+    private func updateExpandedPathsForNavigation() {
+        guard !appState.isViewingTrash else {
+            expandedPaths = []
+            expandedSourceID = appState.selectedSourceID
+            return
+        }
+
+        let currentPathChain = currentPathExpansionSet()
+        if expandedSourceID == appState.selectedSourceID {
+            expandedPaths.formUnion(currentPathChain)
+        } else {
+            expandedPaths = currentPathChain
+            expandedSourceID = appState.selectedSourceID
+        }
+    }
+
+    private func currentPathExpansionSet() -> Set<String> {
         let path = appState.currentFolderURL.standardizedFileURL.path
-        var expanded = expandedPaths
+        var expanded: Set<String> = []
         for location in appState.sidebarLocations.compactMap(\.defaultURL) {
             let rootPath = location.standardizedFileURL.path
             if path == rootPath || path.hasPrefix(rootPath + "/") {
@@ -162,7 +192,7 @@ struct GlassSidebar: View {
                 addAncestors(from: volume.url, to: appState.currentFolderURL, into: &expanded)
             }
         }
-        expandedPaths = expanded
+        return expanded
     }
 
     private func addAncestors(from rootURL: URL, to folderURL: URL, into expanded: inout Set<String>) {
@@ -205,6 +235,7 @@ private struct SidebarPinnedFolderRow: View {
     var title: String
     var url: URL
     var systemImage: String
+    var selectedFolderPath: String?
     var isPinned: Bool
     var isRecentlyUnpinned: Bool
     var togglePin: () -> Void
@@ -219,7 +250,7 @@ private struct SidebarPinnedFolderRow: View {
     }
 
     private var isSelected: Bool {
-        !appState.isViewingTrash && appState.currentFolderURL.standardizedFileURL.path == path
+        selectedFolderPath == path
     }
 
     var body: some View {
@@ -301,12 +332,15 @@ private struct SidebarPinnedFolderRow: View {
         return isSelected ? Color.primary.opacity(0.96) : Color.primary.opacity(0.72)
     }
 
+    @MainActor
     private func loadColorTags() async {
-        let taggedURL = url
-        let tags = await Task.detached(priority: .utility) {
-            FinderTagStore.colorTags(for: taggedURL)
-        }.value
+        if let cached = SidebarFolderTagCache.shared.cachedTags(for: url) {
+            colorTags = cached
+            return
+        }
 
+        colorTags = []
+        let tags = await SidebarFolderTagCache.shared.tags(for: url)
         guard !Task.isCancelled else { return }
         colorTags = tags
     }
@@ -322,6 +356,7 @@ private struct SidebarFolderNode: View {
     var sourceID: String
     var systemImage: String
     var depth: Int
+    var selectedFolderPath: String?
     @Binding var expandedPaths: Set<String>
     var isPinned: Bool
     var isRecentlyUnpinned: Bool
@@ -329,6 +364,7 @@ private struct SidebarFolderNode: View {
 
     @State private var children: [LibraryFolderEntry] = []
     @State private var hasLoadedChildren = false
+    @State private var isLoadingChildren = false
     @State private var isHovering = false
     @State private var colorTags: [String] = []
     @AppStorage(LightboxGlowColor.modeKey) private var glowModeRaw = LightboxGlowColor.systemMode
@@ -343,7 +379,7 @@ private struct SidebarFolderNode: View {
     }
 
     private var isSelected: Bool {
-        !appState.isViewingTrash && appState.currentFolderURL.standardizedFileURL.path == path
+        selectedFolderPath == path
     }
 
     private var childIndent: CGFloat {
@@ -372,6 +408,7 @@ private struct SidebarFolderNode: View {
                                 sourceID: sourceID,
                                 systemImage: "folder",
                                 depth: depth + 1,
+                                selectedFolderPath: selectedFolderPath,
                                 expandedPaths: $expandedPaths,
                                 isPinned: appState.isFolderPinned(child.url),
                                 isRecentlyUnpinned: false,
@@ -384,7 +421,7 @@ private struct SidebarFolderNode: View {
                     .padding(.top, 2)
                     .transition(.move(edge: .top))
                     .task(id: path) {
-                        loadChildrenIfNeeded()
+                        await loadChildrenIfNeeded()
                     }
                 }
             }
@@ -497,22 +534,40 @@ private struct SidebarFolderNode: View {
             expandedPaths.remove(path)
         } else {
             expandedPaths.insert(path)
-            loadChildrenIfNeeded()
+            Task {
+                await loadChildrenIfNeeded()
+            }
         }
     }
 
-    private func loadChildrenIfNeeded() {
-        guard !hasLoadedChildren else { return }
-        children = LocalImageSource.folders(in: url, sourceID: sourceID, rootURL: rootURL)
+    @MainActor
+    private func loadChildrenIfNeeded() async {
+        guard !hasLoadedChildren, !isLoadingChildren else { return }
+        isLoadingChildren = true
+        let folderURL = url
+        let folderSourceID = sourceID
+        let folderRootURL = rootURL
+        let loadedChildren = await Task.detached(priority: .utility) {
+            LocalImageSource.folders(in: folderURL, sourceID: folderSourceID, rootURL: folderRootURL)
+        }.value
+        guard !Task.isCancelled else {
+            isLoadingChildren = false
+            return
+        }
+        children = loadedChildren
         hasLoadedChildren = true
+        isLoadingChildren = false
     }
 
+    @MainActor
     private func loadColorTags() async {
-        let taggedURL = url
-        let tags = await Task.detached(priority: .utility) {
-            FinderTagStore.colorTags(for: taggedURL)
-        }.value
+        if let cached = SidebarFolderTagCache.shared.cachedTags(for: url) {
+            colorTags = cached
+            return
+        }
 
+        colorTags = []
+        let tags = await SidebarFolderTagCache.shared.tags(for: url)
         guard !Task.isCancelled else { return }
         colorTags = tags
     }

@@ -3,18 +3,24 @@ import SwiftUI
 struct Hover3DModifier: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var isReduced = false
+    var isEnabled = true
     @State private var isHovering = false
     @State private var hoverUnitPoint = CGPoint(x: 0.5, y: 0.5)
     @State private var contentSize: CGSize = .zero
 
+    @ViewBuilder
     func body(content: Content) -> some View {
-        let active = isHovering && !reduceMotion
+        hoverBody(content: content)
+    }
+
+    private func hoverBody(content: Content) -> some View {
+        let active = isEnabled && isHovering && !reduceMotion
         let tracksPointer = active && !isReduced
         let highlightPoint = tracksPointer ? hoverUnitPoint : CGPoint(x: 0.5, y: 0.26)
         let xTilt = tracksPointer ? (0.5 - hoverUnitPoint.y) * 5.5 : 0
         let yTilt = tracksPointer ? (hoverUnitPoint.x - 0.5) * 5.5 : 0
 
-        content
+        return content
             .background {
                 GeometryReader { proxy in
                     Color.clear
@@ -28,10 +34,8 @@ struct Hover3DModifier: ViewModifier {
             }
             .overlay {
                 if active {
-                    // Fill a rounded rect (not a bare gradient) so the screen-blend
-                    // highlight is clipped to the card's corners — an unclipped
-                    // gradient bled into the square corners and showed as a light
-                    // box on hover, most visibly in dark mode.
+                    // Fill a rounded rect (not a bare gradient) so the highlight
+                    // is clipped to the card's corners.
                     RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
                         .fill(
                             RadialGradient(
@@ -61,10 +65,8 @@ struct Hover3DModifier: ViewModifier {
             .rotation3DEffect(.degrees(xTilt), axis: (x: 1, y: 0, z: 0), perspective: 0.58)
             .rotation3DEffect(.degrees(yTilt), axis: (x: 0, y: 1, z: 0), perspective: 0.58)
             .scaleEffect(active ? (tracksPointer ? 1.012 : 1.005) : 1)
-            // Shadow keyed only to the (boolean) hover state, NOT the live pointer
-            // position. Tying its x-offset to hoverUnitPoint forced a full shadow
-            // re-rasterization on every mouse-move frame (the most expensive op in
-            // this modifier); the tilt + highlight still track the pointer.
+            // Shadow is keyed only to the boolean hover state, not live pointer
+            // position, to avoid re-rasterizing the shadow on every mouse move.
             .shadow(
                 color: .black.opacity(active ? (tracksPointer ? 0.16 : 0.10) : 0),
                 radius: active ? (tracksPointer ? 9 : 5) : 0,
@@ -73,7 +75,16 @@ struct Hover3DModifier: ViewModifier {
             )
             .animation(MotionTokens.ifAllowed(MotionTokens.hover(active), reduceMotion: reduceMotion), value: active)
             .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: isReduced)
+            .onChange(of: isEnabled) { enabled in
+                if !enabled {
+                    endHover()
+                }
+            }
             .onContinuousHover { phase in
+                guard isEnabled else {
+                    endHover()
+                    return
+                }
                 switch phase {
                 case .active(let location):
                     updateHover(location: location)
@@ -84,6 +95,11 @@ struct Hover3DModifier: ViewModifier {
     }
 
     private func updateHover(location: CGPoint) {
+        guard isEnabled else {
+            endHover()
+            return
+        }
+
         if isReduced {
             isHovering = true
             hoverUnitPoint = CGPoint(x: 0.5, y: 0.5)
@@ -115,7 +131,7 @@ struct Hover3DModifier: ViewModifier {
 }
 
 extension View {
-    func hover3D(isReduced: Bool = false) -> some View {
-        modifier(Hover3DModifier(isReduced: isReduced))
+    func hover3D(isReduced: Bool = false, isEnabled: Bool = true) -> some View {
+        modifier(Hover3DModifier(isReduced: isReduced, isEnabled: isEnabled))
     }
 }
