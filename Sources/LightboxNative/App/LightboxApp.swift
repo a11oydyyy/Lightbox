@@ -33,6 +33,10 @@ struct LightboxApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if LightboxUpdateHealth.isRequested(), !LightboxUpdateHealth.recordLaunch() {
+            NSApp.terminate(nil)
+            return
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }

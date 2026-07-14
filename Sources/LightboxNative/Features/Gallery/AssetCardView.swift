@@ -848,7 +848,7 @@ struct AssetImageView: View {
                 placeholder
             }
         }
-        .task(id: "\(asset.sourceURL?.path ?? ""):\(quality.rawValue):\(loadsImage)") {
+        .task(id: Self.imageRequestIdentity(for: asset, quality: quality, loadsImage: loadsImage)) {
             imageRequest?.cancel()
             imageRequest = nil
             guard loadsImage else {
@@ -857,26 +857,51 @@ struct AssetImageView: View {
                 return
             }
 
-            let currentRequestID = UUID()
-            requestID = currentRequestID
             guard let url = asset.sourceURL else {
                 loadedImage = nil
                 return
             }
-            if let image = Self.seedImage(for: asset, quality: quality, loadsImage: loadsImage) {
+            let knownFileSignature = Self.knownFileSignature(for: asset)
+            if let image = Self.seedImage(
+                for: asset,
+                quality: quality,
+                loadsImage: loadsImage,
+                knownFileSignature: knownFileSignature
+            ) {
                 loadedImage = image
             } else {
                 loadedImage = nil
             }
-            imageRequest = ImageCache.shared.image(for: url, quality: quality, priority: decodePriority) { image in
-                guard requestID == currentRequestID else { return }
-                var transaction = Transaction()
-                transaction.animation = nil
-                withTransaction(transaction) {
-                    loadedImage = image
+
+            repeat {
+                let currentRequestID = UUID()
+                requestID = currentRequestID
+                imageRequest?.cancel()
+                imageRequest = ImageCache.shared.image(
+                    for: url,
+                    quality: quality,
+                    knownFileSignature: knownFileSignature,
+                    priority: decodePriority
+                ) { image in
+                    guard requestID == currentRequestID else { return }
+                    var transaction = Transaction()
+                    transaction.animation = nil
+                    withTransaction(transaction) {
+                        loadedImage = image
+                    }
+                    imageRequest = nil
                 }
-                imageRequest = nil
-            }
+
+                do {
+                    try await Task.sleep(for: .seconds(Self.fileSignatureRefreshInterval))
+                } catch {
+                    break
+                }
+            } while !Task.isCancelled
+
+            imageRequest?.cancel()
+            imageRequest = nil
+            requestID = UUID()
         }
         .onDisappear {
             imageRequest?.cancel()
@@ -899,10 +924,34 @@ struct AssetImageView: View {
         Color.clear
     }
 
-    private static func seedImage(for asset: LightboxAsset, quality: ImageCacheQuality, loadsImage: Bool) -> NSImage? {
+    private static func seedImage(
+        for asset: LightboxAsset,
+        quality: ImageCacheQuality,
+        loadsImage: Bool,
+        knownFileSignature: FileContentSignature? = nil
+    ) -> NSImage? {
         guard loadsImage, let url = asset.sourceURL else { return nil }
-        return ImageCache.shared.bestCachedImage(for: url, quality: quality)
+        return ImageCache.shared.bestCachedImage(
+            for: url,
+            quality: quality,
+            knownFileSignature: knownFileSignature ?? Self.knownFileSignature(for: asset)
+        )
     }
+
+    static func imageRequestIdentity(
+        for asset: LightboxAsset,
+        quality: ImageCacheQuality,
+        loadsImage: Bool
+    ) -> String {
+        let signature = asset.fileContentSignature?.cacheKeyComponent ?? "missing"
+        return "\(asset.sourceURL?.path ?? ""):\(signature):\(quality.rawValue):\(loadsImage)"
+    }
+
+    static func knownFileSignature(for asset: LightboxAsset) -> FileContentSignature? {
+        asset.fileContentSignature
+    }
+
+    static let fileSignatureRefreshInterval: TimeInterval = 15
 }
 
 extension AssetImageView {

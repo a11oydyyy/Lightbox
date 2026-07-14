@@ -20,15 +20,18 @@ final class ImageCache: @unchecked Sendable {
     private var pendingDecodes: [String: PendingDecode] = [:]
     private let diskCache: ThumbnailDiskCache
     private let telemetry = ImageCacheTelemetry()
+    private let fileSignature: @Sendable (URL) -> FileContentSignature?
     private let decodeImage: @Sendable (URL, ImageCacheQuality) -> NSImage?
 
     init(
         diskCache: ThumbnailDiskCache = ThumbnailDiskCache(),
         memoryProfile: ImageCacheMemoryProfile = .current,
-        decodeImage: @escaping @Sendable (URL, ImageCacheQuality) -> NSImage? = ImageCache.downsampledImage
+        decodeImage: @escaping @Sendable (URL, ImageCacheQuality) -> NSImage? = ImageCache.downsampledImage,
+        fileSignature: @escaping @Sendable (URL) -> FileContentSignature? = { FileContentSignature(url: $0) }
     ) {
         self.diskCache = diskCache
         self.decodeImage = decodeImage
+        self.fileSignature = fileSignature
         self.memoryProfile = memoryProfile
         decodeQueue = Self.makeDecodeQueue(memoryProfile: memoryProfile)
         cache.countLimit = memoryProfile.thumbnailCountLimit
@@ -105,17 +108,13 @@ final class ImageCache: @unchecked Sendable {
     func image(
         for url: URL,
         quality: ImageCacheQuality,
+        knownFileSignature: FileContentSignature? = nil,
         priority: ImageDecodePriority = .normal,
         completion: @escaping @MainActor @Sendable (NSImage?) -> Void
     ) -> ImageCacheRequest? {
-        let key = cacheKey(for: url, quality: quality)
-        if let image = cachedImage(forKey: key, quality: quality) {
-            if let snapshot = telemetry.record(.memoryHit, quality: quality) {
-                Self.logThumbnailCacheSummary(snapshot)
-            }
-            completion(image)
-            return nil
-        }
+        // Asset metadata is a hint. The current signature is resolved on the decode queue so
+        // external volumes can detect same-path replacements without blocking the main actor.
+        let pendingKey = cacheKey(for: url, quality: quality, signature: knownFileSignature)
 
         let requestGeneration = currentGeneration()
         let requestID = nextRequestID()
@@ -124,23 +123,24 @@ final class ImageCache: @unchecked Sendable {
         var inheritedCompletions: [UUID: @MainActor @Sendable (NSImage?) -> Void] = [:]
         var operationsToCancel: [Operation] = []
         requestLock.lock()
-        if var pendingDecode = pendingDecodes[key],
+        if var pendingDecode = pendingDecodes[pendingKey],
            pendingDecode.generation == requestGeneration {
             pendingDecode.completions[subscriberID] = completion
             let subscriberCount = pendingDecode.completions.count
-            pendingDecodes[key] = pendingDecode
+            pendingDecodes[pendingKey] = pendingDecode
             requestLock.unlock()
             if requestID <= 8 || subscriberCount >= 4 {
                 Self.logger.info("decode coalesced id=\(requestID) generation=\(requestGeneration) quality=\(quality.rawValue, privacy: .public) subscribers=\(subscriberCount) file=\(url.lastPathComponent, privacy: .public)")
             }
             return ImageCacheRequest { [weak self] in
-                self?.cancelPendingSubscriber(key: key, subscriberID: subscriberID)
+                self?.cancelPendingSubscriber(key: pendingKey, subscriberID: subscriberID)
             }
         }
 
         if let preferred = pendingDecodes.first(where: { _, pending in
             pending.generation == requestGeneration
                 && pending.filePath == filePath
+                && pending.fileSignature == knownFileSignature
                 && Self.shouldAttach(requested: quality, toPending: pending.quality)
         }) {
             var pendingDecode = preferred.value
@@ -159,6 +159,7 @@ final class ImageCache: @unchecked Sendable {
         let promotionKeys = pendingDecodes.compactMap { pendingKey, pending -> String? in
             guard pending.generation == requestGeneration,
                   pending.filePath == filePath,
+                  pending.fileSignature == knownFileSignature,
                   Self.shouldPromote(pending: pending.quality, to: quality)
             else {
                 return nil
@@ -182,6 +183,7 @@ final class ImageCache: @unchecked Sendable {
         }
 
         let operation = BlockOperation()
+        let pendingToken = UUID()
         operation.queuePriority = priority.queuePriority
         operation.qualityOfService = priority.qualityOfService
         let queuedAt = Date()
@@ -189,33 +191,48 @@ final class ImageCache: @unchecked Sendable {
             guard let self else { return }
             let startedAt = Date()
 
-            let decodeResult: (image: NSImage?, usedDiskCache: Bool, cacheSource: ImageCacheTelemetrySource)? = autoreleasepool {
+            let decodeResult: (
+                image: NSImage?,
+                cacheSource: ImageCacheTelemetrySource,
+                resolvedKey: String
+            )? = autoreleasepool {
                 guard operation?.isCancelled == false,
                       self.currentGeneration() == requestGeneration
                 else {
                     return nil
                 }
 
-                let diskImage = quality.usesDiskCache ? self.diskCache.image(for: url, quality: quality) : nil
+                let currentSignature = self.fileSignature(url)
+                let resolvedKey = self.cacheKey(
+                    for: url,
+                    quality: quality,
+                    signature: currentSignature
+                )
+                let memoryImage = self.cachedImage(forKey: resolvedKey, quality: quality)
+                let diskImage = memoryImage == nil && quality.usesDiskCache
+                    ? self.diskCache.image(for: url, quality: quality, signature: currentSignature)
+                    : nil
                 guard operation?.isCancelled == false,
                       self.currentGeneration() == requestGeneration
                 else {
                     return nil
                 }
 
-                let image = diskImage ?? self.decodeImage(url, quality)
+                let image = memoryImage ?? diskImage ?? self.decodeImage(url, quality)
                 guard operation?.isCancelled == false,
                       self.currentGeneration() == requestGeneration
                 else {
                     return nil
                 }
 
-                if diskImage == nil, let image, quality.usesDiskCache {
-                    self.diskCache.store(image, for: url, quality: quality)
+                if memoryImage == nil, diskImage == nil, let image, quality.usesDiskCache {
+                    self.diskCache.store(image, for: url, quality: quality, signature: currentSignature)
                 }
 
                 let cacheSource: ImageCacheTelemetrySource
-                if diskImage != nil {
+                if memoryImage != nil {
+                    cacheSource = .memoryHit
+                } else if diskImage != nil {
                     cacheSource = .diskHit
                 } else if image != nil {
                     cacheSource = .decoded
@@ -223,7 +240,7 @@ final class ImageCache: @unchecked Sendable {
                     cacheSource = .failure
                 }
 
-                return (image, diskImage != nil, cacheSource)
+                return (image, cacheSource, resolvedKey)
             }
             guard let decodeResult else { return }
             if let snapshot = self.telemetry.record(decodeResult.cacheSource, quality: quality) {
@@ -233,7 +250,17 @@ final class ImageCache: @unchecked Sendable {
             let waitSeconds = startedAt.timeIntervalSince(queuedAt)
             let decodeSeconds = finishedAt.timeIntervalSince(startedAt)
             let shouldLog = requestID <= 8 || decodeResult.image == nil || waitSeconds > 0.75 || decodeSeconds > 0.55
-            let usedDiskCache = decodeResult.usedDiskCache
+            let cacheSourceName: String
+            switch decodeResult.cacheSource {
+            case .memoryHit:
+                cacheSourceName = "memory"
+            case .diskHit:
+                cacheSourceName = "disk"
+            case .decoded:
+                cacheSourceName = "decode"
+            case .failure:
+                cacheSourceName = "failure"
+            }
 
             Task { @MainActor in
                 guard self.currentGeneration() == requestGeneration else {
@@ -244,11 +271,15 @@ final class ImageCache: @unchecked Sendable {
                 }
                 let image = decodeResult.image
                 if let image {
-                    self.store(image, forKey: key, quality: quality)
+                    self.store(image, forKey: decodeResult.resolvedKey, quality: quality)
                 }
-                let completions = self.finishPendingDecode(key: key, generation: requestGeneration)
+                let completions = self.finishPendingDecode(
+                    key: pendingKey,
+                    generation: requestGeneration,
+                    token: pendingToken
+                )
                 if shouldLog {
-                    Self.logger.info("decode complete id=\(requestID) quality=\(quality.rawValue, privacy: .public) priority=\(priority.logName, privacy: .public) source=\(usedDiskCache ? "disk" : "decode", privacy: .public) success=\(image != nil) subscribers=\(completions.count) wait=\(waitSeconds, format: .fixed(precision: 2))s decode=\(decodeSeconds, format: .fixed(precision: 2))s pending=\(self.decodeQueue.operationCount) file=\(url.lastPathComponent, privacy: .public)")
+                    Self.logger.info("decode complete id=\(requestID) quality=\(quality.rawValue, privacy: .public) priority=\(priority.logName, privacy: .public) source=\(cacheSourceName, privacy: .public) success=\(image != nil) subscribers=\(completions.count) wait=\(waitSeconds, format: .fixed(precision: 2))s decode=\(decodeSeconds, format: .fixed(precision: 2))s pending=\(self.decodeQueue.operationCount) file=\(url.lastPathComponent, privacy: .public)")
                 }
                 for completion in completions {
                     completion(image)
@@ -264,17 +295,19 @@ final class ImageCache: @unchecked Sendable {
         }
         requestLock.lock()
         inheritedCompletions[subscriberID] = completion
-        pendingDecodes[key] = PendingDecode(
+        pendingDecodes[pendingKey] = PendingDecode(
             generation: requestGeneration,
+            token: pendingToken,
             operation: operation,
             quality: quality,
             filePath: filePath,
+            fileSignature: knownFileSignature,
             completions: inheritedCompletions
         )
         requestLock.unlock()
         decodeQueue.addOperation(operation)
         return ImageCacheRequest { [weak self] in
-            self?.cancelPendingSubscriber(key: key, subscriberID: subscriberID)
+            self?.cancelPendingSubscriber(key: pendingKey, subscriberID: subscriberID)
         }
     }
 
@@ -300,11 +333,13 @@ final class ImageCache: @unchecked Sendable {
 
     private func finishPendingDecode(
         key: String,
-        generation: Int
+        generation: Int,
+        token: UUID
     ) -> [@MainActor @Sendable (NSImage?) -> Void] {
         requestLock.lock()
         guard let pendingDecode = pendingDecodes[key],
-              pendingDecode.generation == generation
+              pendingDecode.generation == generation,
+              pendingDecode.token == token
         else {
             requestLock.unlock()
             return []
@@ -329,8 +364,13 @@ final class ImageCache: @unchecked Sendable {
         return generation
     }
 
-    private func cacheKey(for url: URL, quality: ImageCacheQuality) -> String {
-        "\(quality.rawValue):\(url.path)"
+    private func cacheKey(
+        for url: URL,
+        quality: ImageCacheQuality,
+        signature: FileContentSignature?
+    ) -> String {
+        let signatureKey = signature?.cacheKeyComponent ?? "missing"
+        return "\(quality.rawValue):\(url.standardizedFileURL.path):\(signatureKey)"
     }
 
     static func shouldAttach(requested: ImageCacheQuality, toPending pending: ImageCacheQuality) -> Bool {
@@ -353,9 +393,14 @@ final class ImageCache: @unchecked Sendable {
         return requestedRank > pendingRank
     }
 
-    func bestCachedImage(for url: URL, quality: ImageCacheQuality) -> NSImage? {
+    func bestCachedImage(
+        for url: URL,
+        quality: ImageCacheQuality,
+        knownFileSignature: FileContentSignature? = nil
+    ) -> NSImage? {
+        guard let fileSignature = knownFileSignature else { return nil }
         for candidate in quality.cacheLookupOrder {
-            let key = cacheKey(for: url, quality: candidate)
+            let key = cacheKey(for: url, quality: candidate, signature: fileSignature)
             if let image = cachedImage(forKey: key, quality: candidate) {
                 return image
             }
@@ -554,19 +599,40 @@ final class ImageCacheTelemetry: @unchecked Sendable {
 }
 
 final class ThumbnailDiskCache: @unchecked Sendable {
+    private nonisolated static let logger = Logger(
+        subsystem: "io.github.a11oydyyy.Lightbox",
+        category: "ThumbnailDiskCache"
+    )
     private let folder: URL
     private let fileManager: FileManager
+    private let maxDiskBytes: Int64
+    private let pruneInterval: TimeInterval
+    private let maintenanceLock = NSLock()
+    private var lastPruneAt: Date?
+    private var bytesWrittenSinceLastPrune: Int64 = 0
 
     init(
         folder: URL = LightboxLibraryStore.cacheFolder.appendingPathComponent("Thumbnails", isDirectory: true),
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        maxDiskBytes: Int64 = 1024 * 1024 * 1024,
+        pruneInterval: TimeInterval = 30
     ) {
         self.folder = folder
         self.fileManager = fileManager
+        self.maxDiskBytes = max(0, maxDiskBytes)
+        self.pruneInterval = max(0, pruneInterval)
     }
 
     func image(for url: URL, quality: ImageCacheQuality) -> NSImage? {
-        guard let cacheURL = cacheURL(for: url, quality: quality),
+        image(for: url, quality: quality, signature: FileContentSignature(url: url))
+    }
+
+    func image(
+        for url: URL,
+        quality: ImageCacheQuality,
+        signature: FileContentSignature?
+    ) -> NSImage? {
+        guard let cacheURL = cacheURL(for: url, quality: quality, signature: signature),
               fileManager.fileExists(atPath: cacheURL.path)
         else {
             return nil
@@ -581,7 +647,16 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     }
 
     func store(_ image: NSImage, for url: URL, quality: ImageCacheQuality) {
-        guard let cacheURL = cacheURL(for: url, quality: quality),
+        store(image, for: url, quality: quality, signature: FileContentSignature(url: url))
+    }
+
+    func store(
+        _ image: NSImage,
+        for url: URL,
+        quality: ImageCacheQuality,
+        signature: FileContentSignature?
+    ) {
+        guard let cacheURL = cacheURL(for: url, quality: quality, signature: signature),
               let data = encodedData(for: image)
         else {
             return
@@ -590,6 +665,7 @@ final class ThumbnailDiskCache: @unchecked Sendable {
         do {
             try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
             try data.write(to: cacheURL, options: [.atomic])
+            pruneIfNeeded(addedBytes: Int64(data.count))
         } catch {
             try? fileManager.removeItem(at: cacheURL)
         }
@@ -597,11 +673,27 @@ final class ThumbnailDiskCache: @unchecked Sendable {
 
     func removeAll() {
         try? fileManager.removeItem(at: folder)
+        maintenanceLock.lock()
+        lastPruneAt = nil
+        bytesWrittenSinceLastPrune = 0
+        maintenanceLock.unlock()
+    }
+
+    func pruneIfNeeded(force: Bool = false) {
+        pruneIfNeeded(addedBytes: 0, force: force)
     }
 
     func cacheURL(for url: URL, quality: ImageCacheQuality) -> URL? {
+        cacheURL(for: url, quality: quality, signature: FileContentSignature(url: url))
+    }
+
+    private func cacheURL(
+        for url: URL,
+        quality: ImageCacheQuality,
+        signature: FileContentSignature?
+    ) -> URL? {
         guard quality.usesDiskCache,
-              let signature = ThumbnailFileSignature(url: url)
+              let signature
         else {
             return nil
         }
@@ -613,19 +705,88 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     static func cacheKey(
         for url: URL,
         quality: ImageCacheQuality,
-        signature: ThumbnailFileSignature
+        signature: FileContentSignature
     ) -> String {
         let rawKey = [
             quality.rawValue,
             String(quality.maxPixelSize),
             url.standardizedFileURL.path,
-            String(format: "%.6f", signature.modificationTime),
-            String(signature.fileSize)
+            signature.cacheKeyComponent
         ].joined(separator: "|")
 
         return SHA256.hash(data: Data(rawKey.utf8)).map {
             String(format: "%02x", $0)
         }.joined()
+    }
+
+    private func pruneIfNeeded(addedBytes: Int64, force: Bool = false) {
+        maintenanceLock.lock()
+        defer { maintenanceLock.unlock() }
+
+        bytesWrittenSinceLastPrune += max(0, addedBytes)
+        let now = Date()
+        let elapsed = lastPruneAt.map { now.timeIntervalSince($0) } ?? .infinity
+        let growthThreshold = max(1, min(maxDiskBytes / 20, 64 * 1024 * 1024))
+        let shouldPrune = force
+            || lastPruneAt == nil
+            || elapsed >= pruneInterval
+            || bytesWrittenSinceLastPrune >= growthThreshold
+        guard shouldPrune else { return }
+
+        lastPruneAt = now
+        bytesWrittenSinceLastPrune = 0
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileSizeKey,
+            .contentAccessDateKey,
+            .contentModificationDateKey
+        ]
+        guard let urls = try? fileManager.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        let entries = urls.compactMap { url -> ThumbnailDiskCacheEntry? in
+            guard let values = try? url.resourceValues(forKeys: keys),
+                  values.isRegularFile == true,
+                  let fileSize = values.fileSize
+            else {
+                return nil
+            }
+            let recentDate = [values.contentAccessDate, values.contentModificationDate]
+                .compactMap { $0 }
+                .max() ?? .distantPast
+            return ThumbnailDiskCacheEntry(
+                url: url,
+                fileSize: Int64(max(0, fileSize)),
+                recentDate: recentDate
+            )
+        }
+        var totalBytes = entries.reduce(Int64(0)) { $0 + $1.fileSize }
+        guard totalBytes > maxDiskBytes else { return }
+
+        var removedCount = 0
+        for entry in entries.sorted(by: {
+            if $0.recentDate != $1.recentDate {
+                return $0.recentDate < $1.recentDate
+            }
+            return $0.url.path < $1.url.path
+        }) where totalBytes > maxDiskBytes {
+            do {
+                try fileManager.removeItem(at: entry.url)
+                totalBytes -= entry.fileSize
+                removedCount += 1
+            } catch {
+                continue
+            }
+        }
+
+        if removedCount > 0 {
+            Self.logger.info("thumbnail disk cache pruned removed=\(removedCount) remainingBytes=\(totalBytes) limitBytes=\(self.maxDiskBytes)")
+        }
     }
 
     private func encodedData(for image: NSImage) -> Data? {
@@ -640,25 +801,10 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     }
 }
 
-struct ThumbnailFileSignature: Equatable {
-    var modificationTime: TimeInterval
-    var fileSize: UInt64
-
-    init(modificationTime: TimeInterval, fileSize: UInt64) {
-        self.modificationTime = modificationTime
-        self.fileSize = fileSize
-    }
-
-    init?(url: URL) {
-        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
-              let modificationDate = values.contentModificationDate
-        else {
-            return nil
-        }
-
-        modificationTime = modificationDate.timeIntervalSince1970
-        fileSize = UInt64(max(0, values.fileSize ?? 0))
-    }
+private struct ThumbnailDiskCacheEntry {
+    var url: URL
+    var fileSize: Int64
+    var recentDate: Date
 }
 
 final class ImageCacheRequest {
@@ -675,9 +821,11 @@ final class ImageCacheRequest {
 
 private struct PendingDecode {
     var generation: Int
+    var token: UUID
     var operation: Operation
     var quality: ImageCacheQuality
     var filePath: String
+    var fileSignature: FileContentSignature?
     var completions: [UUID: @MainActor @Sendable (NSImage?) -> Void]
 }
 

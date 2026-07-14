@@ -90,6 +90,51 @@ struct GalleryImagePriorityPlanner {
     }
 }
 
+struct GalleryAssetFrameLifecycle {
+    private static let scrollUpdateThreshold: CGFloat = 24
+    private static let comparisonTolerance: CGFloat = 0.5
+
+    static func activeFrames(
+        _ frames: [LightboxAsset.ID: CGRect],
+        activeAssetIDs: Set<LightboxAsset.ID>
+    ) -> [LightboxAsset.ID: CGRect] {
+        frames.reduce(into: [:]) { result, entry in
+            guard activeAssetIDs.contains(entry.key) else { return }
+            result[entry.key] = entry.value
+        }
+    }
+
+    static func replacementFrames(
+        current: [LightboxAsset.ID: CGRect],
+        incoming: [LightboxAsset.ID: CGRect],
+        activeAssetIDs: Set<LightboxAsset.ID>
+    ) -> [LightboxAsset.ID: CGRect]? {
+        let next = activeFrames(incoming, activeAssetIDs: activeAssetIDs)
+        guard current != next else { return nil }
+        guard Set(current.keys) == Set(next.keys),
+              let firstID = next.keys.first,
+              let firstCurrentFrame = current[firstID],
+              let firstNextFrame = next[firstID]
+        else {
+            return next
+        }
+
+        let verticalShift = firstNextFrame.minY - firstCurrentFrame.minY
+        let isUniformVerticalTranslation = next.allSatisfy { id, nextFrame in
+            guard let currentFrame = current[id] else { return false }
+            return abs(nextFrame.minX - currentFrame.minX) <= comparisonTolerance
+                && abs(nextFrame.width - currentFrame.width) <= comparisonTolerance
+                && abs(nextFrame.height - currentFrame.height) <= comparisonTolerance
+                && abs((nextFrame.minY - currentFrame.minY) - verticalShift) <= comparisonTolerance
+        }
+
+        if isUniformVerticalTranslation, abs(verticalShift) <= scrollUpdateThreshold {
+            return nil
+        }
+        return next
+    }
+}
+
 struct GalleryPerformanceProfile: Equatable {
     var isCompatibilityMode: Bool
 
@@ -218,6 +263,7 @@ struct GalleryView: View {
         GeometryReader { viewport in
             let folderHorizontalPadding = horizontalPadding + imageColumnInset(viewportWidth: viewport.size.width)
             let activeAssets = appState.activeAssets
+            let activeAssetIDs = Set(activeAssets.map(\.id))
             let performanceProfile = GalleryPerformanceProfile.current
             let prefersFastRawThumbnails = prefersFastRawThumbnails(activeAssets: activeAssets)
             let loadableAssetIDs = imageLoadAssetIDs(
@@ -330,10 +376,12 @@ struct GalleryView: View {
                     backgroundContextMenu
                 }
                 .onPreferenceChange(AssetFramePreferenceKey.self) { frames in
-                    updateAssetFramesIfNeeded(frames)
+                    updateAssetFramesIfNeeded(frames, activeAssetIDs: activeAssetIDs)
                 }
                 .onPreferenceChange(PreviewSpaceAssetFramePreferenceKey.self) { frames in
-                    appState.updatePreviewSpaceAssetFrames(frames)
+                    appState.updatePreviewSpaceAssetFrames(
+                        GalleryAssetFrameLifecycle.activeFrames(frames, activeAssetIDs: activeAssetIDs)
+                    )
                 }
                 .onPreferenceChange(FolderRowFramePreferenceKey.self) { frame in
                     folderRowFrame = frame
@@ -522,30 +570,19 @@ struct GalleryView: View {
         }
     }
 
-    private func updateAssetFramesIfNeeded(_ frames: [LightboxAsset.ID: CGRect]) {
+    private func updateAssetFramesIfNeeded(
+        _ frames: [LightboxAsset.ID: CGRect],
+        activeAssetIDs: Set<LightboxAsset.ID>
+    ) {
         // Avoid a per-frame preference→state→re-render storm while the sidebar
         // is being dragged (rubber-band selection isn't active then anyway).
         guard !isResizingSidebar else { return }
-        guard !frames.isEmpty else {
-            if !assetFrames.isEmpty {
-                assetFrames = [:]
-            }
-            return
-        }
-
-        guard frames.count == assetFrames.count,
-              Set(frames.keys) == Set(assetFrames.keys),
-              let previousTop = assetFrames.values.map(\.minY).min(),
-              let nextTop = frames.values.map(\.minY).min(),
-              let previousWidth = assetFrames.values.first?.width,
-              let nextWidth = frames.values.first?.width
-        else {
-            assetFrames = frames
-            return
-        }
-
-        if abs(nextTop - previousTop) > 24 || abs(nextWidth - previousWidth) > 1 {
-            assetFrames = frames
+        if let replacement = GalleryAssetFrameLifecycle.replacementFrames(
+            current: assetFrames,
+            incoming: frames,
+            activeAssetIDs: activeAssetIDs
+        ) {
+            assetFrames = replacement
         }
     }
 

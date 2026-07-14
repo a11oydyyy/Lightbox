@@ -9,8 +9,24 @@ struct SearchAssetGroup: Identifiable, Equatable {
     var assets: [LightboxAsset]
 }
 
+private enum TagMutationAction: Equatable, Sendable {
+    case add
+    case toggle
+}
+
+private struct TagMutationRequest: Sendable {
+    var tag: String
+    var assets: [LightboxAsset]
+    var action: TagMutationAction
+}
+
+private struct TagMutationWrite: Sendable {
+    var id: LightboxAsset.ID
+    var url: URL?
+    var tags: [String]
+}
+
 struct AssetMetadataRefreshPolicy: Equatable {
-    static let externalDimensionLimit = 4
     static let externalAssetTagLimit = 12
     static let localStartDelayMilliseconds = 650
     static let externalStartDelayMilliseconds = 1_600
@@ -19,7 +35,7 @@ struct AssetMetadataRefreshPolicy: Equatable {
     var requiresCompleteAssetTags = false
 
     func dimensionLimit(assetCount: Int) -> Int {
-        usesConservativeExternalLoading ? min(assetCount, Self.externalDimensionLimit) : assetCount
+        assetCount
     }
 
     func tagLimit(assetCount: Int) -> Int {
@@ -85,9 +101,15 @@ final class AppState: ObservableObject {
     @Published var selectedFilter: LibraryFilter = .all {
         didSet {
             guard selectedFilter != oldValue else { return }
+            if selectedFilter == .trash || oldValue == .trash {
+                cancelPreviewDimensionResolution(clearPendingStep: true)
+            }
             rebuildActiveAssets()
             clearSelection()
             restartLibraryMonitor()
+            if case .tag = selectedFilter {
+                startCompleteAssetTagRefresh()
+            }
             if selectedFilter == .trash || oldValue == .trash {
                 refreshLibrary()
             }
@@ -164,6 +186,12 @@ final class AppState: ObservableObject {
     private var previewOpenTask: Task<Void, Never>?
     private var previewCloseTask: Task<Void, Never>?
     private var previewSourceRevealTask: Task<Void, Never>?
+    private var previewDimensionTask: Task<Void, Never>?
+    private var previewDimensionRequestID: UUID?
+    private var trashMoveTask: Task<Void, Never>?
+    private var queuedTrashAssets: [LightboxAsset] = []
+    private var tagMutationTask: Task<Void, Never>?
+    private var queuedTagMutations: [TagMutationRequest] = []
     private var refreshTask: Task<Void, Never>?
     private var libraryLoadTask: Task<Void, Never>?
     private var assetMetadataTask: Task<Void, Never>?
@@ -173,18 +201,42 @@ final class AppState: ObservableObject {
     private var refreshSerial = 0
     private var libraryDirectoryMonitor: DirectoryChangeMonitor?
     private let trashDirectoryMonitor: DirectoryChangeMonitor
-    private let indexStore = LightboxIndexStore()
+    private let indexDatabaseURL: URL
+    private let indexStore: LightboxIndexStore
+    private let libraryDefaults: UserDefaults
     private var selectionAnchorID: LightboxAsset.ID?
     @Published private var cachedActiveAssets: [LightboxAsset] = []
     private var searchResultAssets: [LightboxAsset]?
     private var previewAssetSnapshot: LightboxAsset?
+    private var pendingPreviewStepAssetID: LightboxAsset.ID?
     private var previewSpaceAssetFrames: [LightboxAsset.ID: CGRect] = [:]
     private var compareTrayPulseTask: Task<Void, Never>?
     private var compareTrayDragID: LightboxAsset.ID?
     private let compareTrayLimit = 8
     private var sidebarVolumeObserverTokens: [SidebarVolumeObserverToken] = []
+    private let previewDimensionProbe: @Sendable (URL) -> CGSize?
+    private let systemTrashMover: @Sendable (URL) -> Bool
+    private let finderTagWriter: @Sendable ([String], URL) -> Bool
 
-    init() {
+    init(
+        indexDatabaseURL: URL = LightboxLibraryStore.indexDatabaseURL,
+        libraryDefaults: UserDefaults = .standard,
+        previewDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
+            ImageProbe.dimensions(for: $0)
+        },
+        systemTrashMover: @escaping @Sendable (URL) -> Bool = {
+            LightboxLibraryStore.moveToSystemTrash($0)
+        },
+        finderTagWriter: @escaping @Sendable ([String], URL) -> Bool = {
+            FinderTagStore.setColorTags($0, for: $1)
+        }
+    ) {
+        self.indexDatabaseURL = indexDatabaseURL
+        indexStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
+        self.libraryDefaults = libraryDefaults
+        self.previewDimensionProbe = previewDimensionProbe
+        self.systemTrashMover = systemTrashMover
+        self.finderTagWriter = finderTagWriter
         ImageCache.shared.removeMemoryObjects(reason: "app-init")
         colorMode = LightboxSettingsStore.loadColorMode()
         glassOpacity = LightboxSettingsStore.loadGlassOpacity()
@@ -194,23 +246,24 @@ final class AppState: ObservableObject {
         sidebarVisibleLocationIDs = LightboxSettingsStore.loadSidebarVisibleLocationIDs()
         showFolderCards = LightboxSettingsStore.loadShowFolderCards()
         trashDirectoryMonitor = DirectoryChangeMonitor(url: LightboxLibraryStore.primarySystemTrashFolder)
-        let loadedSources = LibrarySourceStore.loadSources()
+        let loadedSources = LibrarySourceStore.loadSources(defaults: libraryDefaults)
         let fallbackSource = LibrarySource.defaultStartupSource()
-        let savedSourceID = LibrarySourceStore.selectedSourceID(default: fallbackSource.id)
+        let savedSourceID = LibrarySourceStore.selectedSourceID(
+            default: fallbackSource.id,
+            defaults: libraryDefaults
+        )
         var resolvedSource = loadedSources.first { $0.id == savedSourceID } ?? fallbackSource
         var restoredTemporarySource: LibrarySource?
         var initialFolderURL = resolvedSource.rootURL
 
-        if let lastSession = LibrarySourceStore.loadLastSession(),
-           FileManager.default.fileExists(atPath: lastSession.folderURL.path) {
+        if let lastSession = LibrarySourceStore.loadLastSession(defaults: libraryDefaults) {
             if let matchedSource = loadedSources.first(where: {
                 $0.id == lastSession.sourceID ||
                 $0.rootURL.standardizedFileURL.path == lastSession.sourceRootURL.path
             }) {
                 resolvedSource = matchedSource
                 initialFolderURL = lastSession.folderURL
-            } else if lastSession.sourceKind == .external,
-                      FileManager.default.fileExists(atPath: lastSession.sourceRootURL.path) {
+            } else if lastSession.sourceKind == .external {
                 let temporary = LibrarySource(
                     id: lastSession.sourceID,
                     name: lastSession.sourceName,
@@ -231,7 +284,7 @@ final class AppState: ObservableObject {
         }
         selectedSourceID = resolvedSource.id
         currentFolderURL = initialFolderURL
-        LibrarySourceStore.saveSelectedSourceID(resolvedSource.id)
+        LibrarySourceStore.saveSelectedSourceID(resolvedSource.id, defaults: libraryDefaults)
         saveCurrentFolderSession()
         refreshSidebarDestinations()
         startSidebarVolumeMonitoring()
@@ -249,6 +302,9 @@ final class AppState: ObservableObject {
         previewOpenTask?.cancel()
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
+        previewDimensionTask?.cancel()
+        trashMoveTask?.cancel()
+        tagMutationTask?.cancel()
         libraryLoadTask?.cancel()
         assetMetadataTask?.cancel()
         indexWriteTask?.cancel()
@@ -860,9 +916,10 @@ final class AppState: ObservableObject {
     }
 
     private func activateSource(_ source: LibrarySource, initialFolderURL: URL? = nil) {
+        cancelPreviewDimensionResolution(clearPendingStep: true)
         let previousSourceID = selectedSourceID
         selectedSourceID = source.id
-        LibrarySourceStore.saveSelectedSourceID(source.id)
+        LibrarySourceStore.saveSelectedSourceID(source.id, defaults: libraryDefaults)
         selectedFilter = .all
         currentFolderURL = initialFolderURL?.standardizedFileURL ?? source.rootURL
         saveCurrentFolderSession()
@@ -914,10 +971,10 @@ final class AppState: ObservableObject {
 
         let wasSelected = selectedSourceID == sourceID
         sources.removeAll { $0.id == sourceID }
-        LibrarySourceStore.saveExternalSources(sources)
+        LibrarySourceStore.saveExternalSources(sources, defaults: libraryDefaults)
         if wasSelected {
             temporarySource = source
-            LibrarySourceStore.saveSelectedSourceID(source.id)
+            LibrarySourceStore.saveSelectedSourceID(source.id, defaults: libraryDefaults)
         }
     }
 
@@ -933,13 +990,13 @@ final class AppState: ObservableObject {
         }
 
         sources.append(source)
-        LibrarySourceStore.saveExternalSources(sources)
+        LibrarySourceStore.saveExternalSources(sources, defaults: libraryDefaults)
         indexStore.upsertSource(source)
         if temporarySource?.rootURL.standardizedFileURL.path == source.rootURL.standardizedFileURL.path {
             temporarySource = nil
         }
         if selectedSourceID == source.id {
-            LibrarySourceStore.saveSelectedSourceID(source.id)
+            LibrarySourceStore.saveSelectedSourceID(source.id, defaults: libraryDefaults)
         }
         if selectPinnedFolder {
             chooseSource(source.id)
@@ -964,7 +1021,7 @@ final class AppState: ObservableObject {
 
         let source = LibrarySourceStore.makeExternalSource(rootURL: standardizedURL)
         sources.append(source)
-        LibrarySourceStore.saveExternalSources(sources)
+        LibrarySourceStore.saveExternalSources(sources, defaults: libraryDefaults)
         indexStore.upsertSource(source)
         if temporarySource?.rootURL.standardizedFileURL.path == standardizedURL.path {
             temporarySource = nil
@@ -993,7 +1050,11 @@ final class AppState: ObservableObject {
 
     private func saveCurrentFolderSession() {
         guard !isViewingTrash, let selectedSource else { return }
-        LibrarySourceStore.saveLastSession(source: selectedSource, folderURL: currentFolderURL)
+        LibrarySourceStore.saveLastSession(
+            source: selectedSource,
+            folderURL: currentFolderURL,
+            defaults: libraryDefaults
+        )
     }
 
     func openFolder(_ folder: LibraryFolderEntry) {
@@ -1013,8 +1074,9 @@ final class AppState: ObservableObject {
                 return
             }
             temporarySource = nil
+            cancelPreviewDimensionResolution(clearPendingStep: true)
             selectedSourceID = source.id
-            LibrarySourceStore.saveSelectedSourceID(source.id)
+            LibrarySourceStore.saveSelectedSourceID(source.id, defaults: libraryDefaults)
             selectedFilter = .all
             currentFolderURL = standardizedURL
             saveCurrentFolderSession()
@@ -1042,6 +1104,7 @@ final class AppState: ObservableObject {
             return
         }
 
+        cancelPreviewDimensionResolution(clearPendingStep: true)
         selectedFilter = .all
         currentFolderURL = standardizedURL
         saveCurrentFolderSession()
@@ -1070,12 +1133,23 @@ final class AppState: ObservableObject {
     }
 
     func showPreview(for asset: LightboxAsset? = nil, sourceFrame: CGRect? = nil) {
-        guard var target = asset ?? selectedAsset ?? activeAssets.first else {
+        guard let target = asset ?? selectedAsset ?? activeAssets.first else {
             Self.previewLogger.info("preview show ignored reason=no-target phase=\(self.previewPhase.rawValue, privacy: .public)")
             return
         }
-        target = resolvedPreviewTarget(target, sourceFrame: sourceFrame)
 
+        pendingPreviewStepAssetID = nil
+        resolvePreviewTarget(
+            target,
+            sourceFrame: sourceFrame,
+            requiresActiveAsset: false
+        ) { [weak self] resolvedTarget in
+            self?.presentPreview(resolvedTarget, sourceFrame: sourceFrame)
+        }
+    }
+
+    private func presentPreview(_ target: LightboxAsset, sourceFrame: CGRect?) {
+        pendingPreviewStepAssetID = nil
         let previousPhase = previewPhase
         let nextSessionID = UUID()
         closeComparison()
@@ -1096,14 +1170,94 @@ final class AppState: ObservableObject {
         schedulePreviewOpenCompletion()
     }
 
-    private func resolvedPreviewTarget(_ asset: LightboxAsset, sourceFrame: CGRect?) -> LightboxAsset {
+    private func resolvePreviewTarget(
+        _ asset: LightboxAsset,
+        sourceFrame: CGRect?,
+        requiresActiveAsset: Bool,
+        completion: @escaping @MainActor @Sendable (LightboxAsset) -> Void
+    ) {
+        cancelPreviewDimensionResolution()
         guard needsPreviewDimensionResolve(asset),
               let url = asset.sourceURL
         else {
-            return asset
+            completion(asset)
+            return
         }
 
-        if let dimensions = ImageProbe.dimensions(for: url),
+        let dimensionProbe = previewDimensionProbe
+        let indexDatabaseURL = indexDatabaseURL
+        let requestID = UUID()
+        let requestSourceID = selectedSourceID
+        let requestFolderPath = currentFolderURL.standardizedFileURL.path
+        let requestSessionID = previewSessionID
+        let requestAssetID = asset.id
+        previewDimensionRequestID = requestID
+        previewDimensionTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let dimensions = autoreleasepool {
+                dimensionProbe(url)
+            }
+            guard !Task.isCancelled else { return }
+
+            let didResolve = await MainActor.run { () -> Bool in
+                guard let self,
+                      self.previewDimensionRequestID == requestID
+                else {
+                    return false
+                }
+                self.previewDimensionTask = nil
+                self.previewDimensionRequestID = nil
+                guard !Task.isCancelled,
+                      self.selectedSourceID == requestSourceID,
+                      self.currentFolderURL.standardizedFileURL.path == requestFolderPath,
+                      self.previewSessionID == requestSessionID,
+                      !requiresActiveAsset || self.activeAssets.contains(where: { $0.id == requestAssetID })
+                else {
+                    Self.previewLogger.info("preview dimensions ignored stale-context assetID=\(requestAssetID, privacy: .public)")
+                    return false
+                }
+                let resolved = self.resolvedPreviewTarget(
+                    asset,
+                    sourceFrame: sourceFrame,
+                    dimensions: dimensions
+                )
+                completion(resolved)
+                return true
+            }
+
+            guard didResolve,
+                  !Task.isCancelled,
+                  let dimensions,
+                  dimensions.width > 1,
+                  dimensions.height > 1
+            else {
+                return
+            }
+            LightboxIndexStore(databaseURL: indexDatabaseURL).updateCachedDimensions(
+                sourceID: requestSourceID,
+                updates: [IndexedAssetDimensions(
+                    url: url,
+                    width: dimensions.width,
+                    height: dimensions.height
+                )]
+            )
+        }
+    }
+
+    private func cancelPreviewDimensionResolution(clearPendingStep: Bool = false) {
+        previewDimensionTask?.cancel()
+        previewDimensionTask = nil
+        previewDimensionRequestID = nil
+        if clearPendingStep {
+            pendingPreviewStepAssetID = nil
+        }
+    }
+
+    private func resolvedPreviewTarget(
+        _ asset: LightboxAsset,
+        sourceFrame: CGRect?,
+        dimensions: CGSize?
+    ) -> LightboxAsset {
+        if let dimensions,
            dimensions.width > 1,
            dimensions.height > 1 {
             var resolved = asset
@@ -1196,6 +1350,7 @@ final class AppState: ObservableObject {
         previewOpenTask?.cancel()
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
+        cancelPreviewDimensionResolution(clearPendingStep: true)
         previewPhase = .closing
         previewStepDirection = nil
         Self.previewLogger.info("preview close begin phase=\(previousPhase.rawValue, privacy: .public)->closing session=\(self.previewSessionID.uuidString, privacy: .public) delay=\(Self.durationDescription(delay), privacy: .public) revealDelay=\(Self.durationDescription(sourceRevealDelay), privacy: .public) sourceHidden=\(self.previewSourceHiddenAssetID != nil, privacy: .public)")
@@ -1246,6 +1401,7 @@ final class AppState: ObservableObject {
     }
 
     func closePreview() {
+        cancelPreviewDimensionResolution(clearPendingStep: true)
         previewOpenTask?.cancel()
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
@@ -1260,6 +1416,7 @@ final class AppState: ObservableObject {
         previewOpenTask?.cancel()
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
+        cancelPreviewDimensionResolution(clearPendingStep: true)
         previewAssetID = nil
         previewAssetSnapshot = nil
         previewSourceHiddenAssetID = nil
@@ -1313,6 +1470,7 @@ final class AppState: ObservableObject {
             tags: FinderTagStore.colorTags(for: url),
             sourceURL: url,
             addedAt: LocalImageSource.addedDate(for: url) ?? .now,
+            contentModifiedAt: LocalImageSource.contentModifiedDate(for: url),
             fileSize: LocalImageSource.fileSize(for: url),
             palette: MockPalette.imported[compareTrayAssets.count % MockPalette.imported.count],
             metadataLoaded: true
@@ -1392,6 +1550,7 @@ final class AppState: ObservableObject {
         previewOpenTask?.cancel()
         previewCloseTask?.cancel()
         previewSourceRevealTask?.cancel()
+        cancelPreviewDimensionResolution(clearPendingStep: true)
         previewAssetID = nil
         previewAssetSnapshot = nil
         previewSourceHiddenAssetID = nil
@@ -1473,6 +1632,7 @@ final class AppState: ObservableObject {
             return
         }
         previewSourceRevealTask?.cancel()
+        pendingPreviewStepAssetID = nil
         previewAssetID = nil
         previewAssetSnapshot = nil
         previewSourceHiddenAssetID = nil
@@ -1515,7 +1675,7 @@ final class AppState: ObservableObject {
         guard visible.count > 1,
               previewPhase == .opening || previewPhase == .open
         else { return }
-        let currentID = previewAssetID ?? selectedAssetID
+        let currentID = pendingPreviewStepAssetID ?? previewAssetID ?? selectedAssetID
         let currentIndex = currentID.flatMap { id in visible.firstIndex { $0.id == id } } ?? 0
         let nextIndex: Int
         switch direction {
@@ -1524,7 +1684,25 @@ final class AppState: ObservableObject {
         case .next:
             nextIndex = (currentIndex + 1) % visible.count
         }
-        let nextAsset = resolvedPreviewTarget(visible[nextIndex], sourceFrame: nil)
+        let nextAsset = visible[nextIndex]
+        pendingPreviewStepAssetID = nextAsset.id
+        resolvePreviewTarget(
+            nextAsset,
+            sourceFrame: nil,
+            requiresActiveAsset: true
+        ) { [weak self] nextAsset in
+            self?.presentPreviewStep(nextAsset, direction: direction)
+        }
+    }
+
+    private func presentPreviewStep(_ nextAsset: LightboxAsset, direction: PreviewDirection) {
+        guard pendingPreviewStepAssetID == nextAsset.id else { return }
+        pendingPreviewStepAssetID = nil
+        guard previewPhase == .opening || previewPhase == .open,
+              activeAssets.contains(where: { $0.id == nextAsset.id })
+        else {
+            return
+        }
         previewOpenTask?.cancel()
         previewSourceRevealTask?.cancel()
         if previewPhase == .opening {
@@ -1566,17 +1744,48 @@ final class AppState: ObservableObject {
     }
 
     private func moveAssetsToSystemTrash(_ targetAssets: [LightboxAsset]) {
-        var removedIDs = Set<LightboxAsset.ID>()
+        let validAssets = targetAssets.filter { !$0.isDeleted && $0.sourceURL != nil }
+        guard !validAssets.isEmpty else { return }
 
-        for asset in targetAssets where !asset.isDeleted {
-            guard let sourceURL = asset.sourceURL else { continue }
-            if LightboxLibraryStore.moveToSystemTrash(sourceURL) {
-                removedIDs.insert(asset.id)
-            } else {
-                Self.logger.error("system trash failed id=\(asset.id, privacy: .public) path=\(sourceURL.path, privacy: .public)")
-            }
+        if trashMoveTask != nil {
+            let queuedIDs = Set(queuedTrashAssets.map(\.id))
+            queuedTrashAssets.append(contentsOf: validAssets.filter { !queuedIDs.contains($0.id) })
+            Self.logger.info("system trash queued assets=\(self.queuedTrashAssets.count)")
+            return
         }
 
+        let targets = validAssets.compactMap { asset -> (id: LightboxAsset.ID, url: URL)? in
+            guard let sourceURL = asset.sourceURL else { return nil }
+            return (asset.id, sourceURL)
+        }
+
+        let trashMover = systemTrashMover
+        trashMoveTask = Task.detached(priority: .userInitiated) { [weak self] in
+            var removedIDs = Set<LightboxAsset.ID>()
+            for target in targets {
+                guard !Task.isCancelled else { break }
+                if trashMover(target.url) {
+                    removedIDs.insert(target.id)
+                } else {
+                    Self.logger.error("system trash failed id=\(target.id, privacy: .public) path=\(target.url.path, privacy: .public)")
+                }
+            }
+
+            await MainActor.run {
+                guard let self else { return }
+                self.applySystemTrashSuccesses(removedIDs)
+                self.trashMoveTask = nil
+                self.queuedTrashAssets.removeAll { removedIDs.contains($0.id) }
+                let queuedAssets = self.queuedTrashAssets
+                self.queuedTrashAssets = []
+                if !queuedAssets.isEmpty {
+                    self.moveAssetsToSystemTrash(queuedAssets)
+                }
+            }
+        }
+    }
+
+    private func applySystemTrashSuccesses(_ removedIDs: Set<LightboxAsset.ID>) {
         guard !removedIDs.isEmpty else { return }
 
         assets.removeAll { removedIDs.contains($0.id) }
@@ -1637,13 +1846,7 @@ final class AppState: ObservableObject {
 
     func applyTag(_ tag: String, to asset: LightboxAsset) {
         guard MacColorTag.isColorTag(tag) else { return }
-        update(asset) { item in
-            var nextTags = item.tags
-            if !nextTags.contains(tag) {
-                nextTags.append(tag)
-            }
-            writeColorTags(nextTags, to: &item)
-        }
+        enqueueTagMutation(TagMutationRequest(tag: tag, assets: [asset], action: .add))
     }
 
     func toggleTag(_ tag: String, to asset: LightboxAsset) {
@@ -1655,33 +1858,8 @@ final class AppState: ObservableObject {
             targetIDs = [asset.id]
         }
         let targetAssets = activeAssets.filter { targetIDs.contains($0.id) }
-        let removesTag = !targetAssets.isEmpty && targetAssets.allSatisfy { $0.tags.contains(tag) }
-        let shouldClearCurrentFilter = shouldClearTagFilterAfterRemoving(tag, targetIDs: targetIDs)
-        var nextTagsByID: [LightboxAsset.ID: [String]] = [:]
-
-        for asset in targetAssets {
-            var nextTags = asset.tags
-            if removesTag {
-                nextTags.removeAll { $0 == tag }
-            } else if !nextTags.contains(tag) {
-                nextTags.append(tag)
-            }
-
-            let sortedTags = MacColorTag.sort(nextTags.filter(MacColorTag.isColorTag))
-            if let url = asset.sourceURL,
-               !FinderTagStore.setColorTags(sortedTags, for: url) {
-                continue
-            }
-            nextTagsByID[asset.id] = sortedTags
-        }
-
-        applyTagCopies(nextTagsByID)
-        clearCurrentTagFilterIfNeeded(
-            shouldClearCurrentFilter,
-            removedTag: tag,
-            targetAssets: targetAssets,
-            updatedTagsByID: nextTagsByID
-        )
+        guard !targetAssets.isEmpty else { return }
+        enqueueTagMutation(TagMutationRequest(tag: tag, assets: targetAssets, action: .toggle))
     }
 
     func selectedAssetTagCoverage(for tag: String) -> Double {
@@ -1698,33 +1876,62 @@ final class AppState: ObservableObject {
         let selectedAssets = activeAssets.filter { targetIDs.contains($0.id) }
         guard !selectedAssets.isEmpty else { return }
 
-        let removesTag = selectedAssets.allSatisfy { $0.tags.contains(tag) }
-        let shouldClearCurrentFilter = shouldClearTagFilterAfterRemoving(tag, targetIDs: targetIDs)
-        var nextTagsByID: [LightboxAsset.ID: [String]] = [:]
+        enqueueTagMutation(TagMutationRequest(tag: tag, assets: selectedAssets, action: .toggle))
+    }
 
-        for asset in selectedAssets {
-            var nextTags = asset.tags
-            if removesTag {
-                nextTags.removeAll { $0 == tag }
-            } else if !nextTags.contains(tag) {
-                nextTags.append(tag)
-            }
+    private func enqueueTagMutation(_ request: TagMutationRequest) {
+        queuedTagMutations.append(request)
+        guard tagMutationTask == nil else { return }
 
-            let sortedTags = MacColorTag.sort(nextTags.filter(MacColorTag.isColorTag))
-            if let url = asset.sourceURL,
-               !FinderTagStore.setColorTags(sortedTags, for: url) {
-                continue
+        tagMutationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, !self.queuedTagMutations.isEmpty {
+                let request = self.queuedTagMutations.removeFirst()
+                let targetAssets = request.assets.map { asset in
+                    self.assetForCurrentPresentation(asset.id) ?? asset
+                }
+                let targetIDs = Set(targetAssets.map(\.id))
+                let removesTag = request.action == .toggle
+                    && targetAssets.allSatisfy { $0.tags.contains(request.tag) }
+                let shouldClearCurrentFilter = removesTag
+                    && self.shouldClearTagFilterAfterRemoving(request.tag, targetIDs: targetIDs)
+                let writes = targetAssets.map { asset -> TagMutationWrite in
+                    var nextTags = asset.tags
+                    if removesTag {
+                        nextTags.removeAll { $0 == request.tag }
+                    } else if !nextTags.contains(request.tag) {
+                        nextTags.append(request.tag)
+                    }
+                    return TagMutationWrite(
+                        id: asset.id,
+                        url: asset.sourceURL,
+                        tags: MacColorTag.sort(nextTags.filter(MacColorTag.isColorTag))
+                    )
+                }
+                let writer = self.finderTagWriter
+                let updatedTagsByID = await Task.detached(priority: .userInitiated) {
+                    var result: [LightboxAsset.ID: [String]] = [:]
+                    for write in writes {
+                        guard !Task.isCancelled else { break }
+                        if let url = write.url, !writer(write.tags, url) {
+                            continue
+                        }
+                        result[write.id] = write.tags
+                    }
+                    return result
+                }.value
+                guard !Task.isCancelled else { break }
+
+                self.applyTagCopies(updatedTagsByID)
+                self.clearCurrentTagFilterIfNeeded(
+                    shouldClearCurrentFilter,
+                    removedTag: request.tag,
+                    targetAssets: targetAssets,
+                    updatedTagsByID: updatedTagsByID
+                )
             }
-            nextTagsByID[asset.id] = sortedTags
+            self.tagMutationTask = nil
         }
-
-        applyTagCopies(nextTagsByID)
-        clearCurrentTagFilterIfNeeded(
-            shouldClearCurrentFilter,
-            removedTag: tag,
-            targetAssets: selectedAssets,
-            updatedTagsByID: nextTagsByID
-        )
     }
 
     func revealInFinder(_ asset: LightboxAsset) {
@@ -1893,12 +2100,6 @@ final class AppState: ObservableObject {
             Self.logger.info("refresh[\(refreshID)] no selected source")
             return
         }
-        if !FileManager.default.fileExists(atPath: currentFolderURL.path) {
-            Self.logger.info("refresh[\(refreshID)] current folder missing, fallback=\(source.rootURL.path, privacy: .public)")
-            currentFolderURL = source.rootURL
-            saveCurrentFolderSession()
-        }
-
         let folderURL = currentFolderURL
         let hasCachedVisibleSnapshot = applyCachedVisibleSnapshotIfAvailable(source: source, folderURL: folderURL, refreshID: refreshID)
         let usesConservativeExternalLoading = source.usesConservativeExternalLoading
@@ -1906,6 +2107,7 @@ final class AppState: ObservableObject {
             usesConservativeExternalLoading: usesConservativeExternalLoading,
             hasCachedVisibleSnapshot: hasCachedVisibleSnapshot
         )
+        let indexDatabaseURL = indexDatabaseURL
         libraryLoadTask = Task.detached(priority: .userInitiated) { [weak self, source] in
             let scanDelayMilliseconds = refreshPolicy.scanStartDelayMilliseconds
             if scanDelayMilliseconds > 0 {
@@ -1918,7 +2120,7 @@ final class AppState: ObservableObject {
             }
             let startedAt = Date()
             Self.logger.info("refresh[\(refreshID)] scan task start source=\(source.id, privacy: .public) sourceKind=\(source.kind.rawValue, privacy: .public) folder=\(folderURL.path, privacy: .public)")
-            let cachedDimensions = LightboxIndexStore().cachedDimensions(
+            let cachedDimensions = LightboxIndexStore(databaseURL: indexDatabaseURL).cachedDimensions(
                 sourceID: source.id,
                 parentPath: folderURL.path
             )
@@ -1933,6 +2135,14 @@ final class AppState: ObservableObject {
             )
             let folders = directorySnapshot.folders
             let snapshot = directorySnapshot.assets
+            let sourceRootAvailability: LocalFolderSnapshotAvailability? = {
+                guard case .unavailable(.sourceUnavailable) = directorySnapshot.availability,
+                      folderURL.standardizedFileURL.path != source.rootURL.standardizedFileURL.path
+                else {
+                    return nil
+                }
+                return LocalImageSource.folderAvailability(in: source.rootURL)
+            }()
 
             await MainActor.run {
                 guard let self,
@@ -1942,6 +2152,22 @@ final class AppState: ObservableObject {
                       self.currentFolderURL.standardizedFileURL.path == folderURL.standardizedFileURL.path
                 else {
                     Self.logger.info("refresh[\(refreshID)] ignored cancelled=\(Task.isCancelled) folder=\(folderURL.path, privacy: .public)")
+                    return
+                }
+
+                if case let .unavailable(reason) = directorySnapshot.availability {
+                    if reason == .sourceUnavailable,
+                       sourceRootAvailability == .available {
+                        Self.logger.info("refresh[\(refreshID)] current folder missing, fallback=\(source.rootURL.path, privacy: .public)")
+                        self.cancelPreviewDimensionResolution(clearPendingStep: true)
+                        self.currentFolderURL = source.rootURL
+                        self.saveCurrentFolderSession()
+                        self.restartLibraryMonitor()
+                        self.refreshLibrary()
+                        return
+                    }
+                    self.libraryLoadingStatus = nil
+                    Self.logger.error("refresh[\(refreshID)] scan unavailable reason=\(reason.rawValue, privacy: .public) keeping-current-content folder=\(folderURL.path, privacy: .public)")
                     return
                 }
 
@@ -2068,6 +2294,9 @@ final class AppState: ObservableObject {
             if refreshed.addedAt != .distantPast {
                 existing.addedAt = refreshed.addedAt
             }
+            if refreshed.contentModifiedAt != nil {
+                existing.contentModifiedAt = refreshed.contentModifiedAt
+            }
             if refreshed.fileSize != nil {
                 existing.fileSize = refreshed.fileSize
             }
@@ -2122,17 +2351,34 @@ final class AppState: ObservableObject {
 
         Self.logger.info("refresh[\(refreshID)] metadata begin total=\(targets.count) dimensionLimit=\(metadataLimit) tagLimit=\(tagLimit) tags=\(loadsFinderTags) delayMs=\(startDelayMilliseconds) folder=\(folderURL.path, privacy: .public)")
 
+        let indexDatabaseURL = indexDatabaseURL
         assetMetadataTask = Task.detached(priority: .background) { [weak self] in
             try? await Task.sleep(for: .milliseconds(startDelayMilliseconds))
             guard !Task.isCancelled else { return }
             let startedAt = Date()
-            let dimensionIndexStore = LightboxIndexStore()
+            let dimensionIndexStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
             var batch: [AssetMetadataUpdate] = []
             var processedCount = 0
-            let progressInterval = 160
+            let batchSize = 32
+
+            func persist(_ updates: [AssetMetadataUpdate]) {
+                guard !updates.isEmpty else { return }
+                dimensionIndexStore.updateCachedMetadata(
+                    sourceID: sourceID,
+                    updates: updates.map {
+                        IndexedAssetMetadata(
+                            url: $0.url,
+                            width: $0.width,
+                            height: $0.height,
+                            tags: $0.tags
+                        )
+                    }
+                )
+            }
 
             for target in targets {
                 guard !Task.isCancelled else {
+                    persist(batch)
                     Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
                     return
                 }
@@ -2142,10 +2388,6 @@ final class AppState: ObservableObject {
                         size: target.shouldLoadDimensions ? ImageProbe.dimensions(for: target.url) : nil,
                         tags: target.shouldLoadTags ? FinderTagStore.colorTags(for: target.url) : nil
                     )
-                }
-                guard !Task.isCancelled else {
-                    Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
-                    return
                 }
                 processedCount += 1
 
@@ -2158,21 +2400,16 @@ final class AppState: ObservableObject {
                         tags: metadata.tags
                     ))
                 }
+                guard !Task.isCancelled else {
+                    persist(batch)
+                    Self.logger.info("refresh[\(refreshID)] metadata cancelled processed=\(processedCount)/\(targets.count)")
+                    return
+                }
 
-                if batch.count >= 160 || processedCount % progressInterval == 0 {
+                if batch.count >= batchSize || processedCount % batchSize == 0 {
                     let updates = batch
                     batch.removeAll(keepingCapacity: true)
-                    dimensionIndexStore.updateCachedMetadata(
-                        sourceID: sourceID,
-                        updates: updates.map {
-                            IndexedAssetMetadata(
-                                url: $0.url,
-                                width: $0.width,
-                                height: $0.height,
-                                tags: $0.tags
-                            )
-                        }
-                    )
+                    persist(updates)
                     await MainActor.run {
                         self?.applyAssetMetadataUpdates(
                             updates,
@@ -2189,23 +2426,13 @@ final class AppState: ObservableObject {
                     }
                 }
 
-                if processedCount % 80 == 0 {
+                if processedCount % batchSize == 0 {
                     try? await Task.sleep(for: .milliseconds(6))
                 }
             }
 
             if !batch.isEmpty || processedCount > 0 {
-                dimensionIndexStore.updateCachedMetadata(
-                    sourceID: sourceID,
-                    updates: batch.map {
-                        IndexedAssetMetadata(
-                            url: $0.url,
-                            width: $0.width,
-                            height: $0.height,
-                            tags: $0.tags
-                        )
-                    }
-                )
+                persist(batch)
                 await MainActor.run {
                     self?.applyAssetMetadataUpdates(
                         batch,
@@ -2233,6 +2460,27 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func startCompleteAssetTagRefresh() {
+        guard !isViewingTrash,
+              !assets.isEmpty,
+              let source = selectedSource
+        else {
+            return
+        }
+
+        assetMetadataTask?.cancel()
+        startAssetMetadataRefresh(
+            assets,
+            folderURL: currentFolderURL,
+            sourceID: source.id,
+            refreshID: refreshSerial,
+            metadataLimit: assets.count,
+            tagLimit: assets.count,
+            loadsFinderTags: true,
+            startDelayMilliseconds: 0
+        )
+    }
+
     private func scheduleVisibleSnapshotIndex(
         source: LibrarySource,
         folderURL: URL,
@@ -2241,9 +2489,10 @@ final class AppState: ObservableObject {
         refreshID: Int
     ) {
         indexWriteTask?.cancel()
+        let indexDatabaseURL = indexDatabaseURL
         indexWriteTask = Task.detached(priority: .utility) {
             let startedAt = Date()
-            let store = LightboxIndexStore()
+            let store = LightboxIndexStore(databaseURL: indexDatabaseURL)
             store.upsertSource(source)
             store.replaceVisibleSnapshot(
                 source: source,
@@ -2440,6 +2689,7 @@ final class AppState: ObservableObject {
         let sourceID = source.id
         let sourceRootURL = source.rootURL
         let currentFolderPath = currentFolderURL.standardizedFileURL.path
+        let indexDatabaseURL = indexDatabaseURL
         searchStatus = LightboxSearchStatus(isSearching: true)
 
         searchTask = Task.detached(priority: .utility) { [weak self, query, searchFolder, sourceID, sourceRootURL, currentFolderPath, trimmedSearchText] in
@@ -2485,7 +2735,7 @@ final class AppState: ObservableObject {
                 }
             guard !metadataTargets.isEmpty else { return }
 
-            let metadataStore = LightboxIndexStore()
+            let metadataStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
             var batch: [AssetMetadataUpdate] = []
             var processedCount = 0
             for target in metadataTargets {
@@ -2705,18 +2955,6 @@ final class AppState: ObservableObject {
         }
 
         rebuildActiveAssets()
-    }
-
-    private func writeColorTags(_ tags: [String], to asset: inout LightboxAsset) {
-        let sortedTags = MacColorTag.sort(tags.filter(MacColorTag.isColorTag))
-        guard let url = asset.sourceURL else {
-            asset.tags = sortedTags
-            return
-        }
-
-        if FinderTagStore.setColorTags(sortedTags, for: url) {
-            asset.tags = sortedTags
-        }
     }
 
     private func sourceKey(for asset: LightboxAsset) -> String? {

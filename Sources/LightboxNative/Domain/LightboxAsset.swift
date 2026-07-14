@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import SwiftUI
 
@@ -9,6 +10,7 @@ struct LightboxAsset: Identifiable, Hashable, Sendable {
     var tags: [String]
     var sourceURL: URL?
     var addedAt: Date
+    var contentModifiedAt: Date?
     var fileSize: Int64?
     var palette: MockPalette
     var deletedAt: Date?
@@ -22,6 +24,7 @@ struct LightboxAsset: Identifiable, Hashable, Sendable {
         tags: [String],
         sourceURL: URL? = nil,
         addedAt: Date,
+        contentModifiedAt: Date? = nil,
         fileSize: Int64? = nil,
         palette: MockPalette,
         deletedAt: Date? = nil,
@@ -34,6 +37,7 @@ struct LightboxAsset: Identifiable, Hashable, Sendable {
         self.tags = tags
         self.sourceURL = sourceURL
         self.addedAt = addedAt
+        self.contentModifiedAt = contentModifiedAt
         self.fileSize = fileSize
         self.palette = palette
         self.deletedAt = deletedAt
@@ -48,12 +52,83 @@ struct LightboxAsset: Identifiable, Hashable, Sendable {
         deletedAt != nil
     }
 
+    var fileContentSignature: FileContentSignature? {
+        FileContentSignature(
+            modificationTime: contentModifiedAt?.timeIntervalSince1970,
+            fileSize: fileSize
+        )
+    }
+
     static func stableID(originalName: String, sourceURL: URL?) -> String {
         if let sourceURL {
             return "file:\(sourceURL.standardizedFileURL.path)"
         }
 
         return "memory:\(originalName)"
+    }
+}
+
+struct FileContentSignature: Equatable, Hashable, Sendable {
+    let modificationTime: TimeInterval
+    let fileSize: Int64
+    let fileSystemIdentifier: String?
+    let statusChangeTime: TimeInterval?
+
+    init(
+        modificationTime: TimeInterval,
+        fileSize: Int64,
+        fileSystemIdentifier: String? = nil,
+        statusChangeTime: TimeInterval? = nil
+    ) {
+        precondition(modificationTime.isFinite)
+        precondition(fileSize >= 0)
+        precondition(statusChangeTime?.isFinite != false)
+        self.modificationTime = modificationTime
+        self.fileSize = fileSize
+        self.fileSystemIdentifier = fileSystemIdentifier
+        self.statusChangeTime = statusChangeTime
+    }
+
+    init?(modificationTime: TimeInterval?, fileSize: Int64?) {
+        guard let modificationTime,
+              modificationTime.isFinite,
+              let fileSize,
+              fileSize >= 0
+        else {
+            return nil
+        }
+
+        self.init(modificationTime: modificationTime, fileSize: fileSize)
+    }
+
+    init?(url: URL) {
+        var fileStatus = stat()
+        let result: Int32 = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return Int32(-1) }
+            return stat(path, &fileStatus)
+        }
+        guard result == 0, fileStatus.st_size >= 0 else { return nil }
+
+        let modificationTime = TimeInterval(fileStatus.st_mtimespec.tv_sec)
+            + TimeInterval(fileStatus.st_mtimespec.tv_nsec) / 1_000_000_000
+        let statusChangeTime = TimeInterval(fileStatus.st_ctimespec.tv_sec)
+            + TimeInterval(fileStatus.st_ctimespec.tv_nsec) / 1_000_000_000
+
+        self.init(
+            modificationTime: modificationTime,
+            fileSize: Int64(fileStatus.st_size),
+            fileSystemIdentifier: "\(fileStatus.st_dev):\(fileStatus.st_ino)",
+            statusChangeTime: statusChangeTime
+        )
+    }
+
+    var cacheKeyComponent: String {
+        let statusChangeKey = statusChangeTime.map { String($0.bitPattern) } ?? "unknown"
+        return "\(modificationTime.bitPattern):\(fileSize):\(fileSystemIdentifier ?? "unknown"):\(statusChangeKey)"
+    }
+
+    func matchesModificationMetadata(_ other: FileContentSignature) -> Bool {
+        modificationTime == other.modificationTime && fileSize == other.fileSize
     }
 }
 

@@ -5,22 +5,31 @@ enum LibrarySourceStore {
     private static let selectedSourceKey = "Lightbox.full.selectedSource"
     private static let lastSessionKey = "Lightbox.full.lastSession"
 
-    static func loadSources() -> [LibrarySource] {
-        loadExternalSources()
+    static func loadSources(defaults: UserDefaults = .standard) -> [LibrarySource] {
+        loadExternalSources(defaults: defaults)
     }
 
-    static func saveExternalSources(_ sources: [LibrarySource]) {
+    static func saveExternalSources(
+        _ sources: [LibrarySource],
+        defaults: UserDefaults = .standard
+    ) {
         let externalSources = sources.filter { $0.kind == .external }
         guard let data = try? JSONEncoder().encode(externalSources) else { return }
-        UserDefaults.standard.set(data, forKey: externalSourcesKey)
+        defaults.set(data, forKey: externalSourcesKey)
     }
 
-    static func selectedSourceID(default defaultID: LibrarySource.ID) -> LibrarySource.ID {
-        UserDefaults.standard.string(forKey: selectedSourceKey) ?? defaultID
+    static func selectedSourceID(
+        default defaultID: LibrarySource.ID,
+        defaults: UserDefaults = .standard
+    ) -> LibrarySource.ID {
+        defaults.string(forKey: selectedSourceKey) ?? defaultID
     }
 
-    static func saveSelectedSourceID(_ id: LibrarySource.ID) {
-        UserDefaults.standard.set(id, forKey: selectedSourceKey)
+    static func saveSelectedSourceID(
+        _ id: LibrarySource.ID,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.set(id, forKey: selectedSourceKey)
     }
 
     static func loadLastSession(defaults: UserDefaults = .standard) -> LibrarySourceSession? {
@@ -57,17 +66,15 @@ enum LibrarySourceStore {
         )
     }
 
-    private static func loadExternalSources() -> [LibrarySource] {
-        guard let data = UserDefaults.standard.data(forKey: externalSourcesKey),
+    private static func loadExternalSources(defaults: UserDefaults) -> [LibrarySource] {
+        guard let data = defaults.data(forKey: externalSourcesKey),
               let decoded = try? JSONDecoder().decode([LibrarySource].self, from: data)
         else {
             return []
         }
 
         return decoded.compactMap { source in
-            guard source.kind == .external,
-                  FileManager.default.fileExists(atPath: source.rootURL.path)
-            else {
+            guard source.kind == .external else {
                 return nil
             }
 

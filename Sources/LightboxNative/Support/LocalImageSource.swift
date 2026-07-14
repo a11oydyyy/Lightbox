@@ -2,7 +2,20 @@ import Darwin
 import Foundation
 import OSLog
 
+enum LocalFolderSnapshotUnavailableReason: String, Equatable, Sendable {
+    case accessDenied
+    case cancelled
+    case readFailed
+    case sourceUnavailable
+}
+
+enum LocalFolderSnapshotAvailability: Equatable, Sendable {
+    case available
+    case unavailable(LocalFolderSnapshotUnavailableReason)
+}
+
 struct LocalFolderSnapshot: Sendable {
+    var availability: LocalFolderSnapshotAvailability
     var entryCount: Int
     var folders: [LibraryFolderEntry]
     var assets: [LightboxAsset]
@@ -38,6 +51,15 @@ enum LocalImageSource {
         supportedImageExtensions.contains(url.pathExtension.lowercased())
     }
 
+    static func folderAvailability(in folder: URL) -> LocalFolderSnapshotAvailability {
+        guard !Task.isCancelled else { return .unavailable(.cancelled) }
+        guard let directory = opendir(folder.standardizedFileURL.path) else {
+            return .unavailable(unavailableReason(forPOSIXError: errno))
+        }
+        closedir(directory)
+        return .available
+    }
+
     static func loadAssets(
         in folder: URL,
         isDeleted: Bool = false,
@@ -47,7 +69,8 @@ enum LocalImageSource {
         imageURLs(in: folder, recursive: recursive).enumerated().map { index, url in
             let fallbackSize = MockLibrary.importFallbackSizes[index % MockLibrary.importFallbackSizes.count]
             let size = probeMetadata ? ImageProbe.dimensions(for: url) ?? fallbackSize : fallbackSize
-            let addedAt = addedDate(for: url) ?? .distantPast
+            let values = try? url.resourceValues(forKeys: Set(folderSnapshotResourceKeys))
+            let addedAt = addedDate(from: values) ?? .distantPast
             return LightboxAsset(
                 originalName: url.lastPathComponent,
                 width: size.width,
@@ -55,7 +78,8 @@ enum LocalImageSource {
                 tags: probeMetadata ? FinderTagStore.colorTags(for: url) : [],
                 sourceURL: url,
                 addedAt: addedAt,
-                fileSize: fileSize(for: url),
+                contentModifiedAt: values?.contentModificationDate,
+                fileSize: fileSize(from: values),
                 palette: MockPalette.imported[index % MockPalette.imported.count],
                 deletedAt: isDeleted ? addedAt : nil,
                 metadataLoaded: probeMetadata
@@ -84,7 +108,8 @@ enum LocalImageSource {
             let folderAssets = imageURLs.enumerated().map { index, url in
                 let fallbackSize = MockLibrary.importFallbackSizes[index % MockLibrary.importFallbackSizes.count]
                 let size = ImageProbe.dimensions(for: url) ?? fallbackSize
-                let addedAt = addedDate(for: url) ?? .distantPast
+                let values = try? url.resourceValues(forKeys: Set(folderSnapshotResourceKeys))
+                let addedAt = addedDate(from: values) ?? .distantPast
                 return LightboxAsset(
                     originalName: url.lastPathComponent,
                     width: size.width,
@@ -92,7 +117,8 @@ enum LocalImageSource {
                     tags: FinderTagStore.colorTags(for: url),
                     sourceURL: url,
                     addedAt: addedAt,
-                    fileSize: fileSize(for: url),
+                    contentModifiedAt: values?.contentModificationDate,
+                    fileSize: fileSize(from: values),
                     palette: MockPalette.imported[index % MockPalette.imported.count],
                     deletedAt: addedAt,
                     metadataLoaded: true
@@ -123,6 +149,7 @@ enum LocalImageSource {
         folders.reserveCapacity(min(maxResults, 64))
         var visitedCount = 0
         var limitReached = false
+        var directoryReadFailed = false
 
         func visit(_ url: URL) {
             guard !Task.isCancelled else { return }
@@ -152,13 +179,11 @@ enum LocalImageSource {
         }
 
         func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
-            let posix = posixDirectoryEntries(in: folder, options: [.skipsHiddenFiles]).urls
-            if !posix.isEmpty { return posix }
-            return directoryChildren(
-                in: folder,
-                includingPropertiesForKeys: [],
-                options: [.skipsHiddenFiles]
-            ).map { POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil) }
+            let result = searchDirectoryEntries(in: folder)
+            if result.availability != .available {
+                directoryReadFailed = true
+            }
+            return result.urls
         }
 
         func isDirectory(_ entry: POSIXDirectoryEntry) -> Bool {
@@ -191,12 +216,13 @@ enum LocalImageSource {
         }
 
         let sortedFolders = sortedSearchFolders(folders)
-        logger.info("folder-search complete path=\(folder.path, privacy: .public) recursive=\(recursive) visited=\(visitedCount) folders=\(sortedFolders.count) limit=\(limitReached) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+        let resultsIncomplete = limitReached || directoryReadFailed
+        logger.info("folder-search complete path=\(folder.path, privacy: .public) recursive=\(recursive) visited=\(visitedCount) folders=\(sortedFolders.count) limit=\(resultsIncomplete) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
         return LightboxSearchScanResult(
             assets: [],
             folders: sortedFolders,
             visitedCount: visitedCount,
-            limitReached: limitReached
+            limitReached: resultsIncomplete
         )
     }
 
@@ -210,15 +236,49 @@ enum LocalImageSource {
         cachedDimensions: [String: CachedAssetDimensions] = [:]
     ) -> LocalFolderSnapshot {
         let readStartedAt = Date()
-        var entries = posixDirectoryEntries(in: folder.standardizedFileURL, options: [.skipsHiddenFiles]).urls
-        if entries.isEmpty {
-            entries = directoryChildrenResult(
+        let posixResult = posixDirectoryEntries(
+            in: folder.standardizedFileURL,
+            options: [.skipsHiddenFiles]
+        )
+        var entries = posixResult.urls
+        var availability = posixResult.availability
+        if case .unavailable(.cancelled) = availability {
+            let directoryReadSeconds = Date().timeIntervalSince(readStartedAt)
+            return LocalFolderSnapshot(
+                availability: availability,
+                entryCount: entries.count,
+                folders: [],
+                assets: [],
+                directoryReadSeconds: directoryReadSeconds,
+                classificationSeconds: 0,
+                metadataProbeSeconds: 0,
+                sortSeconds: 0
+            )
+        }
+        if case .unavailable = availability {
+            let fallbackResult = directoryChildrenResult(
                 in: folder,
                 includingPropertiesForKeys: [],
                 options: [.skipsHiddenFiles]
-            ).urls.map { POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil) }
+            )
+            entries = fallbackResult.urls.map {
+                POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil)
+            }
+            availability = fallbackResult.availability
         }
         let directoryReadSeconds = Date().timeIntervalSince(readStartedAt)
+        guard availability == .available else {
+            return LocalFolderSnapshot(
+                availability: availability,
+                entryCount: entries.count,
+                folders: [],
+                assets: [],
+                directoryReadSeconds: directoryReadSeconds,
+                classificationSeconds: 0,
+                metadataProbeSeconds: 0,
+                sortSeconds: 0
+            )
+        }
         let classificationKeys = Set(folderSnapshotClassificationKeys(probeMetadata: probeMetadata))
 
         var folders: [LibraryFolderEntry] = []
@@ -228,6 +288,7 @@ enum LocalImageSource {
 
         let classifyStartedAt = Date()
         for entry in entries {
+            guard !Task.isCancelled else { break }
             let url = entry.url
             let values = try? url.resourceValues(forKeys: classificationKeys)
             if entry.isDirectory ?? (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
@@ -270,12 +331,26 @@ enum LocalImageSource {
                 tags: probeMetadata ? FinderTagStore.colorTags(for: url) : [],
                 sourceURL: url,
                 addedAt: addedAt,
+                contentModifiedAt: values?.contentModificationDate,
                 fileSize: fileSize(from: values),
                 palette: MockPalette.imported[index % MockPalette.imported.count],
                 metadataLoaded: metadataLoaded
             ))
         }
         let classificationSeconds = Date().timeIntervalSince(classifyStartedAt)
+
+        if Task.isCancelled {
+            return LocalFolderSnapshot(
+                availability: .unavailable(.cancelled),
+                entryCount: entries.count,
+                folders: [],
+                assets: [],
+                directoryReadSeconds: directoryReadSeconds,
+                classificationSeconds: classificationSeconds,
+                metadataProbeSeconds: 0,
+                sortSeconds: 0
+            )
+        }
 
         let sortStartedAt = Date()
         let sortedFolders = folders.sorted { lhs, rhs in
@@ -288,6 +363,7 @@ enum LocalImageSource {
         var metadataProbeCount = 0
         if !probeMetadata, initialMetadataLimit > 0 {
             for index in sortedAssets.indices {
+                guard !Task.isCancelled else { break }
                 guard metadataProbeCount < initialMetadataLimit else { break }
                 guard !sortedAssets[index].metadataLoaded else { continue }
                 guard let url = sortedAssets[index].sourceURL else {
@@ -299,16 +375,30 @@ enum LocalImageSource {
                 else {
                     continue
                 }
+                guard !Task.isCancelled else { break }
                 sortedAssets[index].width = size.width
                 sortedAssets[index].height = size.height
                 sortedAssets[index].metadataLoaded = true
             }
         }
         let metadataProbeSeconds = Date().timeIntervalSince(metadataProbeStartedAt)
+        if Task.isCancelled {
+            return LocalFolderSnapshot(
+                availability: .unavailable(.cancelled),
+                entryCount: entries.count,
+                folders: [],
+                assets: [],
+                directoryReadSeconds: directoryReadSeconds,
+                classificationSeconds: classificationSeconds,
+                metadataProbeSeconds: metadataProbeSeconds,
+                sortSeconds: sortSeconds
+            )
+        }
 
         logger.info("folder-scan complete path=\(folder.path, privacy: .public) probe=\(probeMetadata) cachedDimensions=\(cachedDimensions.count) initialProbe=\(metadataProbeCount)/\(initialMetadataLimit) entries=\(entries.count) folders=\(sortedFolders.count) assets=\(sortedAssets.count) read=\(directoryReadSeconds, format: .fixed(precision: 2))s classify=\(classificationSeconds, format: .fixed(precision: 2))s metadataProbe=\(metadataProbeSeconds, format: .fixed(precision: 2))s sort=\(sortSeconds, format: .fixed(precision: 2))s")
 
         return LocalFolderSnapshot(
+            availability: .available,
             entryCount: entries.count,
             folders: sortedFolders,
             assets: sortedAssets,
@@ -340,13 +430,11 @@ enum LocalImageSource {
         var resultLimitReached = false
 
         func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
-            let posix = posixDirectoryEntries(in: folder, options: [.skipsHiddenFiles]).urls
-            if !posix.isEmpty { return posix }
-            return directoryChildren(
-                in: folder,
-                includingPropertiesForKeys: [],
-                options: [.skipsHiddenFiles]
-            ).map { POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil) }
+            let result = searchDirectoryEntries(in: folder)
+            if result.availability != .available {
+                resultLimitReached = true
+            }
+            return result.urls
         }
 
         func isDirectory(_ entry: POSIXDirectoryEntry) -> Bool {
@@ -411,6 +499,7 @@ enum LocalImageSource {
                 tags: FinderTagStore.colorTags(for: url),
                 sourceURL: url,
                 addedAt: addedDate(from: values) ?? .distantPast,
+                contentModifiedAt: values?.contentModificationDate,
                 fileSize: fileSize(from: values),
                 palette: MockPalette.imported[assets.count % MockPalette.imported.count],
                 metadataLoaded: false
@@ -538,13 +627,22 @@ enum LocalImageSource {
 
     private struct DirectoryChildrenResult {
         var urls: [URL]
-        var accessDenied: Bool
+        var availability: LocalFolderSnapshotAvailability
+
+        var accessDenied: Bool {
+            availability == .unavailable(.accessDenied)
+        }
     }
 
     private struct POSIXDirectoryEntry {
         var url: URL
         var isDirectory: Bool?
         var isRegularFile: Bool?
+    }
+
+    private struct POSIXDirectoryEntriesResult {
+        var urls: [POSIXDirectoryEntry]
+        var availability: LocalFolderSnapshotAvailability
     }
 
     private static func directoryChildrenResult(
@@ -554,39 +652,27 @@ enum LocalImageSource {
     ) -> DirectoryChildrenResult {
         let standardizedFolder = folder.standardizedFileURL
         let fileManager = FileManager.default
-        var accessDenied = false
         do {
             let urls = try fileManager.contentsOfDirectory(
                 at: standardizedFolder,
                 includingPropertiesForKeys: keys,
                 options: options
             )
-            if !urls.isEmpty {
-                return DirectoryChildrenResult(urls: urls, accessDenied: false)
-            }
+            return DirectoryChildrenResult(urls: urls, availability: .available)
         } catch {
-            accessDenied = true
             logger.error("directory url read failed path=\(standardizedFolder.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
         }
 
         do {
             let names = try fileManager.contentsOfDirectory(atPath: standardizedFolder.path)
             let urls = childURLs(from: names, folder: standardizedFolder, options: options)
-            if !urls.isEmpty {
-                return DirectoryChildrenResult(urls: urls, accessDenied: accessDenied)
-            }
+            return DirectoryChildrenResult(urls: urls, availability: .available)
         } catch {
-            accessDenied = true
             logger.error("directory path read failed path=\(standardizedFolder.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
         }
 
         let posixResult = posixDirectoryChildren(in: standardizedFolder, options: options)
-        accessDenied = accessDenied || posixResult.accessDenied
-        if !posixResult.urls.isEmpty {
-            return DirectoryChildrenResult(urls: posixResult.urls, accessDenied: accessDenied)
-        }
-
-        return DirectoryChildrenResult(urls: [], accessDenied: accessDenied)
+        return posixResult
     }
 
     private static func childURLs(
@@ -610,26 +696,72 @@ enum LocalImageSource {
         let entries = posixDirectoryEntries(in: folder, options: options)
         return DirectoryChildrenResult(
             urls: entries.urls.map(\.url),
-            accessDenied: entries.accessDenied
+            availability: entries.availability
+        )
+    }
+
+    private static func searchDirectoryEntries(in folder: URL) -> POSIXDirectoryEntriesResult {
+        let posixResult = posixDirectoryEntries(in: folder, options: [.skipsHiddenFiles])
+        if posixResult.availability == .unavailable(.cancelled) {
+            return posixResult
+        }
+        guard posixResult.availability != .available else { return posixResult }
+
+        let fallbackResult = directoryChildrenResult(
+            in: folder,
+            includingPropertiesForKeys: [],
+            options: [.skipsHiddenFiles]
+        )
+        return POSIXDirectoryEntriesResult(
+            urls: fallbackResult.urls.map {
+                POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil)
+            },
+            availability: fallbackResult.availability
         )
     }
 
     private static func posixDirectoryEntries(
         in folder: URL,
         options: FileManager.DirectoryEnumerationOptions
-    ) -> (urls: [POSIXDirectoryEntry], accessDenied: Bool) {
+    ) -> POSIXDirectoryEntriesResult {
+        guard !Task.isCancelled else {
+            return POSIXDirectoryEntriesResult(urls: [], availability: .unavailable(.cancelled))
+        }
+
         let path = folder.path
         guard let directory = opendir(path) else {
-            let accessDenied = errno == EACCES || errno == EPERM
-            logger.error("directory posix read failed path=\(path, privacy: .public) errno=\(errno)")
-            return ([], accessDenied)
+            let errorCode = errno
+            logger.error("directory posix read failed path=\(path, privacy: .public) errno=\(errorCode)")
+            return POSIXDirectoryEntriesResult(
+                urls: [],
+                availability: .unavailable(unavailableReason(forPOSIXError: errorCode))
+            )
         }
         defer {
             closedir(directory)
         }
 
         var entries: [POSIXDirectoryEntry] = []
-        while let entry = readdir(directory) {
+        while true {
+            guard !Task.isCancelled else {
+                return POSIXDirectoryEntriesResult(
+                    urls: entries,
+                    availability: .unavailable(.cancelled)
+                )
+            }
+
+            errno = 0
+            guard let entry = readdir(directory) else {
+                let errorCode = errno
+                if errorCode != 0 {
+                    logger.error("directory posix iteration failed path=\(path, privacy: .public) errno=\(errorCode)")
+                    return POSIXDirectoryEntriesResult(
+                        urls: entries,
+                        availability: .unavailable(unavailableReason(forPOSIXError: errorCode))
+                    )
+                }
+                break
+            }
             let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) {
                     String(cString: $0)
@@ -663,7 +795,20 @@ enum LocalImageSource {
             ))
         }
 
-        return (entries, false)
+        return POSIXDirectoryEntriesResult(urls: entries, availability: .available)
+    }
+
+    private static func unavailableReason(forPOSIXError errorCode: Int32) -> LocalFolderSnapshotUnavailableReason {
+        switch errorCode {
+        case EACCES, EPERM:
+            return .accessDenied
+        case ECANCELED:
+            return .cancelled
+        case ENOENT, ENODEV, ENXIO, ENOTDIR, ESTALE, ENOTCONN, ETIMEDOUT:
+            return .sourceUnavailable
+        default:
+            return .readFailed
+        }
     }
 
     static func folders(in folder: URL, sourceID: LibrarySource.ID, rootURL: URL) -> [LibraryFolderEntry] {
@@ -714,6 +859,10 @@ enum LocalImageSource {
         }
 
         return fileSize(from: values)
+    }
+
+    static func contentModifiedDate(for url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
 
     private static func fileSize(from values: URLResourceValues?) -> Int64? {
