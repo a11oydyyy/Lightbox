@@ -802,13 +802,36 @@ private struct PressFeedback: View {
     }
 }
 
+struct AssetImageDisplayState {
+    private(set) var assetID: LightboxAsset.ID
+    private(set) var image: NSImage?
+
+    mutating func prepare(for assetID: LightboxAsset.ID, seed: NSImage?) {
+        if self.assetID != assetID {
+            self.assetID = assetID
+            image = seed
+        } else if let seed {
+            image = seed
+        }
+    }
+
+    mutating func applyDecoded(_ image: NSImage?, for assetID: LightboxAsset.ID) {
+        guard self.assetID == assetID, let image else { return }
+        self.image = image
+    }
+
+    mutating func clear() {
+        image = nil
+    }
+}
+
 struct AssetImageView: View {
     var asset: LightboxAsset
     var contentMode: ContentMode = .fill
     var quality: ImageCacheQuality = .thumbnail
     var decodePriority: ImageDecodePriority = .normal
     var loadsImage = true
-    @State private var loadedImage: NSImage?
+    @State private var displayState: AssetImageDisplayState
     @State private var requestID = UUID()
     @State private var imageRequest: ImageCacheRequest?
 
@@ -824,7 +847,10 @@ struct AssetImageView: View {
         self.quality = quality
         self.decodePriority = decodePriority
         self.loadsImage = loadsImage
-        _loadedImage = State(initialValue: Self.seedImage(for: asset, quality: quality, loadsImage: loadsImage))
+        _displayState = State(initialValue: AssetImageDisplayState(
+            assetID: asset.id,
+            image: Self.seedImage(for: asset, quality: quality, loadsImage: loadsImage)
+        ))
     }
 
     var body: some View {
@@ -838,7 +864,7 @@ struct AssetImageView: View {
     @ViewBuilder
     private var imageContent: some View {
         Group {
-            if let image = loadedImage {
+            if let image = displayState.image {
                 Image(nsImage: image)
                     .resizable()
                     .interpolation(interpolationQuality)
@@ -852,61 +878,45 @@ struct AssetImageView: View {
             imageRequest?.cancel()
             imageRequest = nil
             guard loadsImage else {
-                loadedImage = nil
+                displayState.clear()
                 requestID = UUID()
                 return
             }
 
             guard let url = asset.sourceURL else {
-                loadedImage = nil
+                displayState.clear()
                 return
             }
             let knownFileSignature = Self.knownFileSignature(for: asset)
-            if let image = Self.seedImage(
+            let seed = Self.seedImage(
                 for: asset,
                 quality: quality,
                 loadsImage: loadsImage,
                 knownFileSignature: knownFileSignature
-            ) {
-                loadedImage = image
-            } else {
-                loadedImage = nil
+            )
+            displayState.prepare(for: asset.id, seed: seed)
+
+            let currentRequestID = UUID()
+            requestID = currentRequestID
+            imageRequest = ImageCache.shared.image(
+                for: url,
+                quality: quality,
+                knownFileSignature: knownFileSignature,
+                priority: decodePriority
+            ) { image in
+                guard requestID == currentRequestID else { return }
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    displayState.applyDecoded(image, for: asset.id)
+                }
+                imageRequest = nil
             }
-
-            repeat {
-                let currentRequestID = UUID()
-                requestID = currentRequestID
-                imageRequest?.cancel()
-                imageRequest = ImageCache.shared.image(
-                    for: url,
-                    quality: quality,
-                    knownFileSignature: knownFileSignature,
-                    priority: decodePriority
-                ) { image in
-                    guard requestID == currentRequestID else { return }
-                    var transaction = Transaction()
-                    transaction.animation = nil
-                    withTransaction(transaction) {
-                        loadedImage = image
-                    }
-                    imageRequest = nil
-                }
-
-                do {
-                    try await Task.sleep(for: .seconds(Self.fileSignatureRefreshInterval))
-                } catch {
-                    break
-                }
-            } while !Task.isCancelled
-
-            imageRequest?.cancel()
-            imageRequest = nil
-            requestID = UUID()
         }
         .onDisappear {
             imageRequest?.cancel()
             imageRequest = nil
-            loadedImage = nil
+            displayState.clear()
             requestID = UUID()
         }
     }
@@ -950,8 +960,6 @@ struct AssetImageView: View {
     static func knownFileSignature(for asset: LightboxAsset) -> FileContentSignature? {
         asset.fileContentSignature
     }
-
-    static let fileSignatureRefreshInterval: TimeInterval = 15
 }
 
 extension AssetImageView {
