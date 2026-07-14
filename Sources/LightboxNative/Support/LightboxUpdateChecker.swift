@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum LightboxUpdateChecker {
@@ -19,15 +20,17 @@ enum LightboxUpdateChecker {
     struct Asset: Decodable {
         var name: String
         var browserDownloadURL: URL
+        var digest: String?
 
         enum CodingKeys: String, CodingKey {
             case name
             case browserDownloadURL = "browser_download_url"
+            case digest
         }
     }
 
     enum CheckResult: Equatable {
-        case updateAvailable(version: String, releaseURL: URL, assetURL: URL)
+        case updateAvailable(version: String, releaseURL: URL, assetURL: URL, digest: String)
         case upToDate(version: String, releaseURL: URL)
     }
 
@@ -53,16 +56,21 @@ enum LightboxUpdateChecker {
         let release = try JSONDecoder().decode(Release.self, from: data)
         let latestVersion = normalizedVersion(release.tagName)
 
-        guard isVersion(latestVersion, newerThan: currentVersion),
-              let asset = preferredAsset(in: release, compatibility: compatibility)
-        else {
+        guard isVersion(latestVersion, newerThan: currentVersion) else {
             return .upToDate(version: latestVersion, releaseURL: release.htmlURL)
+        }
+        guard let asset = preferredAsset(in: release, compatibility: compatibility) else {
+            throw UpdateError.compatibleAssetMissing
+        }
+        guard let digest = asset.digest, !digest.isEmpty else {
+            throw UpdateError.assetDigestMissing
         }
 
         return .updateAvailable(
             version: latestVersion,
             releaseURL: release.htmlURL,
-            assetURL: asset.browserDownloadURL
+            assetURL: asset.browserDownloadURL,
+            digest: digest
         )
     }
 
@@ -71,12 +79,12 @@ enum LightboxUpdateChecker {
     }
 
     static func preferredAsset(in release: Release, compatibility: Bool) -> Asset? {
-        release.assets.first { asset in
-            let name = asset.name.lowercased()
-            if compatibility {
-                return name.contains("intel") || name.contains("x86")
-            }
-            return name.hasPrefix("lightbox-v") && name.hasSuffix(".zip")
+        let version = normalizedVersion(release.tagName)
+        let expectedName = compatibility
+            ? "Lightbox-Intel-x86-v\(version).zip"
+            : "Lightbox-v\(version).zip"
+        return release.assets.first { asset in
+            asset.name.caseInsensitiveCompare(expectedName) == .orderedSame
         }
     }
 
@@ -111,7 +119,7 @@ enum LightboxUpdateChecker {
 }
 
 enum LightboxUpdateInstaller {
-    static func prepareUpdate(from assetURL: URL) async throws -> URL {
+    static func prepareUpdate(from assetURL: URL, expectedDigest: String) async throws -> URL {
         let (downloadedURL, response) = try await URLSession.shared.download(from: assetURL)
         guard let httpResponse = response as? HTTPURLResponse,
               200..<300 ~= httpResponse.statusCode
@@ -124,37 +132,113 @@ enum LightboxUpdateInstaller {
             .appendingPathComponent("LightboxUpdate-\(UUID().uuidString)", isDirectory: true)
         let zipURL = rootURL.appendingPathComponent("update.zip")
         let unzipURL = rootURL.appendingPathComponent("unzipped", isDirectory: true)
+        var prepared = false
+        defer {
+            if !prepared {
+                try? fileManager.removeItem(at: rootURL)
+            }
+        }
 
         try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
         try fileManager.moveItem(at: downloadedURL, to: zipURL)
+        try validateDigest(of: zipURL, expectedDigest: expectedDigest)
         try fileManager.createDirectory(at: unzipURL, withIntermediateDirectories: true)
         try run("/usr/bin/ditto", arguments: ["-x", "-k", zipURL.path, unzipURL.path])
 
-        guard let appURL = try findAppBundle(in: unzipURL) else {
+        guard let extractedAppURL = try findAppBundle(in: unzipURL) else {
             throw UpdateInstallError.appBundleMissing
         }
-        return appURL
+        let stagedAppURL = rootURL.appendingPathComponent("Lightbox.app", isDirectory: true)
+        try fileManager.moveItem(at: extractedAppURL, to: stagedAppURL)
+        prepared = true
+        return stagedAppURL
     }
 
-    static func installPreparedUpdate(_ stagedAppURL: URL) throws {
-        let currentAppURL = Bundle.main.bundleURL.standardizedFileURL
-        guard currentAppURL.pathExtension == "app" else {
-            throw UpdateInstallError.currentAppBundleMissing
-        }
-        try validateBundleIdentifier(for: stagedAppURL)
-
-        let processID = String(ProcessInfo.processInfo.processIdentifier)
+    static func installPreparedUpdate(_ stagedAppURL: URL, expectedVersion: String) throws {
         let scriptURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("LightboxInstall-\(UUID().uuidString).sh")
-        let script = """
+        do {
+            let currentAppURL = Bundle.main.bundleURL.standardizedFileURL
+            guard currentAppURL.pathExtension == "app" else {
+                throw UpdateInstallError.currentAppBundleMissing
+            }
+            try validateBundleMetadata(
+                for: stagedAppURL,
+                currentBundleIdentifier: Bundle.main.bundleIdentifier,
+                expectedVersion: expectedVersion
+            )
+            try run("/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", stagedAppURL.path])
+
+            let processID = String(ProcessInfo.processInfo.processIdentifier)
+            let script = installScript
+
+            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [scriptURL.path, currentAppURL.path, stagedAppURL.path, processID]
+            try process.run()
+        } catch {
+            try? FileManager.default.removeItem(at: stagedAppURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: scriptURL)
+            throw error
+        }
+    }
+
+    static let installScript = """
         #!/bin/sh
         set -eu
 
         CURRENT_APP="$1"
         STAGED_APP="$2"
         CURRENT_PID="$3"
-        STAGING_ROOT="$(dirname "$(dirname "$STAGED_APP")")"
-        BACKUP_APP="${CURRENT_APP}.old-$(date +%s)"
+        STAGING_ROOT="$(dirname "$STAGED_APP")"
+        BACKUP_APP="${CURRENT_APP}.old-${CURRENT_PID}-$(date +%s)"
+        HEALTH_MARKER="$STAGING_ROOT/launch-healthy"
+        HEALTH_ATTEMPTS="${4:-60}"
+        HEALTH_INTERVAL="${5:-0.25}"
+        INSTALL_SUCCEEDED=0
+        NEW_APP_PID=""
+
+        terminate_new_app() {
+          if [ -n "$NEW_APP_PID" ] && /bin/kill -0 "$NEW_APP_PID" 2>/dev/null; then
+            /bin/kill -TERM "$NEW_APP_PID" 2>/dev/null || true
+            (
+              /bin/sleep 1
+              /bin/kill -KILL "$NEW_APP_PID" 2>/dev/null || true
+            ) &
+            FORCE_KILL_PID=$!
+            wait "$NEW_APP_PID" 2>/dev/null || true
+            /bin/kill -TERM "$FORCE_KILL_PID" 2>/dev/null || true
+            wait "$FORCE_KILL_PID" 2>/dev/null || true
+          elif [ -n "$NEW_APP_PID" ]; then
+            wait "$NEW_APP_PID" 2>/dev/null || true
+          fi
+          NEW_APP_PID=""
+        }
+
+        finish_install() {
+          STATUS=$?
+          trap - EXIT HUP INT TERM
+          if [ "$INSTALL_SUCCEEDED" -eq 0 ]; then
+            terminate_new_app
+          fi
+          if [ "$INSTALL_SUCCEEDED" -eq 0 ] && [ -e "$BACKUP_APP" ]; then
+            /bin/rm -rf "$CURRENT_APP"
+            if /bin/mv "$BACKUP_APP" "$CURRENT_APP"; then
+              /bin/rm -rf "$STAGING_ROOT"
+              /usr/bin/open -n "$CURRENT_APP" >/dev/null 2>&1 || true
+            fi
+          elif [ "$INSTALL_SUCCEEDED" -eq 0 ]; then
+            /bin/rm -rf "$STAGING_ROOT"
+          elif [ "$INSTALL_SUCCEEDED" -eq 1 ]; then
+            /bin/rm -rf "$BACKUP_APP" "$STAGING_ROOT"
+          fi
+          /bin/rm -f "$0"
+          exit "$STATUS"
+        }
+        trap finish_install EXIT HUP INT TERM
 
         while /bin/kill -0 "$CURRENT_PID" 2>/dev/null; do
           /bin/sleep 0.2
@@ -165,18 +249,45 @@ enum LightboxUpdateInstaller {
         fi
 
         /usr/bin/ditto "$STAGED_APP" "$CURRENT_APP"
-        /usr/bin/xattr -cr "$CURRENT_APP" >/dev/null 2>&1 || true
-        /usr/bin/open -n "$CURRENT_APP"
-        /bin/rm -rf "$BACKUP_APP" "$STAGING_ROOT" "$0"
+        /bin/rm -f "$HEALTH_MARKER"
+        NEW_APP_EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$CURRENT_APP/Contents/Info.plist")"
+        case "$NEW_APP_EXECUTABLE_NAME" in
+          ""|*/*) exit 1 ;;
+        esac
+        NEW_APP_EXECUTABLE="$CURRENT_APP/Contents/MacOS/$NEW_APP_EXECUTABLE_NAME"
+        [ -x "$NEW_APP_EXECUTABLE" ]
+        "$NEW_APP_EXECUTABLE" --lightbox-update-health-marker "$HEALTH_MARKER" >/dev/null 2>&1 &
+        NEW_APP_PID=$!
+
+        ATTEMPTS=0
+        while [ ! -f "$HEALTH_MARKER" ] && [ "$ATTEMPTS" -lt "$HEALTH_ATTEMPTS" ]; do
+          /bin/sleep "$HEALTH_INTERVAL"
+          ATTEMPTS=$((ATTEMPTS + 1))
+        done
+        [ -f "$HEALTH_MARKER" ]
+        INSTALL_SUCCEEDED=1
         """
 
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+    static func validateDigest(of fileURL: URL, expectedDigest: String) throws {
+        let prefix = "sha256:"
+        guard expectedDigest.lowercased().hasPrefix(prefix) else {
+            throw UpdateInstallError.invalidDigest
+        }
+        let expectedHash = String(expectedDigest.dropFirst(prefix.count)).lowercased()
+        let hexCharacters = CharacterSet(charactersIn: "0123456789abcdef")
+        guard expectedHash.count == 64,
+              expectedHash.unicodeScalars.allSatisfy(hexCharacters.contains)
+        else {
+            throw UpdateInstallError.invalidDigest
+        }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = [scriptURL.path, currentAppURL.path, stagedAppURL.path, processID]
-        try process.run()
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        let actualHash = SHA256.hash(data: data).map {
+            String(format: "%02x", $0)
+        }.joined()
+        guard actualHash == expectedHash else {
+            throw UpdateInstallError.digestMismatch
+        }
     }
 
     private static func findAppBundle(in directory: URL) throws -> URL? {
@@ -202,13 +313,23 @@ enum LightboxUpdateInstaller {
         return nil
     }
 
-    private static func validateBundleIdentifier(for stagedAppURL: URL) throws {
+    static func validateBundleMetadata(
+        for stagedAppURL: URL,
+        currentBundleIdentifier: String?,
+        expectedVersion: String
+    ) throws {
         guard let stagedBundle = Bundle(url: stagedAppURL),
               let stagedBundleIdentifier = stagedBundle.bundleIdentifier,
-              let currentBundleIdentifier = Bundle.main.bundleIdentifier,
+              let currentBundleIdentifier,
               stagedBundleIdentifier == currentBundleIdentifier
         else {
             throw UpdateInstallError.bundleIdentifierMismatch
+        }
+        guard let stagedVersion = stagedBundle.infoDictionary?["CFBundleShortVersionString"] as? String,
+              LightboxUpdateChecker.normalizedVersion(stagedVersion)
+                == LightboxUpdateChecker.normalizedVersion(expectedVersion)
+        else {
+            throw UpdateInstallError.appVersionMismatch
         }
     }
 
@@ -230,11 +351,58 @@ enum LightboxUpdateInstaller {
     }
 }
 
+enum LightboxUpdateHealth {
+    static let markerArgument = "--lightbox-update-health-marker"
+
+    static func isRequested(arguments: [String] = CommandLine.arguments) -> Bool {
+        arguments.contains(markerArgument)
+    }
+
+    @discardableResult
+    static func recordLaunch(
+        arguments: [String] = CommandLine.arguments,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        guard let argumentIndex = arguments.firstIndex(of: markerArgument),
+              arguments.indices.contains(argumentIndex + 1)
+        else {
+            return false
+        }
+
+        let markerURL = URL(fileURLWithPath: arguments[argumentIndex + 1]).standardizedFileURL
+        let stagingRoot = markerURL.deletingLastPathComponent()
+        let temporaryDirectory = fileManager.temporaryDirectory.standardizedFileURL
+        let stagingValues = try? stagingRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard markerURL.lastPathComponent == "launch-healthy",
+              stagingRoot.lastPathComponent.hasPrefix("LightboxUpdate-"),
+              stagingValues?.isDirectory == true,
+              stagingValues?.isSymbolicLink != true,
+              stagingRoot.resolvingSymlinksInPath().deletingLastPathComponent()
+                == temporaryDirectory.resolvingSymlinksInPath()
+        else {
+            return false
+        }
+
+        do {
+            try Data().write(to: markerURL, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
 enum UpdateError: LocalizedError {
+    case assetDigestMissing
+    case compatibleAssetMissing
     case unavailable
 
     var errorDescription: String? {
         switch self {
+        case .assetDigestMissing:
+            return "The update does not include a SHA-256 digest."
+        case .compatibleAssetMissing:
+            return "This release does not include a compatible Lightbox update."
         case .unavailable:
             return "GitHub Releases is unavailable."
         }
@@ -243,21 +411,30 @@ enum UpdateError: LocalizedError {
 
 enum UpdateInstallError: LocalizedError {
     case appBundleMissing
+    case appVersionMismatch
     case bundleIdentifierMismatch
     case currentAppBundleMissing
+    case digestMismatch
     case downloadFailed
+    case invalidDigest
     case toolFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .appBundleMissing:
             return "The downloaded update did not contain Lightbox.app."
+        case .appVersionMismatch:
+            return "The downloaded app version does not match the selected update."
         case .bundleIdentifierMismatch:
             return "The downloaded update does not match this Lightbox app."
         case .currentAppBundleMissing:
             return "This copy of Lightbox is not running from an app bundle."
+        case .digestMismatch:
+            return "The downloaded update failed its SHA-256 integrity check."
         case .downloadFailed:
             return "The update download failed."
+        case .invalidDigest:
+            return "The update contains an invalid SHA-256 digest."
         case let .toolFailed(message):
             return message
         }

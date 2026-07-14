@@ -231,10 +231,14 @@ struct SettingsView: View {
         do {
             let result = try await LightboxUpdateChecker.checkLatestRelease()
             switch result {
-            case let .updateAvailable(version, _, assetURL):
+            case let .updateAvailable(version, _, assetURL, digest):
                 updateState = .available(version)
                 guard confirmUpdateInstall(version: version) else { return }
-                await installUpdate(from: assetURL)
+                await installUpdate(
+                    from: assetURL,
+                    expectedDigest: digest,
+                    expectedVersion: version
+                )
             case let .upToDate(version, _):
                 updateState = .upToDate(version)
                 showInfoAlert(
@@ -252,12 +256,22 @@ struct SettingsView: View {
     }
 
     @MainActor
-    private func installUpdate(from assetURL: URL) async {
+    private func installUpdate(
+        from assetURL: URL,
+        expectedDigest: String,
+        expectedVersion: String
+    ) async {
         do {
             updateState = .downloading
-            let stagedAppURL = try await LightboxUpdateInstaller.prepareUpdate(from: assetURL)
+            let stagedAppURL = try await LightboxUpdateInstaller.prepareUpdate(
+                from: assetURL,
+                expectedDigest: expectedDigest
+            )
             updateState = .installing
-            try LightboxUpdateInstaller.installPreparedUpdate(stagedAppURL)
+            try LightboxUpdateInstaller.installPreparedUpdate(
+                stagedAppURL,
+                expectedVersion: expectedVersion
+            )
             NSApplication.shared.terminate(nil)
         } catch {
             updateState = .failed

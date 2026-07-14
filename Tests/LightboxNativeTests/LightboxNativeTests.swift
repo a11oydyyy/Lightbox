@@ -1,10 +1,71 @@
 import Testing
 import AppKit
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import SQLite3
 @testable import LightboxNative
+
+private final class LightboxTestUserDefaults: UserDefaults {
+    private let storageLock = NSLock()
+    private var storage: [String: Any] = [:]
+
+    init?(testSuiteName: String = "LightboxTests-\(UUID().uuidString)") {
+        super.init(suiteName: testSuiteName)
+    }
+
+    override func object(forKey defaultName: String) -> Any? {
+        storageLock.withLock { storage[defaultName] }
+    }
+
+    override func string(forKey defaultName: String) -> String? {
+        object(forKey: defaultName) as? String
+    }
+
+    override func data(forKey defaultName: String) -> Data? {
+        object(forKey: defaultName) as? Data
+    }
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        storageLock.withLock {
+            storage[defaultName] = value
+        }
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        _ = storageLock.withLock {
+            storage.removeValue(forKey: defaultName)
+        }
+    }
+}
+
+@MainActor
+private func makeTestAppState(
+    indexDatabaseURL: URL? = nil,
+    libraryDefaults: UserDefaults? = nil,
+    previewDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
+        ImageProbe.dimensions(for: $0)
+    },
+    systemTrashMover: @escaping @Sendable (URL) -> Bool = {
+        LightboxLibraryStore.moveToSystemTrash($0)
+    },
+    finderTagWriter: @escaping @Sendable ([String], URL) -> Bool = {
+        FinderTagStore.setColorTags($0, for: $1)
+    }
+) -> AppState {
+    let databaseURL = indexDatabaseURL ?? FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxAppStateTests-\(UUID().uuidString)", isDirectory: true)
+        .appendingPathComponent("index.sqlite")
+    let defaults = libraryDefaults ?? LightboxTestUserDefaults()!
+    return AppState(
+        indexDatabaseURL: databaseURL,
+        libraryDefaults: defaults,
+        previewDimensionProbe: previewDimensionProbe,
+        systemTrashMover: systemTrashMover,
+        finderTagWriter: finderTagWriter
+    )
+}
 
 @Test func previewTargetFrameIsCenteredInViewport() async throws {
     let viewport = CGSize(width: 1600, height: 1000)
@@ -86,7 +147,7 @@ import SQLite3
 
 @MainActor
 @Test func previewRootClickClosesOpeningPreviewBeforeOverlayIsReady() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let asset = previewRouteAsset(id: "asset-a", name: "a.jpg", addedAt: 0)
 
     appState.assets = [asset]
@@ -104,7 +165,7 @@ import SQLite3
 
 @MainActor
 @Test func previewRootClickReopensCurrentPreviewDuringEarlyClose() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let asset = previewRouteAsset(id: "asset-a", name: "a.jpg", addedAt: 0)
 
     appState.assets = [asset]
@@ -121,7 +182,7 @@ import SQLite3
 
 @MainActor
 @Test func previewRootClickSwitchesTargetDuringEarlyClose() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let first = previewRouteAsset(id: "asset-a", name: "a.jpg", addedAt: 0)
     let second = previewRouteAsset(id: "asset-b", name: "b.jpg", addedAt: 1)
     let firstFrame = CGRect(x: 20, y: 30, width: 120, height: 160)
@@ -146,7 +207,7 @@ import SQLite3
 
 @MainActor
 @Test func previewSpaceFrameReturnsLatestFrame() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let asset = previewRouteAsset(id: "asset-a", name: "a.jpg", addedAt: 0)
     let firstFrame = CGRect(x: 20, y: 30, width: 120, height: 160)
     let secondFrame = CGRect(x: 260, y: 30, width: 120, height: 160)
@@ -161,7 +222,7 @@ import SQLite3
 
 @MainActor
 @Test func previewCanOpenAssetOutsideCurrentFolderSnapshot() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let searchResultAsset = previewRouteAsset(id: "search-result-a", name: "result.jpg", addedAt: 0)
 
     appState.assets = []
@@ -171,6 +232,335 @@ import SQLite3
     #expect(appState.previewAsset?.id == searchResultAsset.id)
 
     appState.closePreview()
+}
+
+@MainActor
+@Test func previewCanResolveAndOpenAssetOutsideCurrentFolderSnapshot() async throws {
+    let appState = makeTestAppState(previewDimensionProbe: { _ in
+        CGSize(width: 640, height: 480)
+    })
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    let imageURL = URL(fileURLWithPath: "/tmp/lightbox-preview-search-result.jpg")
+    let searchResultAsset = LightboxAsset(
+        originalName: imageURL.lastPathComponent,
+        width: 1,
+        height: 1,
+        tags: [],
+        sourceURL: imageURL,
+        addedAt: .now,
+        palette: MockPalette.imported[0],
+        metadataLoaded: false
+    )
+
+    appState.assets = []
+    appState.showPreview(for: searchResultAsset)
+
+    #expect(await waitForLightboxState {
+        appState.previewAssetID == searchResultAsset.id
+            && appState.previewAsset?.metadataLoaded == true
+    })
+    #expect(appState.previewAsset?.width == 640)
+    #expect(appState.previewAsset?.height == 480)
+    appState.closePreview()
+}
+
+@MainActor
+@Test func previewDimensionResolveDoesNotBlockMainActorAndPresentsCorrectSize() async throws {
+    let probeGate = DispatchSemaphore(value: 0)
+    let appState = makeTestAppState(previewDimensionProbe: { _ in
+        probeGate.wait()
+        return CGSize(width: 640, height: 480)
+    })
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    let imageURL = URL(fileURLWithPath: "/tmp/lightbox-preview-background-probe.jpg")
+    let asset = LightboxAsset(
+        originalName: imageURL.lastPathComponent,
+        width: 1,
+        height: 1,
+        tags: [],
+        sourceURL: imageURL,
+        addedAt: .now,
+        palette: MockPalette.imported[0],
+        metadataLoaded: false
+    )
+    appState.assets = [asset]
+
+    Task.detached {
+        try? await Task.sleep(for: .milliseconds(300))
+        probeGate.signal()
+    }
+
+    let clock = ContinuousClock()
+    let startedAt = clock.now
+    appState.showPreview(for: asset, sourceFrame: CGRect(x: 20, y: 30, width: 120, height: 160))
+    let callDuration = startedAt.duration(to: clock.now)
+
+    #expect(callDuration < .milliseconds(100))
+    #expect(await waitForLightboxState {
+        appState.previewAsset?.metadataLoaded == true
+    })
+    #expect(appState.previewAsset?.width == 640)
+    #expect(appState.previewAsset?.height == 480)
+    appState.closePreview()
+}
+
+@MainActor
+@Test func consecutivePreviewStepsAdvancePastPendingSlowProbe() async throws {
+    let appState = makeTestAppState(previewDimensionProbe: { url in
+        Thread.sleep(forTimeInterval: 0.2)
+        return url.lastPathComponent == "b.jpg"
+            ? CGSize(width: 200, height: 100)
+            : CGSize(width: 300, height: 100)
+    })
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    let root = URL(fileURLWithPath: "/tmp/lightbox-preview-step-sequence", isDirectory: true)
+    let first = LightboxAsset(
+        originalName: "a.jpg",
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: root.appendingPathComponent("a.jpg"),
+        addedAt: Date(timeIntervalSince1970: 3),
+        palette: MockPalette.imported[0],
+        metadataLoaded: true
+    )
+    let second = LightboxAsset(
+        originalName: "b.jpg",
+        width: 1,
+        height: 1,
+        tags: [],
+        sourceURL: root.appendingPathComponent("b.jpg"),
+        addedAt: Date(timeIntervalSince1970: 2),
+        palette: MockPalette.imported[1],
+        metadataLoaded: false
+    )
+    let third = LightboxAsset(
+        originalName: "c.jpg",
+        width: 1,
+        height: 1,
+        tags: [],
+        sourceURL: root.appendingPathComponent("c.jpg"),
+        addedAt: Date(timeIntervalSince1970: 1),
+        palette: MockPalette.imported[2],
+        metadataLoaded: false
+    )
+    appState.assets = [first, second, third]
+    appState.showPreview(for: first)
+
+    appState.stepPreview(.next)
+    appState.stepPreview(.next)
+
+    #expect(await waitForLightboxState {
+        appState.previewAssetID == third.id && appState.previewAsset?.metadataLoaded == true
+    })
+    #expect(appState.previewAsset?.width == 300)
+    appState.closePreview()
+}
+
+@MainActor
+@Test func previewDimensionResolveDoesNotOpenOldAssetAfterFolderNavigation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxPreviewFolderNavigationTests-\(UUID().uuidString)", isDirectory: true)
+    let nextFolder = root.appendingPathComponent("Next", isDirectory: true)
+    try FileManager.default.createDirectory(at: nextFolder, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let probeStarted = DispatchSemaphore(value: 0)
+    let probeGate = DispatchSemaphore(value: 0)
+    defer { probeGate.signal() }
+    let appState = makeTestAppState(previewDimensionProbe: { _ in
+        probeStarted.signal()
+        probeGate.wait()
+        return CGSize(width: 640, height: 480)
+    })
+    let source = LibrarySource.favorites(rootURL: root)
+    appState.sources = [source]
+    appState.chooseSource(source.id)
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+
+    let oldAsset = LightboxAsset(
+        originalName: "old.jpg",
+        width: 1,
+        height: 1,
+        tags: [],
+        sourceURL: root.appendingPathComponent("old.jpg"),
+        addedAt: .now,
+        palette: MockPalette.imported[0],
+        metadataLoaded: false
+    )
+    appState.assets = [oldAsset]
+    appState.showPreview(for: oldAsset)
+    #expect(await waitForLightboxState {
+        probeStarted.wait(timeout: .now()) == .success
+    })
+
+    appState.openFolder(LibraryFolderEntry(
+        sourceID: source.id,
+        url: nextFolder,
+        rootURL: root
+    ))
+    #expect(await waitForLightboxState {
+        appState.currentFolderURL == nextFolder.standardizedFileURL
+            && appState.libraryLoadingStatus == nil
+    })
+    probeGate.signal()
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(appState.previewAssetID == nil)
+}
+
+@MainActor
+@Test func previewDimensionResolveDoesNotOpenOldAssetAfterSourceNavigation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxPreviewSourceNavigationTests-\(UUID().uuidString)", isDirectory: true)
+    let firstRoot = root.appendingPathComponent("First", isDirectory: true)
+    let secondRoot = root.appendingPathComponent("Second", isDirectory: true)
+    try FileManager.default.createDirectory(at: firstRoot, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let probeStarted = DispatchSemaphore(value: 0)
+    let probeGate = DispatchSemaphore(value: 0)
+    defer { probeGate.signal() }
+    let appState = makeTestAppState(previewDimensionProbe: { _ in
+        probeStarted.signal()
+        probeGate.wait()
+        return CGSize(width: 640, height: 480)
+    })
+    let firstSource = LibrarySourceStore.makeExternalSource(rootURL: firstRoot)
+    let secondSource = LibrarySourceStore.makeExternalSource(rootURL: secondRoot)
+    appState.sources = [firstSource, secondSource]
+    appState.chooseSource(firstSource.id)
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+
+    let oldAsset = LightboxAsset(
+        originalName: "old.jpg",
+        width: 1,
+        height: 1,
+        tags: [],
+        sourceURL: firstRoot.appendingPathComponent("old.jpg"),
+        addedAt: .now,
+        palette: MockPalette.imported[0],
+        metadataLoaded: false
+    )
+    appState.assets = [oldAsset]
+    appState.showPreview(for: oldAsset)
+    #expect(await waitForLightboxState {
+        probeStarted.wait(timeout: .now()) == .success
+    })
+
+    appState.chooseSource(secondSource.id)
+    #expect(await waitForLightboxState {
+        appState.selectedSourceID == secondSource.id
+            && appState.currentFolderURL == secondRoot.standardizedFileURL
+            && appState.libraryLoadingStatus == nil
+    })
+    probeGate.signal()
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(appState.previewAssetID == nil)
+}
+
+@MainActor
+@Test func movingSelectionToTrashDoesNotBlockAndKeepsFailures() async throws {
+    let successURL = URL(fileURLWithPath: "/tmp/lightbox-trash-success.jpg")
+    let failureURL = URL(fileURLWithPath: "/tmp/lightbox-trash-failure.jpg")
+    let appState = makeTestAppState(systemTrashMover: { url in
+        if url.standardizedFileURL == successURL.standardizedFileURL {
+            Thread.sleep(forTimeInterval: 0.3)
+            return true
+        }
+        return false
+    })
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    let success = LightboxAsset(
+        originalName: successURL.lastPathComponent,
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: successURL,
+        addedAt: Date(timeIntervalSince1970: 2),
+        palette: MockPalette.imported[0]
+    )
+    let failure = LightboxAsset(
+        originalName: failureURL.lastPathComponent,
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: failureURL,
+        addedAt: Date(timeIntervalSince1970: 1),
+        palette: MockPalette.imported[1]
+    )
+    appState.assets = [success, failure]
+    appState.selectedAssetIDs = [success.id, failure.id]
+    appState.selectedAssetID = success.id
+
+    let clock = ContinuousClock()
+    let startedAt = clock.now
+    appState.deleteSelectedAssets()
+    let callDuration = startedAt.duration(to: clock.now)
+
+    #expect(callDuration < .milliseconds(100))
+    #expect(await waitForLightboxState {
+        appState.assets.map(\.id) == [failure.id]
+    })
+    #expect(appState.selectedAssetIDs == [failure.id])
+    #expect(appState.selectedAssetID == failure.id)
+}
+
+@MainActor
+@Test func movingAssetsToTrashQueuesSecondOperation() async throws {
+    let firstURL = URL(fileURLWithPath: "/tmp/lightbox-trash-queue-first.jpg")
+    let secondURL = URL(fileURLWithPath: "/tmp/lightbox-trash-queue-second.jpg")
+    let firstStarted = DispatchSemaphore(value: 0)
+    let firstGate = DispatchSemaphore(value: 0)
+    let secondStarted = LockedCounter()
+    defer { firstGate.signal() }
+    let appState = makeTestAppState(systemTrashMover: { url in
+        if url.standardizedFileURL == firstURL.standardizedFileURL {
+            firstStarted.signal()
+            firstGate.wait()
+            return true
+        }
+        if url.standardizedFileURL == secondURL.standardizedFileURL {
+            secondStarted.increment()
+            return true
+        }
+        return false
+    })
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    let first = LightboxAsset(
+        originalName: firstURL.lastPathComponent,
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: firstURL,
+        addedAt: Date(timeIntervalSince1970: 2),
+        palette: MockPalette.imported[0]
+    )
+    let second = LightboxAsset(
+        originalName: secondURL.lastPathComponent,
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: secondURL,
+        addedAt: Date(timeIntervalSince1970: 1),
+        palette: MockPalette.imported[1]
+    )
+    appState.assets = [first, second]
+
+    appState.markDeleted(first)
+    #expect(await waitForLightboxState {
+        firstStarted.wait(timeout: .now()) == .success
+    })
+    appState.markDeleted(second)
+
+    #expect(secondStarted.value == 0)
+    firstGate.signal()
+    #expect(await waitForLightboxState { appState.assets.isEmpty })
+    #expect(secondStarted.value == 1)
 }
 
 @Test func assetIDIsStableForFileURL() async throws {
@@ -273,7 +663,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(cached[imageURL.standardizedFileURL.path]?.height == 654)
 }
 
-@Test func indexStoreReturnsVisibleSnapshot() async throws {
+@Test func indexStoreReturnsVisibleSnapshotWithoutTrustingDimensions() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -289,13 +679,14 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
     let source = LibrarySource.favorites(rootURL: root)
     let folder = LibraryFolderEntry(sourceID: source.id, url: folderURL, rootURL: root, tags: ["Red"])
+    let addedAt = Date(timeIntervalSince1970: 1_600_000_123)
     let asset = LightboxAsset(
         originalName: imageURL.lastPathComponent,
         width: 321,
         height: 654,
         tags: ["Blue"],
         sourceURL: imageURL,
-        addedAt: .now,
+        addedAt: addedAt,
         fileSize: 6,
         palette: MockPalette.imported[0],
         metadataLoaded: true
@@ -308,10 +699,60 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(snapshot.folders.map(\.url.standardizedFileURL.path) == [folderURL.standardizedFileURL.path])
     #expect(snapshot.folders.first?.tags == ["Red"])
     #expect(snapshot.assets.map(\.sourceURL?.standardizedFileURL.path) == [imageURL.standardizedFileURL.path])
-    #expect(snapshot.assets.first?.width == 321)
-    #expect(snapshot.assets.first?.height == 654)
+    #expect(snapshot.assets.first?.width == 1)
+    #expect(snapshot.assets.first?.height == 1)
     #expect(snapshot.assets.first?.tags == ["Blue"])
-    #expect(snapshot.assets.first?.metadataLoaded == true)
+    #expect(snapshot.assets.first?.addedAt == addedAt)
+    #expect(snapshot.assets.first?.metadataLoaded == false)
+}
+
+@Test func indexStoreFallsBackToModificationTimeForLegacyAddedDate() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxIndexStoreLegacyTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let databaseURL = root.appendingPathComponent("index.sqlite")
+    let imageURL = root.appendingPathComponent("legacy.jpg")
+    let modificationTime: TimeInterval = 1_650_000_321
+    try Data("legacy".utf8).write(to: imageURL)
+    let source = LibrarySource.favorites(rootURL: root)
+
+    var database: OpaquePointer?
+    #expect(sqlite3_open(databaseURL.path, &database) == SQLITE_OK)
+    let createSQL = """
+    CREATE TABLE items (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        parent_path TEXT NOT NULL,
+        is_directory INTEGER NOT NULL,
+        mtime REAL,
+        file_size INTEGER,
+        width REAL,
+        height REAL,
+        tags TEXT NOT NULL DEFAULT '',
+        metadata_loaded INTEGER NOT NULL DEFAULT 0,
+        dimension_version INTEGER NOT NULL DEFAULT 0,
+        indexed_at REAL NOT NULL
+    );
+    INSERT INTO items (
+        id, source_id, path, relative_path, parent_path, is_directory,
+        mtime, file_size, width, height, tags, metadata_loaded, dimension_version, indexed_at
+    ) VALUES (
+        'legacy-item', '\(source.id)', '\(imageURL.path)', 'legacy.jpg', '\(root.path)', 0,
+        \(modificationTime), 6, NULL, NULL, '', 0, 0, \(modificationTime)
+    );
+    """
+    #expect(sqlite3_exec(database, createSQL, nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(database)
+
+    let store = LightboxIndexStore(databaseURL: databaseURL)
+    let snapshot = try #require(store.cachedVisibleSnapshot(source: source, folderURL: root))
+    #expect(snapshot.assets.first?.addedAt == Date(timeIntervalSince1970: modificationTime))
 }
 
 @Test func indexStoreDoesNotReturnFallbackDimensions() async throws {
@@ -381,6 +822,163 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(store.cachedDimensions(sourceID: source.id, parentPath: root.path).isEmpty)
 }
 
+@Test func indexStoreIgnoresDimensionsAfterFileModificationTimeChanges() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let databaseURL = root.appendingPathComponent("index.sqlite")
+    let imageURL = root.appendingPathComponent("modified.jpg")
+    let originalModificationDate = Date(timeIntervalSince1970: 1_700_000_000)
+    try Data("same-size".utf8).write(to: imageURL)
+    try FileManager.default.setAttributes(
+        [.modificationDate: originalModificationDate],
+        ofItemAtPath: imageURL.path
+    )
+
+    let source = LibrarySource.favorites(rootURL: root)
+    let asset = LightboxAsset(
+        originalName: imageURL.lastPathComponent,
+        width: 1200,
+        height: 800,
+        tags: [],
+        sourceURL: imageURL,
+        addedAt: originalModificationDate,
+        palette: MockPalette.imported[0],
+        metadataLoaded: true
+    )
+    let store = LightboxIndexStore(databaseURL: databaseURL)
+    store.replaceVisibleSnapshot(source: source, folderURL: root, folders: [], assets: [asset])
+
+    try FileManager.default.setAttributes(
+        [.modificationDate: originalModificationDate.addingTimeInterval(60)],
+        ofItemAtPath: imageURL.path
+    )
+
+    #expect(store.cachedDimensions(sourceID: source.id, parentPath: root.path).isEmpty)
+    let snapshot = try #require(store.cachedVisibleSnapshot(source: source, folderURL: root))
+    #expect(snapshot.assets.first?.metadataLoaded == false)
+    #expect(snapshot.assets.first?.width == 1)
+    #expect(snapshot.assets.first?.height == 1)
+}
+
+@Test func indexStoreIgnoresDimensionsAfterFileSizeChanges() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let databaseURL = root.appendingPathComponent("index.sqlite")
+    let imageURL = root.appendingPathComponent("replaced.jpg")
+    let modificationDate = Date(timeIntervalSince1970: 1_700_000_000)
+    try Data("small".utf8).write(to: imageURL)
+    try FileManager.default.setAttributes([.modificationDate: modificationDate], ofItemAtPath: imageURL.path)
+
+    let source = LibrarySource.favorites(rootURL: root)
+    let asset = LightboxAsset(
+        originalName: imageURL.lastPathComponent,
+        width: 3000,
+        height: 2000,
+        tags: [],
+        sourceURL: imageURL,
+        addedAt: modificationDate,
+        palette: MockPalette.imported[0],
+        metadataLoaded: true
+    )
+    let store = LightboxIndexStore(databaseURL: databaseURL)
+    store.replaceVisibleSnapshot(source: source, folderURL: root, folders: [], assets: [asset])
+
+    try Data("replacement-with-a-different-size".utf8).write(to: imageURL)
+    try FileManager.default.setAttributes([.modificationDate: modificationDate], ofItemAtPath: imageURL.path)
+
+    #expect(store.cachedDimensions(sourceID: source.id, parentPath: root.path).isEmpty)
+}
+
+@Test func indexStoreStopsSignatureValidationAfterCancellation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let databaseURL = root.appendingPathComponent("index.sqlite")
+    let modificationDate = Date(timeIntervalSince1970: 1_700_000_000)
+    let imageURLs = try (0..<3).map { index in
+        let url = root.appendingPathComponent("cancel-\(index).jpg")
+        try Data(repeating: UInt8(index), count: 8).write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: modificationDate],
+            ofItemAtPath: url.path
+        )
+        return url
+    }
+    let source = LibrarySource.favorites(rootURL: root)
+    let assets = imageURLs.enumerated().map { index, url in
+        LightboxAsset(
+            originalName: url.lastPathComponent,
+            width: CGFloat(100 + index),
+            height: CGFloat(200 + index),
+            tags: [],
+            sourceURL: url,
+            addedAt: modificationDate,
+            palette: MockPalette.imported[index % MockPalette.imported.count],
+            metadataLoaded: true
+        )
+    }
+    do {
+        let seedStore = LightboxIndexStore(databaseURL: databaseURL)
+        seedStore.replaceVisibleSnapshot(source: source, folderURL: root, folders: [], assets: assets)
+    }
+
+    let expectedSignature = FileContentSignature(
+        modificationTime: modificationDate.timeIntervalSince1970,
+        fileSize: 8
+    )
+    let cancelledBeforeReadCounter = TestCounter()
+    let cancelledBeforeRead = await Task.detached {
+        let store = LightboxIndexStore(
+            databaseURL: databaseURL,
+            fileSignatureResolver: { _ in
+                cancelledBeforeReadCounter.increment()
+                return expectedSignature
+            }
+        )
+        withUnsafeCurrentTask { task in
+            task?.cancel()
+        }
+        return store.cachedDimensions(sourceID: source.id, parentPath: root.path)
+    }.value
+
+    #expect(cancelledBeforeRead.isEmpty)
+    #expect(cancelledBeforeReadCounter.count == 0)
+
+    let cancelledDuringReadCounter = TestCounter()
+    let cancelledDuringRead = await Task.detached {
+        let store = LightboxIndexStore(
+            databaseURL: databaseURL,
+            fileSignatureResolver: { _ in
+                cancelledDuringReadCounter.increment()
+                if cancelledDuringReadCounter.count == 1 {
+                    withUnsafeCurrentTask { task in
+                        task?.cancel()
+                    }
+                }
+                return expectedSignature
+            }
+        )
+        return store.cachedDimensions(sourceID: source.id, parentPath: root.path)
+    }.value
+
+    #expect(cancelledDuringRead.isEmpty)
+    #expect(cancelledDuringReadCounter.count == 1)
+}
+
 @Test func indexStoreUsesWALJournalMode() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxIndexStoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -445,6 +1043,216 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(decodeCounter.value == 1)
 }
 
+@Test @MainActor func imageCacheReloadsFileReplacedAtSamePathWhenKnownSignatureIsStale() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sourceURL = root.appendingPathComponent("source.jpg")
+    try Data("first".utf8).write(to: sourceURL)
+    let originalSignature = try #require(FileContentSignature(url: sourceURL))
+    let firstImage = try #require(makeTestImage(size: 8))
+    let replacementImage = try #require(makeTestImage(size: 16))
+    let decodeCounter = LockedCounter()
+    let cache = ImageCache { _, _ in
+        decodeCounter.increment()
+        return decodeCounter.value == 1 ? firstImage : replacementImage
+    }
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(
+            for: sourceURL,
+            quality: .preview,
+            knownFileSignature: originalSignature
+        ) { image in
+            #expect(image?.size.width == 8)
+            continuation.resume()
+        }
+    }
+
+    try Data("replacement-with-a-different-size".utf8).write(to: sourceURL)
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(
+            for: sourceURL,
+            quality: .preview,
+            knownFileSignature: originalSignature
+        ) { image in
+            #expect(image?.size.width == 16)
+            continuation.resume()
+        }
+    }
+    #expect(decodeCounter.value == 2)
+}
+
+@Test @MainActor func imageCacheReloadsAtomicReplacementWithSameSizeAndModificationTime() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sourceURL = root.appendingPathComponent("source.jpg")
+    let fixedDate = Date(timeIntervalSince1970: 1_700_000_000)
+    try Data("first".utf8).write(to: sourceURL)
+    try FileManager.default.setAttributes([.modificationDate: fixedDate], ofItemAtPath: sourceURL.path)
+    let originalSignature = try #require(FileContentSignature(url: sourceURL))
+    let firstImage = try #require(makeTestImage(size: 8))
+    let replacementImage = try #require(makeTestImage(size: 16))
+    let decodeCounter = LockedCounter()
+    let cache = ImageCache { _, _ in
+        decodeCounter.increment()
+        return decodeCounter.value == 1 ? firstImage : replacementImage
+    }
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(
+            for: sourceURL,
+            quality: .preview,
+            knownFileSignature: originalSignature
+        ) { image in
+            #expect(image?.size.width == 8)
+            continuation.resume()
+        }
+    }
+
+    try Data("other".utf8).write(to: sourceURL, options: .atomic)
+    try FileManager.default.setAttributes([.modificationDate: fixedDate], ofItemAtPath: sourceURL.path)
+    let replacementSignature = try #require(FileContentSignature(url: sourceURL))
+    #expect(replacementSignature.fileSize == originalSignature.fileSize)
+    #expect(replacementSignature.modificationTime == originalSignature.modificationTime)
+    #expect(replacementSignature.cacheKeyComponent != originalSignature.cacheKeyComponent)
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(
+            for: sourceURL,
+            quality: .preview,
+            knownFileSignature: originalSignature
+        ) { image in
+            #expect(image?.size.width == 16)
+            continuation.resume()
+        }
+    }
+    #expect(decodeCounter.value == 2)
+}
+
+@Test @MainActor func imageCacheDoesNotCoalescePendingRequestsAcrossFileSignatures() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sourceURL = root.appendingPathComponent("source.jpg")
+    try Data("first".utf8).write(to: sourceURL)
+    let image = try #require(makeTestImage())
+    let decodeCounter = LockedCounter()
+    let cache = ImageCache(
+        decodeImage: { _, _ in
+            decodeCounter.increment()
+            Thread.sleep(forTimeInterval: 0.1)
+            return image
+        },
+        fileSignature: { _ in nil }
+    )
+    let firstSignature = FileContentSignature(modificationTime: 100, fileSize: 5)
+    let replacementSignature = FileContentSignature(modificationTime: 101, fileSize: 33)
+    var completionCount = 0
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        let completion: @MainActor @Sendable (NSImage?) -> Void = { decodedImage in
+            #expect(decodedImage != nil)
+            completionCount += 1
+            if completionCount == 2 {
+                continuation.resume()
+            }
+        }
+
+        _ = cache.image(
+            for: sourceURL,
+            quality: .preview,
+            knownFileSignature: firstSignature,
+            completion: completion
+        )
+        try? Data("replacement-with-a-different-size".utf8).write(to: sourceURL)
+        _ = cache.image(
+            for: sourceURL,
+            quality: .preview,
+            knownFileSignature: replacementSignature,
+            completion: completion
+        )
+    }
+
+    #expect(decodeCounter.value == 2)
+}
+
+@Test @MainActor func imageCacheValidatesKnownFileSignatureOffMainThread() async throws {
+    let signatureResolveCounter = LockedCounter()
+    let resolverRanOnMainThread = LockedFlag()
+    let image = try #require(makeTestImage())
+    let knownSignature = FileContentSignature(modificationTime: 100, fileSize: 200)
+    let cache = ImageCache(
+        decodeImage: { _, _ in image },
+        fileSignature: { _ in
+            signatureResolveCounter.increment()
+            resolverRanOnMainThread.record(Thread.isMainThread)
+            return knownSignature
+        }
+    )
+    let missingURL = URL(fileURLWithPath: "/tmp/lightbox-known-signature-\(UUID().uuidString).jpg")
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(
+            for: missingURL,
+            quality: .preview,
+            knownFileSignature: knownSignature
+        ) { decodedImage in
+            #expect(decodedImage != nil)
+            continuation.resume()
+        }
+    }
+
+    #expect(signatureResolveCounter.value == 1)
+    #expect(!resolverRanOnMainThread.value)
+    #expect(cache.bestCachedImage(
+        for: missingURL,
+        quality: .preview,
+        knownFileSignature: knownSignature
+    ) != nil)
+    #expect(signatureResolveCounter.value == 1)
+
+    #expect(cache.bestCachedImage(for: missingURL, quality: .preview) == nil)
+    #expect(signatureResolveCounter.value == 1)
+}
+
+@Test @MainActor func assetImageRequestIdentityUsesContentModificationTimeInsteadOfAddedDate() async throws {
+    let addedAt = Date(timeIntervalSince1970: 50)
+    let sourceURL = URL(fileURLWithPath: "/tmp/lightbox-same-path.jpg")
+    let original = LightboxAsset(
+        originalName: sourceURL.lastPathComponent,
+        width: 100,
+        height: 100,
+        tags: [],
+        sourceURL: sourceURL,
+        addedAt: addedAt,
+        contentModifiedAt: Date(timeIntervalSince1970: 100),
+        fileSize: 200,
+        palette: MockPalette.imported[0]
+    )
+    var replacement = original
+    replacement.contentModifiedAt = Date(timeIntervalSince1970: 101)
+
+    #expect(replacement.addedAt == original.addedAt)
+    #expect(replacement.fileSize == original.fileSize)
+    #expect(AssetImageView.knownFileSignature(for: replacement) != AssetImageView.knownFileSignature(for: original))
+    #expect(
+        AssetImageView.imageRequestIdentity(for: replacement, quality: .preview, loadsImage: true)
+            != AssetImageView.imageRequestIdentity(for: original, quality: .preview, loadsImage: true)
+    )
+}
+
 @Test func imageCacheThumbnailPromotionRulesExcludePreviewAndComparison() async throws {
     #expect(ImageCache.shouldAttach(requested: .thumbnailFast, toPending: .thumbnail))
     #expect(ImageCache.shouldAttach(requested: .thumbnailBalanced, toPending: .thumbnail))
@@ -461,9 +1269,9 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
 @Test func thumbnailDiskCacheKeysIncludeFileSignatureAndQuality() async throws {
     let url = URL(fileURLWithPath: "/tmp/lightbox-cache-source.jpg")
-    let original = ThumbnailFileSignature(modificationTime: 100, fileSize: 20)
-    let changedSize = ThumbnailFileSignature(modificationTime: 100, fileSize: 21)
-    let changedTime = ThumbnailFileSignature(modificationTime: 101, fileSize: 20)
+    let original = FileContentSignature(modificationTime: 100, fileSize: 20)
+    let changedSize = FileContentSignature(modificationTime: 100, fileSize: 21)
+    let changedTime = FileContentSignature(modificationTime: 101, fileSize: 20)
 
     let originalKey = ThumbnailDiskCache.cacheKey(for: url, quality: .thumbnailFast, signature: original)
 
@@ -490,6 +1298,38 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
     #expect(cache.image(for: sourceURL, quality: .thumbnailFast) != nil)
     #expect(cache.cacheURL(for: sourceURL, quality: .preview) == nil)
+}
+
+@Test func thumbnailDiskCachePrunesOldestFilesWhenOverLimit() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let oldestURL = root.appendingPathComponent("oldest.jpg")
+    let middleURL = root.appendingPathComponent("middle.jpg")
+    let newestURL = root.appendingPathComponent("newest.jpg")
+    let files = [oldestURL, middleURL, newestURL]
+    let futureDate = Date().addingTimeInterval(600)
+    for (index, url) in files.enumerated() {
+        try Data(repeating: UInt8(index), count: 60).write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: futureDate.addingTimeInterval(TimeInterval(index))],
+            ofItemAtPath: url.path
+        )
+    }
+
+    let cache = ThumbnailDiskCache(
+        folder: root,
+        maxDiskBytes: 100,
+        pruneInterval: 3600
+    )
+    cache.pruneIfNeeded(force: true)
+
+    #expect(!FileManager.default.fileExists(atPath: oldestURL.path))
+    #expect(!FileManager.default.fileExists(atPath: middleURL.path))
+    #expect(FileManager.default.fileExists(atPath: newestURL.path))
 }
 
 @Test @MainActor func imageCacheMemoryResetKeepsThumbnailDiskCache() async throws {
@@ -528,6 +1368,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     let sourceURL = root.appendingPathComponent("source.jpg", isDirectory: false)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     try Data("source".utf8).write(to: sourceURL)
+    let sourceSignature = try #require(FileContentSignature(url: sourceURL))
 
     let thumbnailImage = try #require(makeTestImage(size: 8))
     let previewImage = try #require(makeTestImage(size: 24))
@@ -564,9 +1405,21 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
     cache.removeThumbnailMemoryObjects(reason: "test")
 
-    #expect(cache.bestCachedImage(for: sourceURL, quality: .thumbnailFast) == nil)
-    #expect(cache.bestCachedImage(for: sourceURL, quality: .preview)?.size.width == 24)
-    #expect(cache.bestCachedImage(for: sourceURL, quality: .comparison)?.size.width == 16)
+    #expect(cache.bestCachedImage(
+        for: sourceURL,
+        quality: .thumbnailFast,
+        knownFileSignature: sourceSignature
+    ) == nil)
+    #expect(cache.bestCachedImage(
+        for: sourceURL,
+        quality: .preview,
+        knownFileSignature: sourceSignature
+    )?.size.width == 24)
+    #expect(cache.bestCachedImage(
+        for: sourceURL,
+        quality: .comparison,
+        knownFileSignature: sourceSignature
+    )?.size.width == 16)
 }
 
 @Test @MainActor func imageCacheSourceMemoryResetClearsComparisonButKeepsPreviewCache() async throws {
@@ -578,6 +1431,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     let sourceURL = root.appendingPathComponent("source.jpg", isDirectory: false)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     try Data("source".utf8).write(to: sourceURL)
+    let sourceSignature = try #require(FileContentSignature(url: sourceURL))
 
     let thumbnailImage = try #require(makeTestImage(size: 8))
     let previewImage = try #require(makeTestImage(size: 24))
@@ -617,8 +1471,16 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
     cache.removeSourceMemoryObjects(reason: "test")
 
-    #expect(cache.bestCachedImage(for: sourceURL, quality: .thumbnailFast) == nil)
-    #expect(cache.bestCachedImage(for: sourceURL, quality: .preview)?.size.width == 24)
+    #expect(cache.bestCachedImage(
+        for: sourceURL,
+        quality: .thumbnailFast,
+        knownFileSignature: sourceSignature
+    ) == nil)
+    #expect(cache.bestCachedImage(
+        for: sourceURL,
+        quality: .preview,
+        knownFileSignature: sourceSignature
+    )?.size.width == 24)
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
         _ = cache.image(for: sourceURL, quality: .comparison) { decodedImage in
             #expect(decodedImage?.size.width == 16)
@@ -706,6 +1568,66 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     )
 
     #expect(prioritized.count <= GalleryImagePriorityPlanner.maxPrioritizedAssetCount)
+}
+
+@Test func galleryFrameLifecycleFiltersFramesForInactiveAssets() async throws {
+    let previous = [
+        "visible": CGRect(x: 0, y: 0, width: 100, height: 100),
+        "offscreen": CGRect(x: 0, y: 120, width: 100, height: 100)
+    ]
+
+    let replacement = try #require(GalleryAssetFrameLifecycle.replacementFrames(
+        current: previous,
+        incoming: previous,
+        activeAssetIDs: ["visible"]
+    ))
+
+    #expect(replacement == ["visible": previous["visible"]!])
+}
+
+@Test func galleryFrameLifecycleDropsFramesNoLongerReportedByLayout() async throws {
+    let visibleFrame = CGRect(x: 0, y: 0, width: 100, height: 100)
+    let previous = [
+        "visible": visibleFrame,
+        "offscreen": CGRect(x: 0, y: 120, width: 100, height: 100)
+    ]
+
+    #expect(GalleryAssetFrameLifecycle.replacementFrames(
+        current: previous,
+        incoming: ["visible": visibleFrame],
+        activeAssetIDs: Set(previous.keys)
+    ) == ["visible": visibleFrame])
+}
+
+@Test func galleryFrameLifecycleReplacesFramesAfterItemReflow() async throws {
+    let previous = [
+        "first": CGRect(x: 0, y: 0, width: 100, height: 100),
+        "second": CGRect(x: 0, y: 120, width: 100, height: 100)
+    ]
+    let reflowed = [
+        "first": CGRect(x: 0, y: 0, width: 100, height: 160),
+        "second": CGRect(x: 0, y: 180, width: 100, height: 100)
+    ]
+
+    #expect(GalleryAssetFrameLifecycle.replacementFrames(
+        current: previous,
+        incoming: reflowed,
+        activeAssetIDs: Set(reflowed.keys)
+    ) == reflowed)
+}
+
+@Test func galleryFrameLifecycleThrottlesSmallUniformScrollTranslations() async throws {
+    let previous = [
+        "first": CGRect(x: 0, y: 0, width: 100, height: 100),
+        "second": CGRect(x: 0, y: 120, width: 100, height: 100)
+    ]
+    let scrolled = previous.mapValues { $0.offsetBy(dx: 0, dy: -8) }
+
+    #expect(GalleryAssetFrameLifecycle.replacementFrames(
+        current: previous,
+        incoming: scrolled,
+        activeAssetIDs: Set(scrolled.keys)
+    ) == nil)
 }
 
 @Test func prioritizedGalleryImagesUpgradeToFullThumbnailQuality() async throws {
@@ -854,12 +1776,54 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(local.dimensionLimit(assetCount: 110) == 110)
     #expect(local.tagLimit(assetCount: 110) == 110)
     #expect(local.startDelayMilliseconds == 650)
-    #expect(external.dimensionLimit(assetCount: 110) == 4)
+    #expect(external.dimensionLimit(assetCount: 110) == 110)
     #expect(external.dimensionLimit(assetCount: 3) == 3)
     #expect(external.tagLimit(assetCount: 110) == 12)
     #expect(external.tagLimit(assetCount: 20) == 12)
     #expect(external.startDelayMilliseconds == 1_600)
     #expect(externalTagFilter.tagLimit(assetCount: 110) == 110)
+}
+
+@MainActor
+@Test func selectingTagFilterLoadsTagsBeyondExternalBrowsingLimit() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxCompleteTagFilterTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let testImage = try #require(makeTestImage(size: 8))
+    let bitmap = try #require(testImage.representations.first as? NSBitmapImageRep)
+    let imageData = try #require(bitmap.representation(using: .png, properties: [:]))
+    for index in 0..<13 {
+        try imageData.write(
+            to: root.appendingPathComponent("image-\(index).png")
+        )
+    }
+
+    let source = LibrarySourceStore.makeExternalSource(rootURL: root)
+    let initialSnapshot = LocalImageSource.loadFolderSnapshot(
+        in: root,
+        sourceID: source.id,
+        rootURL: root,
+        probeMetadata: false
+    )
+    let taggedAsset = try #require(initialSnapshot.assets.dropFirst(12).first)
+    let taggedURL = try #require(taggedAsset.sourceURL)
+    #expect(FinderTagStore.setColorTags(["Red"], for: taggedURL))
+
+    let appState = makeTestAppState()
+    appState.openSource(source)
+    #expect(await waitForLightboxState { appState.assets.count == 13 })
+    #expect(appState.assets.first { $0.id == taggedAsset.id }?.tags.isEmpty == true)
+
+    appState.selectedFilter = .tag("Red")
+
+    #expect(await waitForLightboxState {
+        appState.activeAssets.map(\.id) == [taggedAsset.id]
+            && appState.assets.allSatisfy(\.metadataLoaded)
+    })
 }
 
 @Test func libraryRefreshPolicyDelaysExternalScanWhenCachedSnapshotExists() async throws {
@@ -966,7 +1930,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
 @MainActor
 @Test func appStateRebuildsActiveAssetsWhenSortChanges() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let older = LightboxAsset(
         originalName: "b.png",
         width: 100,
@@ -1011,7 +1975,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
 @MainActor
 @Test func appStateSortsActiveFoldersWhenSortDirectionChanges() async throws {
-    let appState = AppState()
+    let appState = makeTestAppState()
     let root = URL(fileURLWithPath: "/tmp/lightbox/source", isDirectory: true)
     appState.folderEntries = [
         LibraryFolderEntry(
@@ -1047,6 +2011,8 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     let secondURL = root.appendingPathComponent("second.jpg")
     try Data("first".utf8).write(to: firstURL)
     try Data("second".utf8).write(to: secondURL)
+    try writeFinderTags(["Red\n6"], to: firstURL)
+    try writeFinderTags(["Red\n6"], to: secondURL)
 
     let first = LightboxAsset(
         originalName: "first.jpg",
@@ -1066,22 +2032,69 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
         addedAt: Date(timeIntervalSince1970: 20),
         palette: MockPalette.imported[1]
     )
-    let appState = AppState()
-    appState.assets = [first, second]
+    let appState = makeTestAppState()
+    let source = LibrarySource.favorites(rootURL: root)
+    appState.sources = [source]
+    appState.chooseSource(source.id)
+    #expect(await waitForLightboxState {
+        Set(appState.assets.map(\.id)) == Set([first.id, second.id])
+            && appState.assets.allSatisfy { $0.tags == ["Red"] }
+            && appState.libraryLoadingStatus == nil
+    })
     appState.selectedFilter = .tag("Red")
 
     appState.selectedAssetIDs = [first.id]
     appState.selectedAssetID = first.id
     appState.toggleTagForSelection("Red")
-    #expect(appState.selectedFilter == .tag("Red"))
-    #expect(appState.activeAssets.map(\.id) == [second.id])
+    #expect(await waitForLightboxState {
+        appState.selectedFilter == .tag("Red")
+            && appState.activeAssets.map(\.id) == [second.id]
+    })
 
     appState.selectedAssetIDs = [second.id]
     appState.selectedAssetID = second.id
     appState.toggleTagForSelection("Red")
-    #expect(appState.selectedFilter == .all)
-    #expect(Set(appState.activeAssets.map(\.id)) == Set([first.id, second.id]))
-    #expect(appState.activeAssets.allSatisfy { !$0.tags.contains("Red") })
+    #expect(await waitForLightboxState {
+        appState.selectedFilter == .all
+            && Set(appState.activeAssets.map(\.id)) == Set([first.id, second.id])
+            && appState.activeAssets.allSatisfy { !$0.tags.contains("Red") }
+    })
+}
+
+@MainActor
+@Test func tagMutationsRunOffMainActorAndRemainSerialized() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxTagMutationTests-\(UUID().uuidString)", isDirectory: true)
+    let imageURL = root.appendingPathComponent("image.jpg")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("image".utf8).write(to: imageURL)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let writeCounter = LockedCounter()
+    let appState = makeTestAppState(finderTagWriter: { _, _ in
+        writeCounter.increment()
+        Thread.sleep(forTimeInterval: 0.12)
+        return true
+    })
+    let source = LibrarySource.favorites(rootURL: root)
+    appState.sources = [source]
+    appState.chooseSource(source.id)
+    #expect(await waitForLightboxState {
+        appState.assets.contains { $0.sourceURL?.standardizedFileURL == imageURL.standardizedFileURL }
+            && appState.libraryLoadingStatus == nil
+    })
+    let asset = try #require(appState.assets.first { $0.sourceURL?.standardizedFileURL == imageURL.standardizedFileURL })
+
+    let startedAt = Date()
+    appState.toggleTag("Red", to: asset)
+    appState.toggleTag("Red", to: asset)
+    #expect(Date().timeIntervalSince(startedAt) < 0.08)
+    #expect(await waitForLightboxState {
+        writeCounter.value == 2
+            && appState.assets.first(where: { $0.id == asset.id })?.tags.isEmpty == true
+    })
 }
 
 @Test func localImageSourceRecognizesCommonRawFormats() async throws {
@@ -1185,6 +2198,123 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(asset.addedAt != .distantPast)
 }
 
+@Test func localImageSourceCancelledFolderSnapshotStopsBeforeClassification() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxCancelledSnapshotTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    for index in 0..<8 {
+        try Data("image-\(index)".utf8).write(
+            to: root.appendingPathComponent("image-\(index).jpg")
+        )
+    }
+
+    let task = Task.detached {
+        try? await Task.sleep(for: .milliseconds(200))
+        return LocalImageSource.loadFolderSnapshot(
+            in: root,
+            sourceID: "cancelled-source",
+            rootURL: root,
+            probeMetadata: false,
+            initialMetadataLimit: 8
+        )
+    }
+    task.cancel()
+
+    let snapshot = await task.value
+    #expect(snapshot.availability == .unavailable(.cancelled))
+    #expect(snapshot.entryCount == 0)
+    #expect(snapshot.folders.isEmpty)
+    #expect(snapshot.assets.isEmpty)
+}
+
+@Test func localImageSourceDistinguishesEmptyAndOfflineFolders() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxFolderAvailabilityTests-\(UUID().uuidString)", isDirectory: true)
+    let emptyFolder = root.appendingPathComponent("empty", isDirectory: true)
+    let offlineFolder = root.appendingPathComponent("offline", isDirectory: true)
+    try FileManager.default.createDirectory(at: emptyFolder, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let emptySnapshot = LocalImageSource.loadFolderSnapshot(
+        in: emptyFolder,
+        sourceID: "empty-source",
+        rootURL: emptyFolder,
+        probeMetadata: false
+    )
+    let offlineSnapshot = LocalImageSource.loadFolderSnapshot(
+        in: offlineFolder,
+        sourceID: "offline-source",
+        rootURL: offlineFolder,
+        probeMetadata: false
+    )
+
+    #expect(emptySnapshot.availability == .available)
+    #expect(emptySnapshot.entryCount == 0)
+    #expect(offlineSnapshot.availability == .unavailable(.sourceUnavailable))
+}
+
+@Test func localImageSourcePreservesAccessDeniedStatus() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxFolderDeniedTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: root.path)
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let snapshot = LocalImageSource.loadFolderSnapshot(
+        in: root,
+        sourceID: "denied-source",
+        rootURL: root,
+        probeMetadata: false
+    )
+
+    #expect(snapshot.availability == .unavailable(.accessDenied))
+}
+
+@Test func finderColorTagsPreserveCustomNamesWithColorCodes() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxFinderTagTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let image = root.appendingPathComponent("rose.jpg")
+    try Data("image".utf8).write(to: image)
+    try writeFinderTags(["\u{5ba2}\u{6237}A\n6", "Blue\n4"], to: image)
+
+    #expect(FinderTagStore.colorTags(for: image) == ["Red", "Blue"])
+    #expect(FinderTagStore.setColorTags(["Red"], for: image))
+    #expect(try readFinderTags(from: image) == ["\u{5ba2}\u{6237}A\n6"])
+
+    #expect(FinderTagStore.setColorTags([], for: image))
+    #expect(try readFinderTags(from: image) == ["\u{5ba2}\u{6237}A\n0"])
+    #expect(FinderTagStore.colorTags(for: image).isEmpty)
+}
+
+@Test func finderColorTagRemovalReportsErrorsExceptMissingAttribute() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxFinderTagRemovalTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let image = root.appendingPathComponent("rose.jpg")
+    try Data("image".utf8).write(to: image)
+
+    #expect(FinderTagStore.setColorTags([], for: image))
+    #expect(!FinderTagStore.setColorTags([], for: root.appendingPathComponent("missing.jpg")))
+}
+
 @Test func localImageSourceSearchAssetsSupportsRecursiveFolderSearch() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxSearchTests-\(UUID().uuidString)", isDirectory: true)
@@ -1275,6 +2405,30 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(result.assets.first?.addedAt != .distantPast)
 }
 
+@Test func localImageSourceSearchMarksUnreadableSubfoldersAsIncomplete() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxUnreadableSearchTests-\(UUID().uuidString)", isDirectory: true)
+    let unreadable = root.appendingPathComponent("Blocked", isDirectory: true)
+    try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+    try Data("image".utf8).write(to: unreadable.appendingPathComponent("hidden.jpg"))
+    try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: unreadable.path)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let result = LocalImageSource.searchAssets(
+        in: root,
+        sourceID: "source",
+        rootURL: root,
+        query: LightboxSearchQuery.parse("hidden"),
+        recursive: true
+    )
+
+    #expect(result.assets.isEmpty)
+    #expect(result.limitReached)
+}
+
 @Test func localImageSourceLoadsFolderTagsWithoutAssetMetadataProbe() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxFolderTagTests-\(UUID().uuidString)", isDirectory: true)
@@ -1358,11 +2512,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 }
 
 @Test func libraryStoreRestoreDestinationRoundTrips() async throws {
-    let suiteName = "LightboxRestoreDestinationTests-\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer {
-        defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = try #require(LightboxTestUserDefaults())
 
     let originalURL = URL(fileURLWithPath: "/tmp/lightbox/original/photo.jpg")
     let trashURL = URL(fileURLWithPath: "/tmp/lightbox/.Trash/photo.jpg")
@@ -1390,11 +2540,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
         try? FileManager.default.removeItem(at: root)
     }
 
-    let suiteName = "LightboxRestoreTests-\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer {
-        defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = try #require(LightboxTestUserDefaults())
 
     let originalURL = originalFolder.appendingPathComponent("photo.jpg")
     let trashURL = fakeTrashFolder.appendingPathComponent("photo.jpg")
@@ -1413,11 +2559,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 }
 
 @Test func librarySourceStorePersistsLastSessionFolder() async throws {
-    let suiteName = "LightboxLastSessionTests-\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer {
-        defaults.removePersistentDomain(forName: suiteName)
-    }
+    let defaults = try #require(LightboxTestUserDefaults())
 
     let sourceRoot = URL(fileURLWithPath: "/tmp/lightbox/source", isDirectory: true)
     let folderURL = sourceRoot.appendingPathComponent("nested/folder", isDirectory: true)
@@ -1439,16 +2581,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 }
 
 @Test func librarySourceStoreDoesNotInjectLegacyFavoritesSource() async throws {
-    let defaults = UserDefaults.standard
-    let key = "Lightbox.full.externalSources"
-    let previous = defaults.data(forKey: key)
-    defer {
-        if let previous {
-            defaults.set(previous, forKey: key)
-        } else {
-            defaults.removeObject(forKey: key)
-        }
-    }
+    let defaults = try #require(LightboxTestUserDefaults())
 
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxExternalSourceTests-\(UUID().uuidString)", isDirectory: true)
@@ -1458,32 +2591,37 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     }
 
     let external = LibrarySourceStore.makeExternalSource(rootURL: root)
-    LibrarySourceStore.saveExternalSources([LibrarySource.favorites(rootURL: root), external])
+    LibrarySourceStore.saveExternalSources(
+        [LibrarySource.favorites(rootURL: root), external],
+        defaults: defaults
+    )
 
-    let loaded = LibrarySourceStore.loadSources()
+    let loaded = LibrarySourceStore.loadSources(defaults: defaults)
 
     #expect(loaded == [external])
     #expect(!loaded.contains { $0.kind == .favorites })
 }
 
+@Test func librarySourceStoreKeepsOfflineExternalSources() async throws {
+    let defaults = try #require(LightboxTestUserDefaults())
+
+    let offlineRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxOfflineSource-\(UUID().uuidString)", isDirectory: true)
+    let source = LibrarySource(
+        id: "offline-source",
+        name: "Offline NAS",
+        rootURL: offlineRoot,
+        kind: .external
+    )
+
+    LibrarySourceStore.saveExternalSources([source], defaults: defaults)
+
+    #expect(LibrarySourceStore.loadSources(defaults: defaults) == [source])
+}
+
 @MainActor
 @Test func sidebarOpenKeepsTemporarySourceWhenEnteringChildFolder() async throws {
-    let defaults = UserDefaults.standard
-    let savedSelectedSource = defaults.string(forKey: "Lightbox.full.selectedSource")
-    let savedLastSession = defaults.data(forKey: "Lightbox.full.lastSession")
-    defer {
-        if let savedSelectedSource {
-            defaults.set(savedSelectedSource, forKey: "Lightbox.full.selectedSource")
-        } else {
-            defaults.removeObject(forKey: "Lightbox.full.selectedSource")
-        }
-
-        if let savedLastSession {
-            defaults.set(savedLastSession, forKey: "Lightbox.full.lastSession")
-        } else {
-            defaults.removeObject(forKey: "Lightbox.full.lastSession")
-        }
-    }
+    let defaults = try #require(LightboxTestUserDefaults())
 
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxTemporarySourceTests-\(UUID().uuidString)", isDirectory: true)
@@ -1493,7 +2631,7 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
         try? FileManager.default.removeItem(at: root)
     }
 
-    let appState = AppState()
+    let appState = makeTestAppState(libraryDefaults: defaults)
     appState.sources = []
     appState.openSidebarFolder(root)
     let temporarySourceID = try #require(appState.selectedSource?.id)
@@ -1503,6 +2641,163 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(appState.selectedSource?.id == temporarySourceID)
     #expect(appState.selectedSource?.rootURL == root.standardizedFileURL)
     #expect(appState.currentFolderURL == child.standardizedFileURL)
+}
+
+@MainActor
+@Test func missingCurrentFolderFallbackRebindsDirectoryMonitor() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxMonitorFallbackTests-\(UUID().uuidString)", isDirectory: true)
+    let child = root.appendingPathComponent("Nested", isDirectory: true)
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let source = LibrarySource.favorites(rootURL: root)
+    let appState = makeTestAppState()
+    appState.sources = [source]
+    appState.chooseSource(source.id)
+    appState.openFolder(LibraryFolderEntry(sourceID: source.id, url: child, rootURL: root))
+    #expect(appState.currentFolderURL == child.standardizedFileURL)
+
+    try FileManager.default.removeItem(at: child)
+    appState.refreshLibrary()
+    #expect(await waitForLightboxState {
+        appState.currentFolderURL == root.standardizedFileURL && appState.libraryLoadingStatus == nil
+    })
+    try? await Task.sleep(for: .milliseconds(700))
+
+    let newImage = root.appendingPathComponent("after-fallback.jpg")
+    try Data("new-image".utf8).write(to: newImage)
+
+    #expect(await waitForLightboxState {
+        appState.assets.contains { $0.sourceURL?.standardizedFileURL == newImage.standardizedFileURL }
+    })
+}
+
+@MainActor
+@Test func offlineExternalRootPreservesCurrentChildFolderAndCache() async throws {
+    let container = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxOfflineChildTests-\(UUID().uuidString)", isDirectory: true)
+    let root = container.appendingPathComponent("source", isDirectory: true)
+    let child = root.appendingPathComponent("Nested", isDirectory: true)
+    let imageURL = child.appendingPathComponent("cached.jpg")
+    let databaseURL = container.appendingPathComponent("index.sqlite")
+    let defaults = try #require(LightboxTestUserDefaults())
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    try Data("cached-image".utf8).write(to: imageURL)
+    defer {
+        try? FileManager.default.removeItem(at: container)
+    }
+
+    let source = LibrarySourceStore.makeExternalSource(rootURL: root)
+    LibrarySourceStore.saveExternalSources([source], defaults: defaults)
+    LibrarySourceStore.saveSelectedSourceID(source.id, defaults: defaults)
+    let appState = makeTestAppState(
+        indexDatabaseURL: databaseURL,
+        libraryDefaults: defaults
+    )
+    appState.openFolder(LibraryFolderEntry(sourceID: source.id, url: child, rootURL: root))
+    #expect(await waitForLightboxState {
+        appState.currentFolderURL == child.standardizedFileURL
+            && appState.assets.map(\.sourceURL) == [imageURL]
+            && appState.libraryLoadingStatus == nil
+    })
+    #expect(await waitForLightboxState {
+        LightboxIndexStore(databaseURL: databaseURL)
+            .cachedVisibleSnapshot(source: source, folderURL: child)?
+            .assets.count == 1
+    })
+
+    try FileManager.default.removeItem(at: root)
+    appState.refreshLibrary()
+
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    #expect(appState.currentFolderURL == child.standardizedFileURL)
+    #expect(appState.assets.map(\.sourceURL) == [imageURL])
+    #expect(LibrarySourceStore.loadLastSession(defaults: defaults)?.folderURL == child.standardizedFileURL)
+    #expect(
+        LightboxIndexStore(databaseURL: databaseURL)
+            .cachedVisibleSnapshot(source: source, folderURL: child)?
+            .assets.count == 1
+    )
+}
+
+@MainActor
+@Test func startupRestoresLastChildFolderWhenExternalRootIsOffline() async throws {
+    let container = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxOfflineStartupTests-\(UUID().uuidString)", isDirectory: true)
+    let root = container.appendingPathComponent("source", isDirectory: true)
+    let child = root.appendingPathComponent("Nested", isDirectory: true)
+    let defaults = try #require(LightboxTestUserDefaults())
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: container)
+    }
+
+    let source = LibrarySourceStore.makeExternalSource(rootURL: root)
+    LibrarySourceStore.saveExternalSources([source], defaults: defaults)
+    LibrarySourceStore.saveSelectedSourceID(source.id, defaults: defaults)
+    LibrarySourceStore.saveLastSession(source: source, folderURL: child, defaults: defaults)
+    try FileManager.default.removeItem(at: root)
+
+    let appState = makeTestAppState(libraryDefaults: defaults)
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    #expect(appState.selectedSourceID == source.id)
+    #expect(appState.currentFolderURL == child.standardizedFileURL)
+    #expect(LibrarySourceStore.loadLastSession(defaults: defaults)?.folderURL == child.standardizedFileURL)
+}
+
+@MainActor
+@Test func unavailableFolderRefreshPreservesVisibleCacheAndIndex() async throws {
+    let container = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxUnavailableRefreshTests-\(UUID().uuidString)", isDirectory: true)
+    let sourceRoot = container.appendingPathComponent("source", isDirectory: true)
+    let databaseURL = container.appendingPathComponent("index.sqlite")
+    try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: container)
+    }
+
+    let imageURL = sourceRoot.appendingPathComponent("cached.jpg")
+    try Data("cached-image".utf8).write(to: imageURL)
+    let source = LibrarySourceStore.makeExternalSource(rootURL: sourceRoot)
+    let appState = makeTestAppState(indexDatabaseURL: databaseURL)
+    appState.sources = [source]
+    appState.chooseSource(source.id)
+
+    #expect(await waitForLightboxState {
+        appState.assets.map(\.sourceURL) == [imageURL]
+            && appState.libraryLoadingStatus == nil
+    })
+    #expect(await waitForLightboxState {
+        LightboxIndexStore(databaseURL: databaseURL)
+            .cachedVisibleSnapshot(source: source, folderURL: sourceRoot)?
+            .assets.count == 1
+    })
+
+    try FileManager.default.removeItem(at: sourceRoot)
+    appState.refreshLibrary()
+
+    #expect(await waitForLightboxState { appState.libraryLoadingStatus == nil })
+    #expect(appState.assets.map(\.sourceURL) == [imageURL])
+    #expect(
+        LightboxIndexStore(databaseURL: databaseURL)
+            .cachedVisibleSnapshot(source: source, folderURL: sourceRoot)?
+            .assets.count == 1
+    )
+
+    try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+    appState.refreshLibrary()
+
+    #expect(await waitForLightboxState {
+        appState.assets.isEmpty && appState.libraryLoadingStatus == nil
+    })
+    #expect(await waitForLightboxState {
+        let indexedSnapshot = LightboxIndexStore(databaseURL: databaseURL)
+            .cachedVisibleSnapshot(source: source, folderURL: sourceRoot)
+        return indexedSnapshot?.assets.isEmpty ?? true
+    })
 }
 
 @Test func fastThumbnailOptionsPreferEmbeddedPreviews() async throws {
@@ -1606,13 +2901,14 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
         compatibility: false
     )
 
-    guard case let .updateAvailable(version, _, assetURL) = result else {
+    guard case let .updateAvailable(version, _, assetURL, digest) = result else {
         Issue.record("Expected update to be available")
         return
     }
 
     #expect(version == "1.3.1")
     #expect(assetURL.lastPathComponent == "Lightbox-v1.3.1.zip")
+    #expect(digest == "sha256:" + String(repeating: "b", count: 64))
 }
 
 @Test func updateCheckerChoosesIntelReleaseAssetForCompatibilityBuild() async throws {
@@ -1622,12 +2918,268 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
         compatibility: true
     )
 
-    guard case let .updateAvailable(_, _, assetURL) = result else {
+    guard case let .updateAvailable(_, _, assetURL, digest) = result else {
         Issue.record("Expected update to be available")
         return
     }
 
     #expect(assetURL.lastPathComponent == "Lightbox-Intel-x86-v1.3.1.zip")
+    #expect(digest == "sha256:" + String(repeating: "a", count: 64))
+}
+
+@Test func updateCheckerRejectsReleaseWithoutExactCompatibleAsset() async throws {
+    let json = """
+    {
+      "tag_name": "v1.3.1",
+      "html_url": "https://github.com/a11oydyyy/Lightbox/releases/tag/v1.3.1",
+      "assets": [
+        {
+          "name": "Lightbox-Intel-x86-v1.3.1.zip.sha256",
+          "browser_download_url": "https://example.com/Lightbox-Intel-x86-v1.3.1.zip.sha256",
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+    """
+
+    do {
+        _ = try LightboxUpdateChecker.checkResult(
+            from: try #require(json.data(using: .utf8)),
+            currentVersion: "1.3.0",
+            compatibility: true
+        )
+        Issue.record("Expected an exact compatible asset to be required")
+    } catch let error as UpdateError {
+        guard case .compatibleAssetMissing = error else {
+            Issue.record("Expected compatibleAssetMissing, got \(error)")
+            return
+        }
+    }
+}
+
+@Test func updateInstallerValidatesSHA256Digest() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxDigestTest-\(UUID().uuidString)", isDirectory: true)
+    let fileURL = root.appendingPathComponent("update.zip")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("update".utf8).write(to: fileURL)
+    try LightboxUpdateInstaller.validateDigest(
+        of: fileURL,
+        expectedDigest: "sha256:2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4"
+    )
+
+    do {
+        try LightboxUpdateInstaller.validateDigest(
+            of: fileURL,
+            expectedDigest: "sha256:" + String(repeating: "0", count: 64)
+        )
+        Issue.record("Expected a digest mismatch")
+    } catch let error as UpdateInstallError {
+        guard case .digestMismatch = error else {
+            Issue.record("Expected digestMismatch, got \(error)")
+            return
+        }
+    }
+}
+
+@Test func updateInstallerValidatesBundleIdentityAndVersion() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxBundleValidationTest-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let validAppURL = try makeTestAppBundle(
+        in: root.appendingPathComponent("valid", isDirectory: true),
+        identifier: "io.github.a11oydyyy.Lightbox",
+        version: "1.4.0"
+    )
+    try LightboxUpdateInstaller.validateBundleMetadata(
+        for: validAppURL,
+        currentBundleIdentifier: "io.github.a11oydyyy.Lightbox",
+        expectedVersion: "v1.4.0"
+    )
+
+    let wrongVersionAppURL = try makeTestAppBundle(
+        in: root.appendingPathComponent("wrong-version", isDirectory: true),
+        identifier: "io.github.a11oydyyy.Lightbox",
+        version: "1.3.4"
+    )
+    do {
+        try LightboxUpdateInstaller.validateBundleMetadata(
+            for: wrongVersionAppURL,
+            currentBundleIdentifier: "io.github.a11oydyyy.Lightbox",
+            expectedVersion: "1.4.0"
+        )
+        Issue.record("Expected a staged app version mismatch")
+    } catch let error as UpdateInstallError {
+        guard case .appVersionMismatch = error else {
+            Issue.record("Expected appVersionMismatch, got \(error)")
+            return
+        }
+    }
+}
+
+@Test func updateInstallScriptRestoresCurrentAppWhenCopyFails() async throws {
+    #expect(!LightboxUpdateInstaller.installScript.contains("/usr/bin/xattr"))
+    #expect(LightboxUpdateInstaller.installScript.contains(LightboxUpdateHealth.markerArgument))
+    #expect(!LightboxUpdateInstaller.installScript.contains("MOVED_CURRENT"))
+    #expect(LightboxUpdateInstaller.installScript.contains("NEW_APP_PID=$!"))
+
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent("LightboxInstallRollbackTest-\(UUID().uuidString)", isDirectory: true)
+    let currentAppURL = root.appendingPathComponent("Lightbox.app", isDirectory: true)
+    let markerURL = currentAppURL.appendingPathComponent("marker")
+    let missingStagedAppURL = root
+        .appendingPathComponent("staging", isDirectory: true)
+        .appendingPathComponent("Lightbox.app", isDirectory: true)
+    let scriptURL = root.appendingPathComponent("install.sh")
+    defer { try? fileManager.removeItem(at: root) }
+
+    try fileManager.createDirectory(at: currentAppURL, withIntermediateDirectories: true)
+    try fileManager.createDirectory(
+        at: missingStagedAppURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try Data("original".utf8).write(to: markerURL)
+    try LightboxUpdateInstaller.installScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [scriptURL.path, currentAppURL.path, missingStagedAppURL.path, "99999999"]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+
+    #expect(process.terminationStatus != 0)
+    #expect(fileManager.fileExists(atPath: markerURL.path))
+    #expect(!fileManager.fileExists(atPath: scriptURL.path))
+    #expect(!fileManager.fileExists(atPath: missingStagedAppURL.deletingLastPathComponent().path))
+    let leftovers = try fileManager.contentsOfDirectory(atPath: root.path)
+    #expect(!leftovers.contains { $0.hasPrefix("Lightbox.app.old-") })
+}
+
+@Test func updateInstallScriptTerminatesFailedNewAppBeforeRollback() async throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent("LightboxInstallHealthTimeoutTest-\(UUID().uuidString)", isDirectory: true)
+    let currentAppURL = root.appendingPathComponent("Lightbox.app", isDirectory: true)
+    let originalMarkerURL = currentAppURL.appendingPathComponent("original")
+    let stagingRootURL = root
+        .appendingPathComponent("LightboxUpdate-\(UUID().uuidString)", isDirectory: true)
+    let stagedAppURL = stagingRootURL.appendingPathComponent("Lightbox.app", isDirectory: true)
+    let stagedContentsURL = stagedAppURL.appendingPathComponent("Contents", isDirectory: true)
+    let stagedMacOSURL = stagedContentsURL.appendingPathComponent("MacOS", isDirectory: true)
+    let stagedExecutableURL = stagedMacOSURL.appendingPathComponent("LightboxTest")
+    let launchedPIDURL = root.appendingPathComponent("launched-pid")
+    let terminatedURL = root.appendingPathComponent("terminated")
+    let scriptURL = root.appendingPathComponent("install.sh")
+    defer { try? fileManager.removeItem(at: root) }
+
+    try fileManager.createDirectory(at: currentAppURL, withIntermediateDirectories: true)
+    try Data("original".utf8).write(to: originalMarkerURL)
+    try fileManager.createDirectory(at: stagedMacOSURL, withIntermediateDirectories: true)
+    let info: [String: Any] = [
+        "CFBundleExecutable": "LightboxTest",
+        "CFBundleIdentifier": "io.github.a11oydyyy.Lightbox",
+        "CFBundlePackageType": "APPL"
+    ]
+    let infoData = try PropertyListSerialization.data(
+        fromPropertyList: info,
+        format: .xml,
+        options: 0
+    )
+    try infoData.write(to: stagedContentsURL.appendingPathComponent("Info.plist"))
+    let executable = """
+        #!/bin/sh
+        /bin/echo "$$" > "\(launchedPIDURL.path)"
+        trap '/bin/echo terminated > "\(terminatedURL.path)"; exit 0' TERM
+        while :; do
+          /bin/sleep 0.05
+        done
+        """
+    try executable.write(to: stagedExecutableURL, atomically: true, encoding: .utf8)
+    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stagedExecutableURL.path)
+    try LightboxUpdateInstaller.installScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [
+        scriptURL.path,
+        currentAppURL.path,
+        stagedAppURL.path,
+        "99999999",
+        "50",
+        "0.02"
+    ]
+    process.standardOutput = Pipe()
+    let errorPipe = Pipe()
+    process.standardError = errorPipe
+    try process.run()
+    process.waitUntilExit()
+    let installerError = String(
+        data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8
+    ) ?? ""
+
+    #expect(process.terminationStatus != 0)
+    #expect(fileManager.fileExists(atPath: originalMarkerURL.path))
+    #expect(fileManager.fileExists(atPath: terminatedURL.path), "Installer stderr: \(installerError)")
+    let launchedPIDString = try String(contentsOf: launchedPIDURL, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let launchedPID = try #require(pid_t(launchedPIDString))
+    let processCheck = kill(launchedPID, 0)
+    let processCheckError = errno
+    #expect(processCheck == -1)
+    #expect(processCheckError == ESRCH)
+    #expect(!fileManager.fileExists(atPath: scriptURL.path))
+    #expect(!fileManager.fileExists(atPath: stagingRootURL.path))
+    let leftovers = try fileManager.contentsOfDirectory(atPath: root.path)
+    #expect(!leftovers.contains { $0.hasPrefix("Lightbox.app.old-") })
+}
+
+@Test func updateHealthMarkerOnlyWritesInsidePreparedStagingRoot() async throws {
+    let fileManager = FileManager.default
+    let stagingRoot = fileManager.temporaryDirectory
+        .appendingPathComponent("LightboxUpdate-\(UUID().uuidString)", isDirectory: true)
+    let markerURL = stagingRoot.appendingPathComponent("launch-healthy")
+    let rejectedRoot = fileManager.temporaryDirectory
+        .appendingPathComponent("Untrusted-\(UUID().uuidString)", isDirectory: true)
+    let rejectedMarkerURL = rejectedRoot.appendingPathComponent("launch-healthy")
+    let symlinkDestination = fileManager.temporaryDirectory
+        .appendingPathComponent("LightboxHealthDestination-\(UUID().uuidString)", isDirectory: true)
+    let symlinkRoot = fileManager.temporaryDirectory
+        .appendingPathComponent("LightboxUpdate-\(UUID().uuidString)", isDirectory: true)
+    let symlinkMarkerURL = symlinkRoot.appendingPathComponent("launch-healthy")
+    defer {
+        try? fileManager.removeItem(at: stagingRoot)
+        try? fileManager.removeItem(at: rejectedRoot)
+        try? fileManager.removeItem(at: symlinkRoot)
+        try? fileManager.removeItem(at: symlinkDestination)
+    }
+
+    try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: rejectedRoot, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: symlinkDestination, withIntermediateDirectories: true)
+    try fileManager.createSymbolicLink(at: symlinkRoot, withDestinationURL: symlinkDestination)
+
+    #expect(LightboxUpdateHealth.isRequested(
+        arguments: ["Lightbox", LightboxUpdateHealth.markerArgument, markerURL.path]
+    ))
+    #expect(LightboxUpdateHealth.recordLaunch(
+        arguments: ["Lightbox", LightboxUpdateHealth.markerArgument, markerURL.path]
+    ))
+    #expect(fileManager.fileExists(atPath: markerURL.path))
+    #expect(!LightboxUpdateHealth.recordLaunch(
+        arguments: ["Lightbox", LightboxUpdateHealth.markerArgument, rejectedMarkerURL.path]
+    ))
+    #expect(!fileManager.fileExists(atPath: rejectedMarkerURL.path))
+    #expect(!LightboxUpdateHealth.recordLaunch(
+        arguments: ["Lightbox", LightboxUpdateHealth.markerArgument, symlinkMarkerURL.path]
+    ))
+    #expect(!fileManager.fileExists(atPath: symlinkDestination.appendingPathComponent("launch-healthy").path))
 }
 
 @Test func updateCheckerComparesSemanticVersionNumbers() async throws {
@@ -1682,17 +3234,91 @@ private func sampleReleaseData(tag: String) throws -> Data {
       "assets": [
         {
           "name": "Lightbox-Intel-x86-v1.3.1.zip",
-          "browser_download_url": "https://github.com/a11oydyyy/Lightbox/releases/download/\(tag)/Lightbox-Intel-x86-v1.3.1.zip"
+          "browser_download_url": "https://github.com/a11oydyyy/Lightbox/releases/download/\(tag)/Lightbox-Intel-x86-v1.3.1.zip",
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         },
         {
           "name": "Lightbox-v1.3.1.zip",
-          "browser_download_url": "https://github.com/a11oydyyy/Lightbox/releases/download/\(tag)/Lightbox-v1.3.1.zip"
+          "browser_download_url": "https://github.com/a11oydyyy/Lightbox/releases/download/\(tag)/Lightbox-v1.3.1.zip",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         }
       ]
     }
     """
 
     return try #require(json.data(using: .utf8))
+}
+
+private func makeTestAppBundle(in root: URL, identifier: String, version: String) throws -> URL {
+    let appURL = root.appendingPathComponent("Lightbox.app", isDirectory: true)
+    let contentsURL = appURL.appendingPathComponent("Contents", isDirectory: true)
+    try FileManager.default.createDirectory(at: contentsURL, withIntermediateDirectories: true)
+    let info: [String: Any] = [
+        "CFBundleIdentifier": identifier,
+        "CFBundleShortVersionString": version,
+        "CFBundlePackageType": "APPL"
+    ]
+    let data = try PropertyListSerialization.data(
+        fromPropertyList: info,
+        format: .xml,
+        options: 0
+    )
+    try data.write(to: contentsURL.appendingPathComponent("Info.plist"))
+    return appURL
+}
+
+@MainActor
+private func waitForLightboxState(
+    timeout: Duration = .seconds(6),
+    condition: () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if condition() {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+    return condition()
+}
+
+private let finderUserTagsAttribute = "com.apple.metadata:_kMDItemUserTags"
+
+private func writeFinderTags(_ tags: [String], to url: URL) throws {
+    let data = try PropertyListSerialization.data(
+        fromPropertyList: tags,
+        format: .binary,
+        options: 0
+    )
+    let result = data.withUnsafeBytes { buffer in
+        setxattr(url.path, finderUserTagsAttribute, buffer.baseAddress, data.count, 0, 0)
+    }
+    guard result == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
+private func readFinderTags(from url: URL) throws -> [String] {
+    let size = getxattr(url.path, finderUserTagsAttribute, nil, 0, 0, 0)
+    guard size >= 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    var data = Data(count: size)
+    let readSize = data.withUnsafeMutableBytes { buffer in
+        getxattr(url.path, finderUserTagsAttribute, buffer.baseAddress, size, 0, 0)
+    }
+    guard readSize >= 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    if readSize < data.count {
+        data.removeSubrange(readSize..<data.count)
+    }
+
+    return try #require(
+        PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String]
+    )
 }
 
 private final class LockedCounter: @unchecked Sendable {
@@ -1708,6 +3334,23 @@ private final class LockedCounter: @unchecked Sendable {
     func increment() {
         lock.lock()
         storedValue += 1
+        lock.unlock()
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func record(_ value: Bool) {
+        lock.lock()
+        storedValue = storedValue || value
         lock.unlock()
     }
 }

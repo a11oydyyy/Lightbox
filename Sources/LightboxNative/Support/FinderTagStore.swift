@@ -49,7 +49,8 @@ enum FinderTagStore {
     }
 
     static func setColorTags(_ colorTags: [String], for url: URL) -> Bool {
-        let sortedColorTags = MacColorTag.sort(colorTags.filter(MacColorTag.isColorTag))
+        let sortedColorTags = MacColorTag.sort(Array(Set(colorTags.filter(MacColorTag.isColorTag))))
+        let selectedColorTags = Set(sortedColorTags)
         let didAccess = url.startAccessingSecurityScopedResource()
         defer {
             if didAccess {
@@ -59,8 +60,26 @@ enum FinderTagStore {
 
         do {
             let existingTags = rawUserTags(for: url)
-            let nonColorTags = existingTags.filter { colorTagName(from: $0) == nil }
-            let nextTags = nonColorTags + sortedColorTags.compactMap { colorTagTokens[$0] }
+            var preservedTags: [String] = []
+            var coveredColorTags: Set<String> = []
+
+            for tag in existingTags where managedColorTagName(from: tag) == nil {
+                guard let colorName = colorCodeName(from: tag) else {
+                    preservedTags.append(tag)
+                    continue
+                }
+
+                if selectedColorTags.contains(colorName) {
+                    preservedTags.append(tag)
+                    coveredColorTags.insert(colorName)
+                } else {
+                    preservedTags.append("\(cleanTagName(tag))\n0")
+                }
+            }
+
+            let nextTags = preservedTags + sortedColorTags
+                .filter { !coveredColorTags.contains($0) }
+                .compactMap { colorTagTokens[$0] }
             try writeRawUserTags(nextTags, to: url)
             return true
         } catch {
@@ -100,7 +119,10 @@ enum FinderTagStore {
 
     private static func writeRawUserTags(_ tags: [String], to url: URL) throws {
         if tags.isEmpty {
-            removexattr(url.path, userTagsAttribute, 0)
+            let result = removexattr(url.path, userTagsAttribute, 0)
+            if result != 0, errno != ENOATTR {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
             return
         }
 
@@ -123,9 +145,8 @@ enum FinderTagStore {
 
     private static func colorTagName(from tag: String) -> String? {
         let components = tag.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        if let colorCode = components.dropFirst().first,
-           let colorName = colorCodeNames[colorCode] {
-            return colorName
+        if let colorCode = components.dropFirst().first {
+            return colorCodeNames[colorCode]
         }
 
         let cleanName = cleanTagName(tag)
@@ -134,5 +155,26 @@ enum FinderTagStore {
         }
 
         return localizedColorNames[cleanName]
+    }
+
+    private static func colorCodeName(from tag: String) -> String? {
+        let components = tag.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let colorCode = components.dropFirst().first else { return nil }
+        return colorCodeNames[colorCode]
+    }
+
+    private static func managedColorTagName(from tag: String) -> String? {
+        let components = tag.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let cleanName = cleanTagName(tag)
+        let colorName: String?
+        if MacColorTag.isColorTag(cleanName) {
+            colorName = cleanName
+        } else {
+            colorName = localizedColorNames[cleanName]
+        }
+
+        guard let colorName else { return nil }
+        guard let colorCode = components.dropFirst().first else { return colorName }
+        return colorCodeNames[colorCode] == colorName ? colorName : nil
     }
 }

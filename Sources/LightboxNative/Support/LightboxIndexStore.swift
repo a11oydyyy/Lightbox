@@ -30,10 +30,15 @@ final class LightboxIndexStore {
     private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "Index")
     private static let dimensionCacheVersion = 2
     private let databaseURL: URL
+    private let fileSignatureResolver: @Sendable (URL) -> FileContentSignature?
     private var database: OpaquePointer?
 
-    init(databaseURL: URL = LightboxLibraryStore.indexDatabaseURL) {
+    init(
+        databaseURL: URL = LightboxLibraryStore.indexDatabaseURL,
+        fileSignatureResolver: @escaping @Sendable (URL) -> FileContentSignature? = { FileContentSignature(url: $0) }
+    ) {
         self.databaseURL = databaseURL
+        self.fileSignatureResolver = fileSignatureResolver
         openDatabase()
         prepareSchema()
     }
@@ -105,6 +110,7 @@ final class LightboxIndexStore {
                 isDirectory: true,
                 fileSize: nil,
                 mtime: mtime,
+                addedAt: nil,
                 width: nil,
                 height: nil,
                 tags: folder.tags
@@ -121,8 +127,9 @@ final class LightboxIndexStore {
             }
             guard let url = asset.sourceURL else { continue }
             let resourceStartedAt = Date()
-            let size = fileSize(for: url)
-            let mtime = modificationTime(for: url)
+            let signature = fileSignature(for: url)
+            let size = signature?.fileSize
+            let mtime = signature.map { Date(timeIntervalSince1970: $0.modificationTime) }
             assetResourceSeconds += Date().timeIntervalSince(resourceStartedAt)
             insertItem(
                 id: "\(source.id):\(url.standardizedFileURL.path)",
@@ -133,6 +140,7 @@ final class LightboxIndexStore {
                 isDirectory: false,
                 fileSize: size,
                 mtime: mtime,
+                addedAt: asset.addedAt,
                 width: asset.metadataLoaded ? Double(asset.width) : nil,
                 height: asset.metadataLoaded ? Double(asset.height) : nil,
                 tags: asset.tags,
@@ -150,8 +158,12 @@ final class LightboxIndexStore {
 
     func cachedDimensions(sourceID: String, parentPath: String) -> [String: CachedAssetDimensions] {
         let startedAt = Date()
+        guard !Task.isCancelled else {
+            Self.logger.info("index dimensions skipped cancelled-before-start source=\(sourceID, privacy: .public) parent=\(parentPath, privacy: .public)")
+            return [:]
+        }
         let sql = """
-        SELECT path, width, height
+        SELECT path, width, height, mtime, file_size
         FROM items
         WHERE source_id = ?
           AND parent_path = ?
@@ -168,15 +180,33 @@ final class LightboxIndexStore {
             bindText(parentPath, to: statement, at: 2)
             sqlite3_bind_int(statement, 3, Int32(Self.dimensionCacheVersion))
 
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while !Task.isCancelled, sqlite3_step(statement) == SQLITE_ROW {
+                guard !Task.isCancelled else { break }
                 guard let path = columnText(statement, at: 0) else { continue }
                 let width = CGFloat(sqlite3_column_double(statement, 1))
                 let height = CGFloat(sqlite3_column_double(statement, 2))
-                guard width > 0, height > 0 else { continue }
+                let indexedSignature = FileContentSignature(
+                    modificationTime: nullableDouble(statement, at: 3),
+                    fileSize: nullableInt64(statement, at: 4)
+                )
+                guard width > 0,
+                      height > 0,
+                      let indexedSignature
+                else {
+                    continue
+                }
+                guard !Task.isCancelled else { break }
+                let currentSignature = fileSignatureResolver(URL(fileURLWithPath: path))
+                guard !Task.isCancelled else { break }
+                guard currentSignature?.matchesModificationMetadata(indexedSignature) == true else { continue }
                 dimensions[path] = CachedAssetDimensions(width: width, height: height)
             }
         }
 
+        guard !Task.isCancelled else {
+            Self.logger.info("index dimensions cancelled source=\(sourceID, privacy: .public) parent=\(parentPath, privacy: .public) completed=\(dimensions.count)")
+            return [:]
+        }
         Self.logger.info("index dimensions read source=\(sourceID, privacy: .public) parent=\(parentPath, privacy: .public) count=\(dimensions.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
         return dimensions
     }
@@ -185,7 +215,7 @@ final class LightboxIndexStore {
         let startedAt = Date()
         let folderPath = folderURL.standardizedFileURL.path
         let sql = """
-        SELECT path, is_directory, file_size, mtime, width, height, tags, metadata_loaded
+        SELECT path, is_directory, file_size, mtime, added_at, tags
         FROM items
         WHERE source_id = ?
           AND parent_path = ?
@@ -201,7 +231,7 @@ final class LightboxIndexStore {
             while sqlite3_step(statement) == SQLITE_ROW {
                 guard let path = columnText(statement, at: 0) else { continue }
                 let url = URL(fileURLWithPath: path)
-                let tags = Self.decodedTags(columnText(statement, at: 6) ?? "")
+                let tags = Self.decodedTags(columnText(statement, at: 5) ?? "")
                 let isDirectory = sqlite3_column_int(statement, 1) == 1
                 if isDirectory {
                     folders.append(LibraryFolderEntry(
@@ -213,21 +243,19 @@ final class LightboxIndexStore {
                     continue
                 }
 
-                let width = nullableDouble(statement, at: 4).map { CGFloat($0) }
-                let height = nullableDouble(statement, at: 5).map { CGFloat($0) }
-                let metadataLoaded = sqlite3_column_int(statement, 7) == 1
-                    && (width ?? 0) > 0
-                    && (height ?? 0) > 0
                 assets.append(LightboxAsset(
                     originalName: url.lastPathComponent,
-                    width: metadataLoaded ? width ?? 1 : 1,
-                    height: metadataLoaded ? height ?? 1 : 1,
+                    width: 1,
+                    height: 1,
                     tags: tags,
                     sourceURL: url,
-                    addedAt: nullableDate(statement, at: 3) ?? .distantPast,
+                    addedAt: nullableDate(statement, at: 4)
+                        ?? nullableDate(statement, at: 3)
+                        ?? .distantPast,
+                    contentModifiedAt: nullableDate(statement, at: 3),
                     fileSize: nullableInt64(statement, at: 2),
                     palette: MockPalette.imported[assets.count % MockPalette.imported.count],
-                    metadataLoaded: metadataLoaded
+                    metadataLoaded: false
                 ))
             }
         }
@@ -339,6 +367,7 @@ final class LightboxIndexStore {
             parent_path TEXT NOT NULL,
             is_directory INTEGER NOT NULL,
             mtime REAL,
+            added_at REAL,
             file_size INTEGER,
             width REAL,
             height REAL,
@@ -366,6 +395,12 @@ final class LightboxIndexStore {
                 context: "schema add tags"
             )
         }
+        if !table("items", hasColumn: "added_at") {
+            exec(
+                "ALTER TABLE items ADD COLUMN added_at REAL;",
+                context: "schema add added_at"
+            )
+        }
 
         exec("CREATE INDEX IF NOT EXISTS idx_items_source_parent ON items(source_id, parent_path);")
         exec("CREATE INDEX IF NOT EXISTS idx_items_source_relative ON items(source_id, relative_path);")
@@ -388,6 +423,7 @@ final class LightboxIndexStore {
         isDirectory: Bool,
         fileSize: Int64?,
         mtime: Date?,
+        addedAt: Date?,
         width: Double?,
         height: Double?,
         tags: [String],
@@ -396,15 +432,16 @@ final class LightboxIndexStore {
         let sql = """
         INSERT INTO items (
             id, source_id, path, relative_path, parent_path, is_directory,
-            mtime, file_size, width, height, tags, metadata_loaded, dimension_version, indexed_at
+            mtime, added_at, file_size, width, height, tags, metadata_loaded, dimension_version, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             path = excluded.path,
             relative_path = excluded.relative_path,
             parent_path = excluded.parent_path,
             is_directory = excluded.is_directory,
             mtime = excluded.mtime,
+            added_at = excluded.added_at,
             file_size = excluded.file_size,
             width = excluded.width,
             height = excluded.height,
@@ -422,13 +459,14 @@ final class LightboxIndexStore {
             bindText(parentPath, to: statement, at: 5)
             sqlite3_bind_int(statement, 6, isDirectory ? 1 : 0)
             bindDate(mtime, to: statement, at: 7)
-            bindInt64(fileSize, to: statement, at: 8)
-            bindDouble(width, to: statement, at: 9)
-            bindDouble(height, to: statement, at: 10)
-            bindText(Self.encodedTags(tags), to: statement, at: 11)
-            sqlite3_bind_int(statement, 12, metadataLoaded ? 1 : 0)
-            sqlite3_bind_int(statement, 13, metadataLoaded ? Int32(Self.dimensionCacheVersion) : 0)
-            sqlite3_bind_double(statement, 14, Date().timeIntervalSince1970)
+            bindDate(addedAt, to: statement, at: 8)
+            bindInt64(fileSize, to: statement, at: 9)
+            bindDouble(width, to: statement, at: 10)
+            bindDouble(height, to: statement, at: 11)
+            bindText(Self.encodedTags(tags), to: statement, at: 12)
+            sqlite3_bind_int(statement, 13, metadataLoaded ? 1 : 0)
+            sqlite3_bind_int(statement, 14, metadataLoaded ? Int32(Self.dimensionCacheVersion) : 0)
+            sqlite3_bind_double(statement, 15, Date().timeIntervalSince1970)
             stepDone(statement, context: "insert item")
         }
     }
@@ -561,12 +599,8 @@ final class LightboxIndexStore {
         try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
 
-    private func fileSize(for url: URL) -> Int64? {
-        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
-            return nil
-        }
-
-        return Int64(size)
+    private func fileSignature(for url: URL) -> FileContentSignature? {
+        fileSignatureResolver(url)
     }
 
     private func columnText(_ statement: OpaquePointer?, at index: Int32) -> String? {
