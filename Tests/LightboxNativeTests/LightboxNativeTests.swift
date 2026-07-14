@@ -1017,6 +1017,18 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
     #expect(ImageCacheQuality.thumbnail.maxPixelSize >= 1024)
 }
 
+@Test @MainActor func assetImageDisplayStateKeepsThumbnailDuringQualityUpgrade() throws {
+    let assetID = "file:/tmp/lightbox-preview-upgrade.jpg"
+    let thumbnail = try #require(makeTestImage(size: 8))
+    var state = AssetImageDisplayState(assetID: assetID, image: thumbnail)
+
+    state.prepare(for: assetID, seed: nil)
+    #expect(state.image === thumbnail)
+
+    state.applyDecoded(nil, for: assetID)
+    #expect(state.image === thumbnail)
+}
+
 @Test @MainActor func imageCacheCoalescesDuplicateRequests() async throws {
     let decodeCounter = LockedCounter()
     let cache = ImageCache { _, _ in
@@ -1225,6 +1237,45 @@ private func previewRouteAsset(id: String, name: String, addedAt: TimeInterval) 
 
     #expect(cache.bestCachedImage(for: missingURL, quality: .preview) == nil)
     #expect(signatureResolveCounter.value == 1)
+}
+
+@Test @MainActor func imageCacheKeepsDecodedThumbnailReachableThroughKnownSignature() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+    let image = try #require(makeTestImage(size: 12))
+    let knownSignature = FileContentSignature(modificationTime: 100, fileSize: 200)
+    let resolvedSignature = FileContentSignature(
+        modificationTime: 100,
+        fileSize: 200,
+        fileSystemIdentifier: "1:2",
+        statusChangeTime: 101
+    )
+    let cache = ImageCache(
+        diskCache: ThumbnailDiskCache(folder: root.appendingPathComponent("thumbnails", isDirectory: true)),
+        decodeImage: { _, _ in image },
+        fileSignature: { _ in resolvedSignature }
+    )
+    let url = root.appendingPathComponent("source.jpg")
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(
+            for: url,
+            quality: .thumbnail,
+            knownFileSignature: knownSignature
+        ) { decodedImage in
+            #expect(decodedImage?.size.width == 12)
+            continuation.resume()
+        }
+    }
+
+    #expect(cache.bestCachedImage(
+        for: url,
+        quality: .preview,
+        knownFileSignature: knownSignature
+    )?.size.width == 12)
 }
 
 @Test @MainActor func assetImageRequestIdentityUsesContentModificationTimeInsteadOfAddedDate() async throws {

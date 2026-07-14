@@ -272,6 +272,9 @@ final class ImageCache: @unchecked Sendable {
                 let image = decodeResult.image
                 if let image {
                     self.store(image, forKey: decodeResult.resolvedKey, quality: quality)
+                    if decodeResult.resolvedKey != pendingKey {
+                        self.store(image, forKey: pendingKey, quality: quality)
+                    }
                 }
                 let completions = self.finishPendingDecode(
                     key: pendingKey,
