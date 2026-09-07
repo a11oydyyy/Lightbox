@@ -3,14 +3,8 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var appState: AppState
-    @AppStorage(LightboxGlowColor.modeKey) private var glowModeRaw = LightboxGlowColor.systemMode
-    @AppStorage(LightboxGlowColor.hexKey) private var glowHex = ""
-    @State private var customGlowColor = Color.accentColor
-    @State private var updateState = UpdateState.idle
-
-    private var opacityPercent: Int {
-        Int((appState.glassOpacity * 100).rounded())
-    }
+    @ObservedObject private var updater = LightboxUpdateController.shared
+    private var updateState: UpdateState { updater.updateState }
 
     var body: some View {
         Form {
@@ -22,55 +16,7 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text(appState.localized(.liquidGlassOpacity))
-                        Spacer()
-                        Text("\(opacityPercent)%")
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                    }
 
-                    Slider(
-                        value: Binding(
-                            get: { appState.glassOpacity },
-                            set: { appState.glassOpacity = $0 }
-                        ),
-                        in: LightboxSettingsStore.glassOpacityRange
-                    )
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(appState.localized(.hoverGlow))
-
-                    Picker(appState.localized(.hoverGlow), selection: $glowModeRaw) {
-                        Text(appState.localized(.system)).tag(LightboxGlowColor.systemMode)
-                        Text(appState.localized(.custom)).tag(LightboxGlowColor.customMode)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-
-                    if glowModeRaw == LightboxGlowColor.customMode {
-                        HStack {
-                            Text(appState.localized(.customColor))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            ColorPicker("", selection: $customGlowColor, supportsOpacity: false)
-                                .labelsHidden()
-                                .onAppear {
-                                    syncCustomGlowColorFromStorage()
-                                }
-                                .onChange(of: customGlowColor) { color in
-                                    glowHex = LightboxGlowColor.hex(from: color)
-                                }
-                                .onChange(of: glowModeRaw) { mode in
-                                    if mode == LightboxGlowColor.customMode {
-                                        syncCustomGlowColorFromStorage()
-                                    }
-                                }
-                        }
-                    }
-                }
             }
 
             Section(appState.localized(.language)) {
@@ -78,6 +24,7 @@ struct SettingsView: View {
                     Text(appState.localized(.system)).tag(LightboxLanguage.system)
                     Text(appState.localized(.english)).tag(LightboxLanguage.english)
                     Text(appState.localized(.simplifiedChinese)).tag(LightboxLanguage.simplifiedChinese)
+                    Text(appState.localized(.traditionalChinese)).tag(LightboxLanguage.traditionalChinese)
                     Text(appState.localized(.japanese)).tag(LightboxLanguage.japanese)
                 }
                 .pickerStyle(.menu)
@@ -103,6 +50,7 @@ struct SettingsView: View {
                 }
 
                 Toggle(appState.localized(.showFolderCards), isOn: $appState.showFolderCards)
+                Toggle(appState.localized(.showHiddenFiles), isOn: $appState.showsHiddenItems)
 
                 SidebarLocationToggle(
                     title: appState.localized(.showApplications),
@@ -160,12 +108,39 @@ struct SettingsView: View {
                 .padding(.vertical, 2)
 
                 SettingsInfoRow(title: appState.localized(.version), value: appVersion)
-                SettingsInfoRow(title: appState.localized(.github), value: appState.localized(.githubReserved))
+                HStack {
+                    Text(appState.localized(.github))
+                    Spacer()
+                    Link("a11oydyyy/Lightbox", destination: LightboxUpdateChecker.repositoryURL)
+                }
+                HStack {
+                    Link(appState.localized(.releaseNotes), destination: LightboxUpdateChecker.releasesURL)
+                    Spacer()
+                    Link(appState.localized(.reportIssue), destination: LightboxUpdateChecker.issuesURL)
+                }
+            }
+
+            Section(appState.localized(.updates)) {
+                Toggle(appState.localized(.automaticallyCheckUpdates), isOn: $updater.automaticallyChecksForUpdates)
+                    .onChange(of: updater.automaticallyChecksForUpdates) { enabled in
+                        if enabled { Task { await updater.checkAutomatically(appState: appState) } }
+                    }
+                Text(appState.localized(.automaticUpdateHelp))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let date = updater.lastChecked {
+                    HStack {
+                        Text(appState.localized(.lastUpdateCheck))
+                        Spacer()
+                        Text(date, format: .dateTime.month().day().hour().minute())
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 SettingsInfoRow(title: appState.localized(.updates), value: updateStatusText)
 
                 Button {
                     Task {
-                        await checkForUpdates()
+                        await updater.checkForUpdates(appState: appState)
                     }
                 } label: {
                     HStack(spacing: 7) {
@@ -181,7 +156,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding(18)
-        .frame(width: 440)
+        .frame(width: 480, height: 660)
         .environment(\.lightboxGlassOpacity, appState.glassOpacity)
         .preferredColorScheme(appState.preferredColorScheme)
     }
@@ -199,10 +174,6 @@ struct SettingsView: View {
         default:
             return "Development"
         }
-    }
-
-    private func syncCustomGlowColorFromStorage() {
-        customGlowColor = LightboxGlowColor.color(fromHex: glowHex) ?? .accentColor
     }
 
     private var updateStatusText: String {
@@ -224,99 +195,6 @@ struct SettingsView: View {
         }
     }
 
-    @MainActor
-    private func checkForUpdates() async {
-        updateState = .checking
-
-        do {
-            let result = try await LightboxUpdateChecker.checkLatestRelease()
-            switch result {
-            case let .updateAvailable(version, _, assetURL, digest):
-                updateState = .available(version)
-                guard confirmUpdateInstall(version: version) else { return }
-                await installUpdate(
-                    from: assetURL,
-                    expectedDigest: digest,
-                    expectedVersion: version
-                )
-            case let .upToDate(version, _):
-                updateState = .upToDate(version)
-                showInfoAlert(
-                    title: appState.localized(.alreadyUpToDate),
-                    message: String(format: appState.localized(.alreadyUpToDateMessage), version)
-                )
-            }
-        } catch {
-            updateState = .failed
-            showInfoAlert(
-                title: appState.localized(.updateCheckFailed),
-                message: error.localizedDescription
-            )
-        }
-    }
-
-    @MainActor
-    private func installUpdate(
-        from assetURL: URL,
-        expectedDigest: String,
-        expectedVersion: String
-    ) async {
-        do {
-            updateState = .downloading
-            let stagedAppURL = try await LightboxUpdateInstaller.prepareUpdate(
-                from: assetURL,
-                expectedDigest: expectedDigest
-            )
-            updateState = .installing
-            try LightboxUpdateInstaller.installPreparedUpdate(
-                stagedAppURL,
-                expectedVersion: expectedVersion
-            )
-            NSApplication.shared.terminate(nil)
-        } catch {
-            updateState = .failed
-            showInfoAlert(
-                title: appState.localized(.updateCheckFailed),
-                message: error.localizedDescription
-            )
-        }
-    }
-
-    private func confirmUpdateInstall(version: String) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = appState.localized(.updateAvailable)
-        alert.informativeText = String(format: appState.localized(.updateAvailableMessage), version)
-        alert.addButton(withTitle: appState.localized(.installUpdate))
-        alert.addButton(withTitle: appState.localized(.close))
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    private func showInfoAlert(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: appState.localized(.close))
-        alert.runModal()
-    }
-}
-
-private enum UpdateState: Equatable {
-    case idle
-    case checking
-    case downloading
-    case installing
-    case available(String)
-    case upToDate(String)
-    case failed
-
-    var isBusy: Bool {
-        switch self {
-        case .checking, .downloading, .installing:
-            return true
-        case .idle, .available, .upToDate, .failed:
-            return false
-        }
-    }
 }
 
 private struct SidebarLocationToggle: View {
@@ -377,11 +255,6 @@ private struct SettingsAppIconView: View {
         Image(nsImage: NSApplication.shared.applicationIconImage)
             .resizable()
             .aspectRatio(contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    .stroke(.white.opacity(0.32), lineWidth: 0.8)
-            }
             .shadow(color: .black.opacity(0.14), radius: 7, y: 3)
     }
 }

@@ -32,6 +32,12 @@ struct LightboxClickContext {
         CGPoint(x: windowLocation.x, y: windowSize.height - windowLocation.y)
     }
 
+    var windowTopLeftFrame: CGRect {
+        CGRect(x: windowTopLeftLocation.x - localTopLeftLocation.x,
+               y: windowTopLeftLocation.y - localTopLeftLocation.y,
+               width: bounds.width, height: bounds.height)
+    }
+
     func mappedTopLeftPoint(in frame: CGRect?) -> CGPoint? {
         guard let frame,
               bounds.width > 0,

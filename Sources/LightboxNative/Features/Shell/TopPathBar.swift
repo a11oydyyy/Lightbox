@@ -1,12 +1,25 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TopPathBar: View {
+    var selectionOnly = false
+    var windowLeadingInset: CGFloat = 152
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var isSearchFocused: Bool
+    @FocusState private var isPathFocused: Bool
+    @FocusState private var focusedUtility: TopBarUtility?
     @State private var isSearchExpanded = false
     @State private var isSortMenuPresented = false
+    @State private var isTabSwitcherPresented = false
+    @State private var isPathEditing = false
+    @State private var pathInput = ""
+    @State private var pathInputHasError = false
+    private enum TopBarUtility: Hashable {
+        case search, sort
+    }
+
     private static let selectionLeadingInset: CGFloat = 9
     private static let selectionTrailingInset: CGFloat = 13
     private static let collapsedSearchWidth: CGFloat = 36
@@ -14,65 +27,62 @@ struct TopPathBar: View {
     private static let searchTextFieldWidth: CGFloat = 142
 
     private var isSelecting: Bool {
-        appState.selectedAssetCount > 1
-    }
-
-    private var topBarShadowOpacity: Double {
-        GlassTokens.floatingCapsuleShadowOpacity(appState.glassOpacity)
+        selectionOnly || appState.selectedAssetCount > 1
     }
 
     var body: some View {
         GeometryReader { proxy in
-            let availableWidth = max(0, proxy.size.width - 56)
-            let sidebarWidth: CGFloat = isSelecting ? 0 : 36
-            let sidebarGap: CGFloat = isSelecting ? 0 : 8
-            let leadingControlsWidth = sidebarWidth + sidebarGap
-            let searchWidth: CGFloat = isSearchExpanded ? Self.expandedSearchWidth : Self.collapsedSearchWidth
-            let searchGap: CGFloat = 8
-            let sortWidth: CGFloat = 36
-            let sortGap: CGFloat = 8
-            let trailingControlsWidth = searchGap + searchWidth + sortGap + sortWidth
-            let pathOffset = (leadingControlsWidth - trailingControlsWidth) / 2
-            let maxPathWidth = max(270, availableWidth - leadingControlsWidth - trailingControlsWidth)
-            let minPathWidth: CGFloat = appState.isViewingTrash ? idealPathWidth : 270
-            let pathWidth = min(max(minPathWidth, idealPathWidth), maxPathWidth)
-            let selectionWidth = min(max(360, idealSelectionWidth), availableWidth)
-            let primaryWidth = isSelecting ? selectionWidth : pathWidth
-            let primaryOffset = isSelecting ? CGFloat.zero : pathOffset
-            let sidebarOffset = primaryOffset - pathWidth / 2 - sidebarGap - sidebarWidth / 2
-            let searchOffset = pathOffset + pathWidth / 2 + searchGap + searchWidth / 2
-            let sortOffset = searchOffset + searchWidth / 2 + sortGap + sortWidth / 2
-
-            GlassGroup(spacing: 8) {
-                ZStack {
-                    if !isSelecting {
-                        sidebarCapsule
-                            .offset(x: sidebarOffset)
-                    }
-
-                    primaryCapsule(width: primaryWidth, isSelecting: isSelecting)
-                        .offset(x: primaryOffset)
-                        .frame(maxWidth: .infinity, alignment: .center)
-
-                    if !isSelecting {
+            let galleryInset: CGFloat = appState.sidebarCollapsed ? 0 : appState.sidebarWidth + 18
+            let leadingControlsInset = max(0, galleryInset - windowLeadingInset)
+            let center = (proxy.size.width + windowLeadingInset + 16 + galleryInset) / 2 - windowLeadingInset
+            let trailingWidth = (isSearchExpanded ? Self.expandedSearchWidth : 36) + 60 + (appState.fileTransferProgress == nil ? 0 : 44)
+            let titleWidth = max(40, 2 * min(center - leadingControlsInset - 140, proxy.size.width - trailingWidth - center) - 16)
+            ZStack {
+                if isSelecting {
+                    primaryCapsule(width: max(0, proxy.size.width - 32), isSelecting: true)
+                } else {
+                    pathContent
+                        .frame(width: titleWidth)
+                        .offset(x: center - proxy.size.width / 2)
+                    HStack(spacing: 8) {
+                        navigationControls
+                            .padding(.leading, leadingControlsInset)
+                        NativeToolbarButton(symbol: "rectangle.on.rectangle", title: appState.localized(.tabs)) {
+                            isTabSwitcherPresented.toggle()
+                        }
+                        .frame(width: 32, height: 32)
+                        .popover(isPresented: $isTabSwitcherPresented) {
+                            TabStrip().frame(width: 380, height: 36).padding(12)
+                        }
+                        Spacer(minLength: 0)
                         searchCapsule
-                            .offset(x: searchOffset)
-
                         sortCapsule
-                            .offset(x: sortOffset)
+                        if let progress = appState.fileTransferProgress {
+                            FileTransferControl(progress: progress)
+                        }
                     }
+                    .padding(.horizontal, 16)
                 }
-                .frame(width: availableWidth)
             }
-            .frame(maxWidth: availableWidth)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(height: 40)
+        .frame(height: 44)
         .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.currentPathTitle)
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.breadcrumbs)
+        .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.tabs.map(\.id))
+        .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.activeTabID)
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: isSearchExpanded)
         .onChange(of: appState.searchFocusGeneration) { _ in
+            guard !selectionOnly else { return }
+            cancelPathEditing()
             expandSearch()
+        }
+        .onChange(of: appState.goToFolderFocusGeneration) { _ in
+            guard !selectionOnly else { return }
+            beginPathEditing()
+        }
+        .onChange(of: appState.activeTabID) { _ in
+            cancelPathEditing()
         }
     }
 
@@ -92,10 +102,17 @@ struct TopPathBar: View {
         }
             .frame(width: width, height: 36, alignment: .leading)
             .clipped()
-            .topBarGlass(Capsule())
-            .shadow(color: .black.opacity(topBarShadowOpacity), radius: 8, y: 3)
+
             .contextMenu {
                 if !isSelecting {
+                    Button {
+                        beginPathEditing()
+                    } label: {
+                        Text(appState.localized(.goToFolder))
+                    }
+
+                    Divider()
+
                     Button {
                         appState.pinCurrentPath()
                     } label: {
@@ -121,110 +138,117 @@ struct TopPathBar: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
             .opacity(isVisible ? 1 : 0)
             .offset(y: isVisible || reduceMotion ? 0 : 1.5)
-            .animation(MotionTokens.ifAllowed(.easeOut(duration: 0.12), reduceMotion: reduceMotion), value: isVisible)
+            .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: isVisible)
             .allowsHitTesting(isVisible)
     }
 
-    private var pathContent: some View {
-        HStack(spacing: 8) {
-            if appState.isViewingTrash {
-                Image(systemName: "trash")
-                    .font(.system(size: 12, weight: .semibold))
-                    .symbolRenderingMode(.hierarchical)
+    private var navigationControls: some View {
+            HStack(spacing: 2) {
+                navigationButton(
+                    systemName: "chevron.left",
+                    isEnabled: appState.canGoBack,
+                    help: appState.localized(.goBack),
+                    action: appState.goBack
+                )
+                navigationButton(
+                    systemName: "chevron.right",
+                    isEnabled: appState.canGoForward,
+                    help: appState.localized(.goForward),
+                    action: appState.goForward
+                )
+                navigationButton(
+                    systemName: "chevron.up",
+                    isEnabled: appState.canOpenParentFolder,
+                    help: appState.localized(.goToParentFolder),
+                    action: appState.openParentFolder
+                )
+            }
+            .fixedSize(horizontal: true, vertical: false)
 
+    }
+
+    private var pathContent: some View {
+        Group {
+            if isPathEditing {
+                pathEditor
+                    .layoutPriority(2)
+            } else if appState.isViewingTrash {
                 Text(appState.localized(.trash))
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(TopPathBarColor.strongText)
                     .lineLimit(1)
             } else {
-                Button {
-                    appState.openParentFolder()
-                } label: {
-                    Image(systemName: "chevron.up")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(appState.canOpenParentFolder ? TopPathBarColor.regularText : TopPathBarColor.disabledText)
-                        .frame(width: 24, height: 26)
-                        .contentShape(Capsule())
-                }
-                .disabled(!appState.canOpenParentFolder)
-                .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.025, glowOpacity: 0.12))
-                .help(appState.localized(.goToParentFolder))
-
-                Capsule()
-                    .fill(TopPathBarColor.divider)
-                    .frame(width: 1, height: 17)
-
-                BreadcrumbStrip()
+                BreadcrumbStrip(editPath: beginPathEditing)
                     .layoutPriority(1)
-                    // Fade the breadcrumb content in place on path change so
-                    // going up a level doesn't hard-swap the "…"/crumbs while the
-                    // capsule width eases independently.
+                    // Keep location changes visually stable inside the centered title.
                     .id(appState.currentFolderURL.standardizedFileURL.path)
                     .transition(.opacity)
+                    .onTapGesture(count: 2) {
+                        beginPathEditing()
+                    }
             }
         }
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
-    private var idealPathWidth: CGFloat {
-        if appState.isViewingTrash {
-            return Self.measuredTrashPathWidth(title: appState.localized(.trash))
+        .frame(maxWidth: .infinity, alignment: .center)
+        .contextMenu {
+            Button(appState.localized(.goToFolder), action: beginPathEditing)
+            Button(appState.localized(.copyPath), action: appState.copyCurrentPathToClipboard)
+            Button(appState.localized(.pinCurrentPath), action: appState.pinCurrentPath)
+                .disabled(!appState.canPinCurrentPath)
         }
-
-        return Self.measuredPathContentWidth(
-            breadcrumbs: appState.breadcrumbs
-        )
     }
 
-    private var sidebarCapsule: some View {
-        Button {
-            withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
-                appState.sidebarCollapsed.toggle()
+    private var pathEditor: some View {
+        HStack(spacing: 4) {
+            TextField(appState.localized(.folderPathPlaceholder), text: $pathInput)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(TopPathBarColor.strongText)
+                .focused($isPathFocused)
+                .onSubmit(submitPathInput)
+                .onExitCommand(perform: cancelPathEditing)
+                .padding(.horizontal, 7)
+                .frame(height: 26)
+                .background {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.primary.opacity(0.045))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(
+                            pathInputHasError ? Color.red.opacity(0.72) : Color.accentColor.opacity(0.34),
+                            lineWidth: 0.8
+                        )
+                }
+                .accessibilityLabel(appState.localized(.folderPathPlaceholder))
+
+            if pathInputHasError {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.red)
+                    .help(appState.localized(.folderUnavailable))
+                    .accessibilityLabel(appState.localized(.folderUnavailable))
             }
-        } label: {
-            Image(systemName: "sidebar.left")
-                .font(.system(size: 13, weight: .semibold))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(TopPathBarColor.regularText)
-                .frame(width: 26, height: 26)
-                .contentShape(Circle())
+
+            Button(action: submitPathInput) {
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(TopPathBarColor.regularText)
+                    .frame(width: 24, height: 26)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+            .help(appState.localized(.goToFolder))
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.035, glowOpacity: 0.16))
-        .padding(5)
-        .frame(width: 36, height: 36)
-        .topBarGlass(Capsule())
-        .shadow(color: .black.opacity(topBarShadowOpacity), radius: 8, y: 3)
-        .help(appState.localized(appState.sidebarCollapsed ? .openSidebar : .closeSidebar))
     }
 
-    private var idealSelectionWidth: CGFloat {
-        Self.measuredSelectionContentWidth(
-            countTitle: appState.selectedCountText(appState.selectedAssetCount),
-            compareTitle: appState.localized(.compare),
-            clearTitle: appState.localized(.clear)
-        )
-    }
-
-    private static func measuredTrashPathWidth(title: String) -> CGFloat {
-        let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        let textWidth = ceil((title as NSString).size(withAttributes: [.font: font]).width)
-        let iconWidth: CGFloat = 14
-        let contentSpacing: CGFloat = 8
-        let horizontalPadding: CGFloat = 16
-        return ceil(iconWidth + contentSpacing + textWidth + horizontalPadding)
-    }
-
-    private static func measuredSelectionContentWidth(countTitle: String, compareTitle: String, clearTitle: String) -> CGFloat {
-        let countWidth = textWidth(countTitle, font: .systemFont(ofSize: 11, weight: .semibold))
-        let compareWidth = selectionActionWidth(compareTitle)
-        let clearWidth = selectionActionWidth(clearTitle)
-        let tagStripWidth = MacTagDotMetrics.selectionStripWidth
-        let dividerWidth: CGFloat = 2
-        let hstackSpacing: CGFloat = 5 * 8
-        let horizontalPadding: CGFloat = selectionLeadingInset + selectionTrailingInset
-        let safetyPadding: CGFloat = 6
-
-        return ceil(countWidth + compareWidth + clearWidth + tagStripWidth + dividerWidth + hstackSpacing + horizontalPadding + safetyPadding)
+    private func navigationButton(
+        systemName: String,
+        isEnabled: Bool,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        NativeToolbarButton(symbol: systemName, title: help, isEnabled: isEnabled, action: action)
+            .frame(width: 28, height: 32)
     }
 
     private static func selectionActionWidth(_ title: String) -> CGFloat {
@@ -234,20 +258,12 @@ struct TopPathBar: View {
 
     private var searchCapsule: some View {
         HStack(spacing: 7) {
-            Button {
-                expandSearch()
-            } label: {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(appState.searchText.isEmpty ? TopPathBarColor.regularText : TopPathBarColor.strongText)
-                    .frame(width: 26, height: 26)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.035, glowOpacity: 0.14))
+            NativeToolbarButton(symbol: "magnifyingglass", title: appState.localized(.search), action: expandSearch)
+                .frame(width: 26, height: 32)
 
             if isSearchExpanded {
                 TextField(appState.localized(.search), text: $appState.searchText)
-                    .textFieldStyle(.plain)
+                    .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(TopPathBarColor.strongText)
                     .focused($isSearchFocused)
@@ -265,7 +281,7 @@ struct TopPathBar: View {
                         .frame(width: 22, height: 26)
                         .contentShape(Circle())
                 }
-                .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.035, glowOpacity: 0.12))
+                .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
                 .transition(.opacity)
             }
         }
@@ -273,32 +289,24 @@ struct TopPathBar: View {
         .padding(.trailing, isSearchExpanded ? 7 : 5)
         .frame(height: 36)
         .frame(width: isSearchExpanded ? Self.expandedSearchWidth : Self.collapsedSearchWidth)
-        .topBarGlass(Capsule())
-        .shadow(color: .black.opacity(topBarShadowOpacity), radius: 8, y: 3)
+        .topBarUtilitySurface(isActive: isSearchExpanded || focusedUtility == .search)
     }
 
     private var sortCapsule: some View {
-        Button {
-            withAnimation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion)) {
-                isSortMenuPresented.toggle()
-            }
-        } label: {
-            SortOrderIcon(direction: appState.sortDirection)
-                .foregroundStyle(TopPathBarColor.regularText)
-                .frame(width: 26, height: 26)
-                .contentShape(Circle())
+        NativeToolbarButton(symbol: "line.3.horizontal.decrease", title: appState.localized(.sort)) {
+            isSortMenuPresented.toggle()
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.035, glowOpacity: 0.14))
         .popover(isPresented: $isSortMenuPresented, arrowEdge: .bottom) {
             SortPopover {
                 isSortMenuPresented = false
             }
             .environmentObject(appState)
+        .tint(LightboxColorTokens.accent)
+        .accentColor(LightboxColorTokens.accent)
         }
-        .padding(5)
         .frame(width: 36, height: 36)
-        .topBarGlass(Capsule())
-        .shadow(color: .black.opacity(topBarShadowOpacity), radius: 8, y: 3)
+        .focused($focusedUtility, equals: .sort)
+        .topBarUtilitySurface(isActive: isSortMenuPresented || focusedUtility == .sort)
         .help(appState.localized(.sort))
     }
 
@@ -321,6 +329,35 @@ struct TopPathBar: View {
         } else {
             appState.searchText = ""
         }
+    }
+
+    private func beginPathEditing() {
+        if isSelecting {
+            appState.clearSelection()
+        }
+        isSearchFocused = false
+        pathInput = appState.currentFolderURL.standardizedFileURL.path
+        pathInputHasError = false
+        isPathEditing = true
+        DispatchQueue.main.async {
+            isPathFocused = true
+        }
+    }
+
+    private func cancelPathEditing() {
+        guard isPathEditing else { return }
+        isPathEditing = false
+        isPathFocused = false
+        pathInputHasError = false
+    }
+
+    private func submitPathInput() {
+        guard appState.openFolderPath(pathInput) else {
+            pathInputHasError = true
+            isPathFocused = true
+            return
+        }
+        cancelPathEditing()
     }
 
     private var selectionContent: some View {
@@ -358,7 +395,7 @@ struct TopPathBar: View {
             }
         }
         .font(.system(size: 11, weight: .semibold))
-        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.018, glowOpacity: 0.13))
+        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule()))
         .fixedSize(horizontal: true, vertical: false)
     }
 
@@ -384,6 +421,8 @@ struct TopPathBar: View {
     }
 
     private struct SelectionTagButton: View {
+        @EnvironmentObject private var appState: AppState
+
         var tag: MacColorTag
         var coverage: Double
         var action: () -> Void
@@ -441,65 +480,512 @@ struct TopPathBar: View {
                 .frame(width: MacTagDotMetrics.selectionHitWidth, height: MacTagDotMetrics.selectionHeight)
                 .contentShape(Circle())
             }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.06, glowOpacity: 0.16))
-            .help(tag.name)
+            .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+            .help(appState.localizedColorTagName(tag.name))
+            .accessibilityLabel(appState.localizedColorTagName(tag.name))
+            .accessibilityValue("\(Int((coverage * 100).rounded()))%")
             .animation(MotionTokens.quick, value: coverage)
         }
     }
 
-    private static func measuredPathContentWidth(breadcrumbs: [PathBreadcrumb]) -> CGFloat {
-        let visibleBreadcrumbs = breadcrumbs.count > 4 ? Array(breadcrumbs.suffix(4)) : breadcrumbs
-        let showsLeadingEllipsis = breadcrumbs.count > 4
-
-        let breadcrumbWidth = measuredBreadcrumbWidth(
-            breadcrumbs: visibleBreadcrumbs,
-            showsLeadingEllipsis: showsLeadingEllipsis,
-            isEmpty: breadcrumbs.isEmpty
-        )
-
-        let outerPadding: CGFloat = 16
-        let internalGaps: CGFloat = 8 * 2
-        let dividerWidth: CGFloat = 1
-        let parentButtonWidth: CGFloat = 24
-        let safetyPadding: CGFloat = 8
-
-        return ceil(outerPadding + internalGaps + dividerWidth + parentButtonWidth + breadcrumbWidth + safetyPadding)
-    }
-
-    private static func measuredBreadcrumbWidth(
-        breadcrumbs: [PathBreadcrumb],
-        showsLeadingEllipsis: Bool,
-        isEmpty: Bool
-    ) -> CGFloat {
-        if isEmpty {
-            return textWidth("Path", font: .systemFont(ofSize: 12, weight: .medium))
-        }
-
-        let regularFont = NSFont.systemFont(ofSize: 12, weight: .medium)
-        let currentFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        let separatorWidth: CGFloat = 9
-        var childWidths: [CGFloat] = []
-
-        if showsLeadingEllipsis {
-            childWidths.append(textWidth("...", font: regularFont))
-            childWidths.append(separatorWidth)
-        }
-
-        for (index, breadcrumb) in breadcrumbs.enumerated() {
-            if index > 0 {
-                childWidths.append(separatorWidth)
-            }
-
-            let isCurrent = index == breadcrumbs.count - 1
-            childWidths.append(textWidth(breadcrumb.title, font: isCurrent ? currentFont : regularFont) + 14)
-        }
-
-        let interItemSpacing = CGFloat(max(0, childWidths.count - 1)) * 5
-        return ceil(childWidths.reduce(0, +) + interItemSpacing)
-    }
-
     private static func textWidth(_ text: String, font: NSFont) -> CGFloat {
         ceil((text as NSString).size(withAttributes: [.font: font]).width)
+    }
+}
+
+struct LightboxTabStripLayout: Equatable {
+    var visibleIndices: [Int]
+    var hiddenIndices: [Int]
+
+    static func resolve(tabCount: Int, activeIndex: Int, availableWidth: CGFloat) -> LightboxTabStripLayout {
+        guard tabCount > 0 else {
+            return LightboxTabStripLayout(visibleIndices: [], hiddenIndices: [])
+        }
+
+        let capacityWithoutOverflow = max(1, Int((availableWidth - 45) / 78))
+        if tabCount <= capacityWithoutOverflow {
+            return LightboxTabStripLayout(
+                visibleIndices: Array(0..<tabCount),
+                hiddenIndices: []
+            )
+        }
+
+        let capacity = max(1, Int((availableWidth - 77) / 78))
+        let clampedActiveIndex = min(max(0, activeIndex), tabCount - 1)
+        let maximumStart = max(0, tabCount - capacity)
+        let start = min(max(0, clampedActiveIndex - capacity / 2), maximumStart)
+        let visibleIndices = Array(start..<min(tabCount, start + capacity))
+        let visibleSet = Set(visibleIndices)
+        return LightboxTabStripLayout(
+            visibleIndices: visibleIndices,
+            hiddenIndices: (0..<tabCount).filter { !visibleSet.contains($0) }
+        )
+    }
+}
+
+private struct TabStrip: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var fileDropTargetID: UUID?
+    @State private var isOverflowPresented = false
+
+    var body: some View {
+        GeometryReader { proxy in
+            let activeIndex = appState.tabs.firstIndex(where: { $0.id == appState.activeTabID }) ?? 0
+            let layout = LightboxTabStripLayout.resolve(
+                tabCount: appState.tabs.count,
+                activeIndex: activeIndex,
+                availableWidth: proxy.size.width
+            )
+            let controlWidth: CGFloat = layout.hiddenIndices.isEmpty ? 37 : 65
+            let gaps = CGFloat(max(0, layout.visibleIndices.count)) * 2
+            let availableTabWidth = max(52, proxy.size.width - controlWidth - gaps - 8)
+            let tabWidth = min(148, max(52, availableTabWidth / CGFloat(max(1, layout.visibleIndices.count))))
+
+            HStack(spacing: 2) {
+                ForEach(layout.visibleIndices, id: \.self) { index in
+                    let tab = appState.tabs[index]
+                    LightboxTabButton(
+                        tab: tab,
+                        width: tabWidth,
+                        isFileDropTargeted: fileDropTargetID == tab.id
+                    )
+                        .onDrag {
+                            appState.beginTabDrag(tab.id)
+                            return NSItemProvider(object: tab.id.uuidString as NSString)
+                        }
+                        .onDrop(of: [.utf8PlainText], isTargeted: nil) { _ in
+                            appState.moveDraggedTab(before: tab.id)
+                            appState.endTabDrag()
+                            return true
+                        }
+                        .onDrop(
+                            of: [UTType(exportedAs: LightboxPasteboardTypes.internalAssetDragIdentifier)],
+                            delegate: TabAssetDropDelegate(
+                                targetTabID: tab.id,
+                                fileDropTargetID: $fileDropTargetID,
+                                appState: appState
+                            )
+                        )
+                }
+
+                if !layout.hiddenIndices.isEmpty {
+                    Button {
+                        isOverflowPresented.toggle()
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(TopPathBarColor.regularText)
+                            .frame(width: 26, height: 26)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+                    .help(appState.localized(.tabs))
+                    .popover(isPresented: $isOverflowPresented, arrowEdge: .bottom) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(layout.hiddenIndices, id: \.self) { index in
+                                let tab = appState.tabs[index]
+                                OverflowTabRow(
+                                    tab: tab,
+                                    isFileDropTargeted: fileDropTargetID == tab.id
+                                ) {
+                                    isOverflowPresented = false
+                                }
+                                .onDrop(
+                                    of: [UTType(exportedAs: LightboxPasteboardTypes.internalAssetDragIdentifier)],
+                                    delegate: TabAssetDropDelegate(
+                                        targetTabID: tab.id,
+                                        fileDropTargetID: $fileDropTargetID,
+                                        appState: appState,
+                                        activatesOnHover: false,
+                                        onDropCompleted: { isOverflowPresented = false }
+                                    )
+                                )
+                            }
+                        }
+                        .padding(6)
+                        .frame(minWidth: 220, alignment: .leading)
+                    }
+                    .onDrop(
+                        of: [UTType(exportedAs: LightboxPasteboardTypes.internalAssetDragIdentifier)],
+                        delegate: TabOverflowDropDelegate(
+                            hiddenTabIDs: layout.hiddenIndices.map { appState.tabs[$0].id },
+                            isOverflowPresented: $isOverflowPresented,
+                            appState: appState
+                        )
+                    )
+                }
+
+                Capsule()
+                    .fill(TopPathBarColor.divider)
+                    .frame(width: 1, height: 16)
+                    .padding(.horizontal, 2)
+
+                Button {
+                    appState.newTab()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(TopPathBarColor.regularText)
+                        .frame(width: 26, height: 26)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+                .help(appState.localized(.newTab))
+            }
+            .padding(.horizontal, 4)
+            .frame(width: proxy.size.width, height: 36, alignment: .leading)
+
+        }
+    }
+}
+
+private struct OverflowTabRow: View {
+    @EnvironmentObject private var appState: AppState
+
+    var tab: LightboxTab
+    var isFileDropTargeted: Bool
+    var onSelect: () -> Void
+
+    var body: some View {
+        Button {
+            appState.selectTab(tab.id)
+            onSelect()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(appState.tabTitle(tab))
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 12)
+            }
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isFileDropTargeted ? Color.accentColor.opacity(0.16) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(appState.tabPath(tab))
+    }
+}
+
+private struct LightboxTabButton: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovering = false
+
+    var tab: LightboxTab
+    var width: CGFloat
+    var isFileDropTargeted: Bool
+
+    private var isActive: Bool {
+        tab.id == appState.activeTabID
+    }
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Button {
+                appState.selectTab(tab.id)
+            } label: {
+                Text(appState.tabTitle(tab))
+                    .font(.system(size: 11, weight: isActive ? .semibold : .medium))
+                    .foregroundStyle(isActive ? TopPathBarColor.strongText : TopPathBarColor.regularText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isActive || isHovering {
+                Button {
+                    appState.closeTab(tab.id)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(TopPathBarColor.regularText)
+                        .frame(width: 20, height: 22)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+                .transition(.opacity.combined(with: .scale(scale: 0.82)))
+                .help(appState.localized(.closeTab))
+            }
+        }
+        .padding(.leading, 9)
+        .padding(.trailing, isActive || isHovering ? 3 : 9)
+        .frame(width: width, height: 28)
+        .clipped()
+        .background {
+            if isActive || isHovering || isFileDropTargeted {
+                if isFileDropTargeted {
+                    LightboxSelectionSurface(
+                        shape: Capsule(style: .continuous),
+                        fillOpacity: LightboxSelectionTokens.dropFillOpacity,
+                        strokeOpacity: LightboxSelectionTokens.emphasisStrokeOpacity,
+                        lineWidth: LightboxSelectionTokens.emphasisLineWidth
+                    )
+                } else if isActive {
+                    LightboxSelectionSurface(shape: Capsule(style: .continuous))
+                } else {
+                    LightboxSelectionSurface(
+                        shape: Capsule(style: .continuous),
+                        fillOpacity: LightboxSelectionTokens.hoverFillOpacity
+                    )
+                }
+            }
+        }
+        .overlay {
+            TabMiddleClickCatcher {
+                appState.closeTab(tab.id)
+            }
+        }
+        .contentShape(Capsule(style: .continuous))
+        .onHover { hovering in
+            withAnimation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion)) {
+                isHovering = hovering
+            }
+        }
+        .help(appState.tabPath(tab))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(appState.tabTitle(tab))
+        .accessibilityAddTraits(isActive ? .isSelected : [])
+    }
+}
+
+struct TabAssetDropDelegate: DropDelegate {
+    var targetTabID: UUID
+    @Binding var fileDropTargetID: UUID?
+    var appState: AppState
+    var activatesOnHover = true
+    var onDropCompleted: () -> Void = {}
+
+    func validateDrop(info: DropInfo) -> Bool {
+        LightboxDragState.isDraggingAsset && appState.canReceiveFileDrop(on: targetTabID)
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard validateDrop(info: info) else { return }
+        fileDropTargetID = targetTabID
+        if activatesOnHover {
+            appState.scheduleTabActivationForAssetDrag(targetTabID)
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if fileDropTargetID == targetTabID {
+            fileDropTargetID = nil
+        }
+        appState.cancelTabActivationForAssetDrag()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard validateDrop(info: info) else { return DropProposal(operation: .forbidden) }
+        return DropProposal(operation: currentOperation == .move ? .move : .copy)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        defer {
+            fileDropTargetID = nil
+            appState.cancelTabActivationForAssetDrag()
+            onDropCompleted()
+        }
+        guard validateDrop(info: info) else { return false }
+        return appState.enqueueFileTransfer(
+            sourceURLs: LightboxDragState.sourceURLs,
+            to: targetTabID,
+            operation: currentOperation
+        )
+    }
+
+    private var currentOperation: FileTransferOperation {
+        let eventHasOption = NSApp.currentEvent?.modifierFlags.contains(.option) == true
+        let sessionHasOption = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlternate)
+        return eventHasOption || sessionHasOption ? .move : .copy
+    }
+}
+
+private struct TabOverflowDropDelegate: DropDelegate {
+    var hiddenTabIDs: [UUID]
+    @Binding var isOverflowPresented: Bool
+    var appState: AppState
+
+    func validateDrop(info: DropInfo) -> Bool {
+        LightboxDragState.isDraggingAsset
+            && hiddenTabIDs.contains(where: appState.canReceiveFileDrop)
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard validateDrop(info: info) else { return }
+        isOverflowPresented = true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        validateDrop(info: info) ? DropProposal(operation: .copy) : DropProposal(operation: .forbidden)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        false
+    }
+}
+
+private struct FileTransferControl: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var isPopoverPresented = false
+
+    var progress: FileTransferProgress
+
+    var body: some View {
+        Button {
+            isPopoverPresented.toggle()
+        } label: {
+            ZStack {
+                Circle()
+                    .stroke(Color.primary.opacity(0.10), lineWidth: 2)
+
+                if progress.phase == .active {
+                    Circle()
+                        .trim(from: 0, to: max(0.035, progress.fractionCompleted))
+                        .stroke(Color.accentColor.opacity(0.88), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+
+                Image(systemName: transferSymbol)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(transferColor)
+            }
+            .frame(width: 23, height: 23)
+            .contentShape(Circle())
+        }
+        .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+        .padding(5)
+        .frame(width: 36, height: 36)
+        .topBarGlass(Capsule())
+        .shadow(
+            color: .black.opacity(GlassTokens.floatingCapsuleShadowOpacity(appState.glassOpacity)),
+            radius: 8,
+            y: 3
+        )
+        .help(appState.fileTransferStatusText(progress))
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(accessibilityValue)
+        .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(appState.fileTransferStatusText(progress))
+                    .font(.system(size: 12, weight: .semibold))
+
+                if !progress.currentName.isEmpty {
+                    Text(progress.currentName)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                if progress.phase == .active {
+                    ProgressView(value: progress.fractionCompleted)
+                        .progressViewStyle(.linear)
+
+                    Button(appState.localized(.cancel)) {
+                        appState.cancelFileTransfer()
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                } else {
+                    Button(appState.localized(.close)) {
+                        appState.dismissFileTransferStatus()
+                        isPopoverPresented = false
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                }
+            }
+            .padding(14)
+            .frame(width: 238, alignment: .leading)
+        }
+    }
+
+    private var transferSymbol: String {
+        switch progress.phase {
+        case .active:
+            progress.operation == .copy ? "doc.on.doc" : "arrow.right"
+        case .completed:
+            "checkmark"
+        case .failed:
+            "exclamationmark"
+        case .cancelled:
+            "xmark"
+        }
+    }
+
+    private var transferColor: Color {
+        switch progress.phase {
+        case .active, .completed:
+            Color.accentColor
+        case .failed:
+            .red
+        case .cancelled:
+            .secondary
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch progress.phase {
+        case .active:
+            appState.localized(progress.operation == .copy ? .copyingFiles : .movingFiles)
+        case .completed, .failed, .cancelled:
+            appState.fileTransferStatusText(progress)
+        }
+    }
+
+    private var accessibilityValue: String {
+        var parts = ["\(min(progress.completedCount, progress.totalCount))/\(progress.totalCount)"]
+        if progress.phase == .active {
+            parts.append("\(Int((progress.fractionCompleted * 100).rounded()))%")
+        }
+        if !progress.currentName.isEmpty {
+            parts.append(progress.currentName)
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+private struct TabMiddleClickCatcher: NSViewRepresentable {
+    var action: () -> Void
+
+    func makeNSView(context: Context) -> MiddleClickView {
+        let view = MiddleClickView()
+        view.action = action
+        return view
+    }
+
+    func updateNSView(_ nsView: MiddleClickView, context: Context) {
+        nsView.action = action
+    }
+}
+
+private final class MiddleClickView: NSView {
+    var action: (() -> Void)?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let event = window?.currentEvent ?? NSApp.currentEvent,
+              event.type == .otherMouseDown,
+              event.buttonNumber == 2
+        else {
+            return nil
+        }
+        return self
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        action?()
     }
 }
 
@@ -571,12 +1057,17 @@ private struct SortPopover: View {
                     }
                     .padding(.horizontal, 10)
                     .frame(width: 164, height: 30, alignment: .leading)
+                    .background {
+                        if appState.sortField == field {
+                            LightboxSelectionSurface(
+                                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
+                            )
+                        }
+                    }
                     .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous))
                 }
                 .buttonStyle(LightboxButtonHoverStyle(
-                    shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous),
-                    hoverScale: 1.006,
-                    glowOpacity: 0.13
+                    shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
                 ))
             }
 
@@ -604,9 +1095,7 @@ private struct SortPopover: View {
                 .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous))
             }
             .buttonStyle(LightboxButtonHoverStyle(
-                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous),
-                hoverScale: 1.006,
-                glowOpacity: 0.13
+                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
             ))
         }
         .padding(8)
@@ -666,10 +1155,7 @@ private struct SourceMenuButton: View {
             .contentShape(Capsule())
         }
         .buttonStyle(LightboxButtonHoverStyle(
-            shape: Capsule(),
-            hoverScale: 1.018,
-            pressedScale: 0.975,
-            glowOpacity: 0.13
+            shape: Capsule()
         ))
         .popover(isPresented: $isSourceMenuPresented, arrowEdge: .bottom) {
             SourceMenuPopover(
@@ -700,6 +1186,8 @@ private struct SourceMenuButton: View {
                 }
             )
             .environmentObject(appState)
+        .tint(LightboxColorTokens.accent)
+        .accentColor(LightboxColorTokens.accent)
         }
         .onChange(of: isSourceMenuPresented) { presented in
             if presented {
@@ -707,7 +1195,7 @@ private struct SourceMenuButton: View {
                 menuUnpinnedSourceIDs = unpinnedSourceIDs
             }
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -759,9 +1247,7 @@ private struct SourceMenuPopover: View {
                 .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous))
             }
             .buttonStyle(LightboxButtonHoverStyle(
-                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous),
-                hoverScale: 1.006,
-                glowOpacity: 0.13
+                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
             ))
         }
         .padding(8)
@@ -805,9 +1291,7 @@ private struct PinnedSourceRow: View {
                 .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous))
             }
             .buttonStyle(LightboxButtonHoverStyle(
-                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous),
-                hoverScale: 1.006,
-                glowOpacity: 0.13
+                shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
             ))
 
             Button {
@@ -820,18 +1304,19 @@ private struct PinnedSourceRow: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(isPinned ? Color.primary.opacity(0.72) : Color.secondary.opacity(0.58))
                     .frame(width: 28, height: 28)
-                    .scaleEffect(pinIsPressed ? 0.82 : 1)
+                    .scaleEffect(pinIsPressed ? 0.96 : 1)
                     .rotationEffect(.degrees(pinIsPressed ? -10 : (isPinned ? 0 : -16)))
                     .contentShape(Circle())
             }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.05, glowOpacity: 0.16))
+            .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
             .help(isPinned ? unpinTitle : pinTitle)
         }
         .frame(width: 258, height: 34)
         .background {
             if isSelected {
-                RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
+                LightboxSelectionSurface(
+                    shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
+                )
                     .allowsHitTesting(false)
             }
         }
@@ -847,93 +1332,84 @@ private struct PinnedSourceRow: View {
 }
 
 private struct BreadcrumbStrip: View {
+    var editPath: () -> Void
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
-        let breadcrumbs = appState.breadcrumbs
-
-        HStack(spacing: 5) {
-            if breadcrumbs.isEmpty {
-                Text(appState.localized(.path))
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(TopPathBarColor.mutedText)
-                    .frame(height: 28)
-            } else {
-                let visibleBreadcrumbs = tailBreadcrumbs(from: breadcrumbs, count: 4)
-
-                breadcrumbRow(visibleBreadcrumbs, showsLeadingEllipsis: breadcrumbs.count > 4)
+        let ancestors = Array(appState.breadcrumbs.dropLast())
+        VStack(spacing: 1) {
+            Button(action: editPath) {
+                Text(appState.breadcrumbs.last?.title ?? appState.currentPathTitle)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(LightboxColorTokens.currentLocationText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity)
+                    .contentShape(Rectangle())
             }
-        }
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
-    private func tailBreadcrumbs(from breadcrumbs: [PathBreadcrumb], count: Int) -> [PathBreadcrumb] {
-        guard breadcrumbs.count > count else {
-            return breadcrumbs
-        }
-
-        return Array(breadcrumbs.suffix(count))
-    }
-
-    private func breadcrumbRow(_ breadcrumbs: [PathBreadcrumb], showsLeadingEllipsis: Bool = false) -> some View {
-        HStack(spacing: 5) {
-            if showsLeadingEllipsis {
-                Text("...")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(TopPathBarColor.regularText)
-                    .frame(height: 26)
-
-                separator
-            }
-
-            ForEach(Array(breadcrumbs.enumerated()), id: \.element.id) { index, breadcrumb in
-                if index > 0 {
-                    separator
+            .buttonStyle(.borderless)
+            .help(appState.currentFolderURL.path)
+            if !ancestors.isEmpty {
+                ViewThatFits(in: .horizontal) {
+                    ancestorRow(ancestors)
+                        .fixedSize(horizontal: true, vertical: false)
+                    ancestorRow(Array(ancestors.suffix(1)), collapsed: ancestors)
+                        .fixedSize(horizontal: true, vertical: false)
+                    ancestorMenu(ancestors)
                 }
-
-                breadcrumbButton(breadcrumb, isCurrent: index == breadcrumbs.count - 1)
             }
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity)
     }
 
-    private var separator: some View {
-        Image(systemName: "chevron.right")
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(TopPathBarColor.faintText)
-    }
-
-    private func breadcrumbButton(_ breadcrumb: PathBreadcrumb, isCurrent: Bool) -> some View {
-        Button {
-            appState.openBreadcrumb(breadcrumb)
+    private func ancestorMenu(_ ancestors: [PathBreadcrumb]) -> some View {
+        Menu {
+            ForEach(ancestors) { crumb in
+                Button(crumb.title) { appState.openBreadcrumb(crumb) }
+                    .help(crumb.url.path)
+            }
         } label: {
-            Text(breadcrumb.title)
-                .font(.system(size: 12, weight: isCurrent ? .semibold : .medium))
-                .foregroundStyle(isCurrent ? TopPathBarColor.strongText : TopPathBarColor.regularText)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 7)
-                .frame(height: 26)
-                .contentShape(Capsule())
+            Image(systemName: "ellipsis").frame(width: 28, height: 20)
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.018, glowOpacity: 0.12))
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(appState.currentFolderURL.path)
+        .accessibilityLabel(appState.localized(.path))
     }
 
+    private func ancestorRow(_ ancestors: [PathBreadcrumb], collapsed: [PathBreadcrumb] = []) -> some View {
+        HStack(spacing: 3) {
+            if !collapsed.isEmpty { ancestorMenu(collapsed) }
+            ForEach(ancestors) { crumb in
+                Button { appState.openBreadcrumb(crumb) } label: {
+                    Text(crumb.title).lineLimit(1).padding(.horizontal, 3).frame(height: 22)
+                }
+                .buttonStyle(.plain)
+                .help(crumb.url.path)
+                Image(systemName: "chevron.right").font(.system(size: 7, weight: .medium))
+            }
+        }
+        .font(.system(size: 11, weight: .regular))
+        .foregroundStyle(LightboxColorTokens.mutedText)
+    }
 }
 
 private enum TopPathBarColor {
-    static let strongText = Color.primary.opacity(0.98)
-    static let regularText = Color.primary.opacity(0.78)
-    static let mutedText = Color.primary.opacity(0.68)
-    static let faintText = Color.primary.opacity(0.50)
-    static let disabledText = Color.primary.opacity(0.40)
-    static let divider = Color.primary.opacity(0.16)
+    static let strongText = LightboxColorTokens.primaryText
+    static let regularText = LightboxColorTokens.secondaryText
+    static let mutedText = LightboxColorTokens.mutedText
+    static let faintText = LightboxColorTokens.mutedText
+    static let disabledText = LightboxColorTokens.disabledText
+    static let divider = LightboxColorTokens.border
 }
 
 private extension View {
-    func topBarGlass<S: Shape>(_ shape: S) -> some View {
-        modifier(TopBarGlassModifier(shape: shape))
+    func topBarUtilitySurface(isActive: Bool) -> some View {
+        modifier(TopBarUtilitySurfaceModifier(isActive: isActive))
+    }
+
+    func topBarGlass<S: Shape>(_ shape: S, isEnabled: Bool = true) -> some View {
+        modifier(TopBarGlassModifier(shape: shape, isEnabled: isEnabled))
     }
 
     func selectionActionLabel(width: CGFloat) -> some View {
@@ -944,36 +1420,84 @@ private extension View {
     }
 }
 
+// Keep utility chrome quiet without fading its symbol or keyboard focus.
+private struct TopBarUtilitySurfaceModifier: ViewModifier {
+    @Environment(\.lightboxGlassOpacity) private var glassOpacity
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovering = false
+    var isActive: Bool
+
+    func body(content: Content) -> some View {
+        let showsSurface = isActive || isHovering
+        content
+            .background(LightboxColorTokens.primaryText.opacity(showsSurface ? 0.06 : 0), in: RoundedRectangle(cornerRadius: RadiusTokens.control))
+            .shadow(
+                color: .black.opacity(showsSurface ? GlassTokens.floatingCapsuleShadowOpacity(glassOpacity) : 0),
+                radius: 8,
+                y: 3
+            )
+            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: showsSurface)
+            .onHover { isHovering = $0 }
+    }
+}
+
 private struct TopBarGlassModifier<S: Shape>: ViewModifier {
     @Environment(\.lightboxGlassOpacity) private var glassOpacity
     @Environment(\.colorScheme) private var colorScheme
 
     var shape: S
+    var isEnabled: Bool
 
     func body(content: Content) -> some View {
-        let materialOpacity = GlassTokens.floatingCapsuleMaterialOpacity(glassOpacity)
-        let fillOpacity = GlassTokens.floatingCapsuleFillOpacity(glassOpacity, colorScheme: colorScheme)
-        let strokeOpacity = GlassTokens.floatingCapsuleStrokeOpacity(glassOpacity)
+        let materialOpacity = isEnabled ? GlassTokens.floatingCapsuleMaterialOpacity(glassOpacity) : 0
+        let fillOpacity = isEnabled ? GlassTokens.floatingCapsuleFillOpacity(glassOpacity, colorScheme: colorScheme) : 0
+        let strokeOpacity = isEnabled ? GlassTokens.floatingCapsuleStrokeOpacity(glassOpacity) : 0
 
         if #available(macOS 26.0, *) {
             content
-                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
                 .background {
-                    shape.fill(Color(nsColor: .controlBackgroundColor).opacity(fillOpacity))
+                    shape.fill(LightboxColorTokens.control.opacity(fillOpacity))
                 }
-                .glassEffect(.clear.interactive(true), in: shape)
+                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
+                .glassEffect(isEnabled ? .clear.interactive(true) : .identity, in: shape)
                 .overlay {
-                    shape.stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
+                    shape.stroke(LightboxColorTokens.primaryText.opacity(strokeOpacity), lineWidth: 0.7)
                 }
         } else {
             content
-                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
                 .background {
-                    shape.fill(Color(nsColor: .controlBackgroundColor).opacity(fillOpacity))
+                    shape.fill(LightboxColorTokens.control.opacity(fillOpacity))
                 }
+                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
                 .overlay {
-                    shape.stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
+                    shape.stroke(LightboxColorTokens.primaryText.opacity(strokeOpacity), lineWidth: 0.7)
                 }
         }
+    }
+}
+
+/// Existing secondary controls keep their data and behavior while their anchors
+/// and main navigation move into AppKit.
+struct NativeHeaderPanel: View {
+    enum Kind { case tabs, sort, selection, transfer }
+    @ObservedObject var appState: AppState
+    var kind: Kind
+    var close: () -> Void = {}
+
+    var body: some View {
+        Group {
+            switch kind {
+            case .tabs: TabStrip().frame(width: 380, height: 36).padding(12)
+            case .sort: SortPopover(close: close)
+            case .selection: TopPathBar(selectionOnly: true)
+            case .transfer:
+                if let progress = appState.fileTransferProgress { FileTransferControl(progress: progress) }
+            }
+        }
+        .environmentObject(appState)
+        .tint(LightboxColorTokens.accent)
+        .accentColor(LightboxColorTokens.accent)
+        .environment(\.lightboxGlassOpacity, appState.glassOpacity)
+        .preferredColorScheme(appState.preferredColorScheme)
     }
 }

@@ -1,51 +1,33 @@
 # Lightbox
 
-Lightbox 是一款 macOS 图片浏览与素材整理工具，适合想用更轻量方式管理本地图片的人。
+[English](README.en.md) · **简体中文** · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md)
 
-相比 Eagle 这类素材库工具，Lightbox 更贴近 Finder：直接浏览本地文件夹，少一层导入和库管理负担；固定常用路径后，可以快速在项目素材、下载目录、外接硬盘或 NAS 文件夹之间切换。界面更克制，预览更直接，适合频繁翻图、挑图和整理文件。
+Lightbox 是一款轻量的 macOS 图片浏览与整理工具。直接浏览已有文件夹，无需先将图片导入独立素材库。
 
-## 基本功能
+固定常用路径，在项目素材、下载目录、外接硬盘和 NAS 文件夹之间快速切换。支持多标签页浏览、大图预览和拍摄信息查看，适合日常翻图、挑图与整理文件。
 
-- 浏览本地图片文件夹
-- 固定常用文件夹
-- 瀑布流 / 网格视图
-- 单击大图预览
-- 键盘切换上一张 / 下一张
-- 多选、拖拽、复制图片
-- 使用 macOS 颜色标签
-- 将图片移入 Lightbox 回收区域
-- App 内检查更新
+## 功能
+
+- 独立新标签页，多标签浏览与文件夹导航
+- 瀑布流布局，支持浏览当前文件夹或包含所有子文件夹的图片
+- 单击大图预览，键盘切换图片，查看相机、拍摄参数与文件信息
+- 固定常用文件夹，使用 macOS 颜色标签
+- 多选、拖拽、复制与文件整理
+- 适配浅色与深色外观，支持鼠标、键盘和无障碍操作
+- 支持 English、简体中文、繁體中文、日本語
+- 自动检查更新，并由用户确认安装
 
 ## 下载
 
-前往 [Releases](https://github.com/a11oydyyy/Lightbox/releases/latest) 下载最新版。
+前往 [Releases](https://github.com/a11oydyyy/Lightbox/releases/latest) 下载最新公开版本。
 
-- `Lightbox-v1.3.6.zip`：Apple Silicon Mac，macOS 15 或更新版本。
-- `Lightbox-Intel-x86-v1.3.6.zip`：Intel Mac，或需要 macOS 13 兼容版本的设备。
+| 安装包 | 适用设备 |
+| --- | --- |
+| `Lightbox-v*.zip` | Apple Silicon，macOS 15 或更新版本 |
+| `Lightbox-Intel-x86-v*.zip` | Intel 或 Apple Silicon，macOS 13 或更新版本 |
 
----
+兼容包包含两种架构，在 Apple Silicon 上正常启动时使用 ARM 原生架构。具体版本的签名、公证状态与已知限制请查看发布说明。
 
-# Lightbox
+## 反馈
 
-Lightbox is a macOS image browser and material organizer for people who want a lighter way to work with local images.
-
-Compared with library-first tools like Eagle, Lightbox stays closer to Finder: browse local folders directly, reduce import overhead, and jump quickly between project assets, Downloads, external drives, or NAS folders. The interface is restrained, previews are direct, and the workflow fits frequent browsing, picking, and file cleanup.
-
-## Features
-
-- Browse local image folders
-- Pin frequently used folders
-- Masonry and grid views
-- Single-click large preview
-- Keyboard previous / next navigation
-- Multi-select, drag, and copy images
-- macOS color tags
-- Move images into Lightbox trash
-- Check for updates in the app
-
-## Download
-
-Get the latest version from [Releases](https://github.com/a11oydyyy/Lightbox/releases/latest).
-
-- `Lightbox-v1.3.6.zip`: Apple Silicon Macs running macOS 15 or later.
-- `Lightbox-Intel-x86-v1.3.6.zip`: Intel Macs, or devices that need the macOS 13 compatible build.
+遇到问题或有功能建议，请提交 [Issue](https://github.com/a11oydyyy/Lightbox/issues)。描述问题时，请附上应用版本、macOS 版本和 Mac 芯片类型。

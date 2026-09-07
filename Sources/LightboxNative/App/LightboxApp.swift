@@ -7,13 +7,20 @@ struct LightboxApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        WindowGroup {
+        Window("Lightbox", id: "main") {
             RootShellView()
                 .environmentObject(appState)
+                .tint(LightboxColorTokens.accent)
+                .accentColor(LightboxColorTokens.accent)
                 .environment(\.lightboxGlassOpacity, appState.glassOpacity)
                 .preferredColorScheme(appState.preferredColorScheme)
+                .environment(\.locale, appState.appLanguage.locale)
                 .frame(minWidth: 980, minHeight: 680)
-                .background(WindowConfigurator())
+                .background(WindowConfigurator(appState: appState))
+                .task { await LightboxUpdateController.shared.checkAutomatically(appState: appState) }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    Task { await LightboxUpdateController.shared.checkAutomatically(appState: appState) }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -25,8 +32,11 @@ struct LightboxApp: App {
         Settings {
             SettingsView()
                 .environmentObject(appState)
+                .tint(LightboxColorTokens.accent)
+                .accentColor(LightboxColorTokens.accent)
                 .environment(\.lightboxGlassOpacity, appState.glassOpacity)
                 .preferredColorScheme(appState.preferredColorScheme)
+                .environment(\.locale, appState.appLanguage.locale)
         }
     }
 }

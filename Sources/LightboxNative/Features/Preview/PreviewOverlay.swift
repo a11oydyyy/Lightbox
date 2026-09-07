@@ -11,6 +11,7 @@ struct PreviewOverlay: View {
     var asset: LightboxAsset
     @State private var isPresented = false
     @State private var isClosing = false
+    @State private var showsInformation = false
     @State private var lockedPreviewSize: CGSize?
     @State private var lockedSourceFrame: CGRect?
     @State private var didStartPresentation = false
@@ -53,6 +54,8 @@ struct PreviewOverlay: View {
 
             ZStack(alignment: .bottom) {
                 PreviewKeyboardLayer(
+                    requestsFocus: !showsInformation,
+                    onInformation: { showsInformation = true },
                     onPrevious: {
                         appState.stepPreview(.previous)
                     },
@@ -60,7 +63,8 @@ struct PreviewOverlay: View {
                         appState.stepPreview(.next)
                     },
                     onClose: {
-                        closeAnimated()
+                        if showsInformation { showsInformation = false }
+                        else { closeAnimated() }
                     }
                 )
                 .frame(width: 0, height: 0)
@@ -104,6 +108,7 @@ struct PreviewOverlay: View {
                             compareMenuTitle: compareMenuTitle,
                             menuTitles: AssetContextMenuTitles(appState: appState),
                             showsPressFeedback: false,
+                            dragSourceURLs: { appState.dragSourceURLs(for: asset) },
                             triggersClickOnMouseDown: true,
                             onPressChanged: { _ in },
                             onClick: { click in
@@ -138,6 +143,9 @@ struct PreviewOverlay: View {
                     .frame(width: size.width, height: size.height)
                     .scaleEffect(x: scale.width, y: scale.height, anchor: .center)
                     .position(x: visibleFrame.midX, y: visibleFrame.midY)
+                    // Clip in viewport coordinates, after scale and position. A
+                    // partially hidden source must return beneath the opaque header.
+                    .clipShape(PreviewImageViewportClip())
                     // No `.compositingGroup()` here: during the open/close scale it
                     // forced an offscreen re-composite of the image + its radius-14
                     // shadow every frame (a slow path during the zoom). The view
@@ -149,12 +157,25 @@ struct PreviewOverlay: View {
                     .id(asset.id)
                     .animation(MotionTokens.ifAllowed(MotionTokens.preview, reduceMotion: reduceMotion), value: asset.id)
 
-                PreviewControls(asset: asset)
+                PreviewControls(asset: asset, showsInfo: $showsInformation)
                     .previewChromePresentation(isVisible: isPresented, reduceMotion: reduceMotion)
                     .position(
                         x: proxy.size.width / 2,
                         y: controlsY
                     )
+            }
+            .overlay(alignment: .topTrailing) {
+                Button(action: closeAnimated) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: LightboxControlMetrics.iconSize, weight: .medium))
+                        .foregroundStyle(LightboxColorTokens.secondaryText)
+                        .frame(width: LightboxControlMetrics.iconButtonSize, height: LightboxControlMetrics.iconButtonSize)
+                }
+                .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)))
+                .help(appState.localized(.close))
+                .accessibilityLabel(appState.localized(.close))
+                .padding(.top, 58)
+                .padding(.trailing, 22)
             }
             .onAppear {
                 if lockedPreviewSize == nil {
@@ -287,6 +308,9 @@ struct PreviewOverlay: View {
             previewOverlayLogger.info("preview overlay close rejected-by-state asset=\(asset.originalName, privacy: .public)")
             return
         }
+        if let currentFrame = appState.previewSpaceFrame(for: asset.id) {
+            lockedSourceFrame = currentFrame
+        }
         isClosing = true
         presentationTask?.cancel()
         highResolutionTask?.cancel()
@@ -297,6 +321,9 @@ struct PreviewOverlay: View {
 
     private func closeFromExternalRoute() {
         guard !isClosing else { return }
+        if let currentFrame = appState.previewSpaceFrame(for: asset.id) {
+            lockedSourceFrame = currentFrame
+        }
         isClosing = true
         presentationTask?.cancel()
         highResolutionTask?.cancel()
@@ -332,6 +359,8 @@ struct PreviewOverlay: View {
 }
 
 private struct PreviewKeyboardLayer: NSViewRepresentable {
+    var requestsFocus: Bool
+    var onInformation: () -> Void
     var onPrevious: () -> Void
     var onNext: () -> Void
     var onClose: () -> Void
@@ -345,37 +374,49 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: PreviewKeyboardView, context: Context) {
+        nsView.onInformation = onInformation
         nsView.onPrevious = onPrevious
         nsView.onNext = onNext
         nsView.onClose = onClose
-        DispatchQueue.main.async {
-            nsView.window?.makeFirstResponder(nsView)
-        }
+        nsView.requestedFocus = requestsFocus
     }
 }
 
-private final class PreviewKeyboardView: NSView {
+final class PreviewKeyboardView: NSView {
+    var requestedFocus = false {
+        didSet { if requestedFocus && !oldValue { requestFocusWhenAttached() } }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        requestFocusWhenAttached()
+    }
+
+    private func requestFocusWhenAttached() {
+        guard requestedFocus, window != nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.requestedFocus else { return }
+            self.window?.makeFirstResponder(self)
+        }
+    }
+    var onInformation: () -> Void = {}
     var onPrevious: () -> Void = {}
     var onNext: () -> Void = {}
     var onClose: () -> Void = {}
 
     override var acceptsFirstResponder: Bool { true }
 
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.window?.makeFirstResponder(self)
-        }
-    }
-
     override func keyDown(with event: NSEvent) {
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            super.keyDown(with: event); return
+        }
+        if event.charactersIgnoringModifiers?.lowercased() == "i" { onInformation(); return }
         switch event.keyCode {
         case 123:
             onPrevious()
         case 124:
             onNext()
-        case 53:
+        case 53, 49:
             onClose()
         default:
             super.keyDown(with: event)
@@ -464,8 +505,18 @@ private struct PreviewBackgroundVeil: View {
         Rectangle()
             .fill(.regularMaterial)
             .overlay {
-                Color(nsColor: .windowBackgroundColor)
-                    .opacity(colorScheme == .dark ? 0.18 : 0.42)
+                LightboxColorTokens.inspection
+                    .opacity(colorScheme == .dark ? 0.90 : 0.88)
             }
+    }
+}
+
+/// The gallery's opaque titlebar occupies the first 52 points of PreviewSpace.
+/// Keep this boundary fixed throughout opening, closing, and interrupted transitions.
+struct PreviewImageViewportClip: Shape {
+    func path(in rect: CGRect) -> Path {
+        let top = min(52, rect.height)
+        return Path(CGRect(x: rect.minX, y: rect.minY + top,
+                           width: rect.width, height: max(0, rect.height - top)))
     }
 }

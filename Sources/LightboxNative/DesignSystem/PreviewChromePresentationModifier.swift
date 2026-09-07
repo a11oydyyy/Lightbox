@@ -28,7 +28,7 @@ struct PreviewChromePresentationModifier: ViewModifier {
             .animation(
                 isVisible
                     ? MotionTokens.ifAllowed(MotionTokens.previewChrome, reduceMotion: reduceMotion)
-                    : MotionTokens.ifAllowed(.easeOut(duration: 0.07), reduceMotion: reduceMotion),
+                    : MotionTokens.ifAllowed(MotionTokens.chromeHide, reduceMotion: reduceMotion),
                 value: isVisible
             )
     }
@@ -48,7 +48,7 @@ struct BottomPreviewChromePresentationModifier: ViewModifier {
             .animation(
                 isVisible
                     ? MotionTokens.ifAllowed(MotionTokens.previewChrome, reduceMotion: reduceMotion)
-                    : MotionTokens.ifAllowed(.easeOut(duration: 0.07), reduceMotion: reduceMotion),
+                    : MotionTokens.ifAllowed(MotionTokens.chromeHide, reduceMotion: reduceMotion),
                 value: isVisible
             )
     }

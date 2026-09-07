@@ -3,6 +3,16 @@ import Darwin
 
 enum FinderTagStore {
     private static let userTagsAttribute = "com.apple.metadata:_kMDItemUserTags"
+    private static let finderFavoriteTagNamesKey = "FavoriteTagNames"
+    private static let finderFavoriteTagIndexes: [String: Int] = [
+        "Red": 1,
+        "Orange": 2,
+        "Yellow": 3,
+        "Green": 4,
+        "Blue": 5,
+        "Purple": 6,
+        "Gray": 7
+    ]
     private static let colorTagTokens: [String: String] = [
         "Red": "Red\n6",
         "Orange": "Orange\n7",
@@ -43,14 +53,26 @@ enum FinderTagStore {
     ]
 
     static func colorTags(for url: URL) -> [String] {
-        let xattrTags = rawUserTags(for: url)
+        (try? readColorTags(for: url)) ?? []
+    }
+
+    // Mutations must distinguish absent tags from unreadable metadata.
+    static func readColorTags(for url: URL) throws -> [String] {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        let xattrTags = try rawUserTags(for: url)
         let tags = xattrTags.compactMap { colorTagName(from: $0) }
         return MacColorTag.sort(Array(Set(tags)))
     }
 
-    static func setColorTags(_ colorTags: [String], for url: URL) -> Bool {
+    static func setColorTags(
+        _ colorTags: [String],
+        for url: URL,
+        favoriteTagNames: [String]? = nil
+    ) -> Bool {
         let sortedColorTags = MacColorTag.sort(Array(Set(colorTags.filter(MacColorTag.isColorTag))))
         let selectedColorTags = Set(sortedColorTags)
+        let favoriteTagNames = favoriteTagNames ?? finderFavoriteTagNames()
         let didAccess = url.startAccessingSecurityScopedResource()
         defer {
             if didAccess {
@@ -59,7 +81,7 @@ enum FinderTagStore {
         }
 
         do {
-            let existingTags = rawUserTags(for: url)
+            let existingTags = try rawUserTags(for: url)
             var preservedTags: [String] = []
             var coveredColorTags: Set<String> = []
 
@@ -79,7 +101,7 @@ enum FinderTagStore {
 
             let nextTags = preservedTags + sortedColorTags
                 .filter { !coveredColorTags.contains($0) }
-                .compactMap { colorTagTokens[$0] }
+                .compactMap { colorTagToken(for: $0, favoriteTagNames: favoriteTagNames) }
             try writeRawUserTags(nextTags, to: url)
             return true
         } catch {
@@ -87,33 +109,48 @@ enum FinderTagStore {
         }
     }
 
-    private static func rawUserTags(for url: URL) -> [String] {
-        let path = url.path
-        let size = getxattr(path, userTagsAttribute, nil, 0, 0, 0)
-        guard size > 0 else {
-            return []
+    private static func finderFavoriteTagNames() -> [String] {
+        UserDefaults(suiteName: "com.apple.finder")?
+            .stringArray(forKey: finderFavoriteTagNamesKey) ?? []
+    }
+
+    private static func colorTagToken(for colorTag: String, favoriteTagNames: [String]) -> String? {
+        guard let fallbackToken = colorTagTokens[colorTag] else { return nil }
+        guard
+            let tagIndex = finderFavoriteTagIndexes[colorTag],
+            favoriteTagNames.indices.contains(tagIndex),
+            !favoriteTagNames[tagIndex].isEmpty,
+            let colorCode = fallbackToken.split(separator: "\n", maxSplits: 1).last
+        else {
+            return fallbackToken
         }
+
+        return "\(favoriteTagNames[tagIndex])\n\(colorCode)"
+    }
+
+    private static func rawUserTags(for url: URL) throws -> [String] {
+        let size = getxattr(url.path, userTagsAttribute, nil, 0, 0, 0)
+        if size < 0 {
+            if errno == ENOATTR { return [] }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard size > 0 else { throw CocoaError(.propertyListReadCorrupt) }
 
         var data = Data(count: size)
         let readSize = data.withUnsafeMutableBytes { buffer in
-            getxattr(path, userTagsAttribute, buffer.baseAddress, size, 0, 0)
+            getxattr(url.path, userTagsAttribute, buffer.baseAddress, size, 0, 0)
         }
-        guard readSize > 0 else {
-            return []
+        guard readSize >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-
-        if readSize < data.count {
-            data.removeSubrange(readSize..<data.count)
-        }
-
-        guard let tags = try? PropertyListSerialization.propertyList(
+        data.count = readSize
+        guard let tags = try PropertyListSerialization.propertyList(
             from: data,
             options: [],
             format: nil
         ) as? [String] else {
-            return []
+            throw CocoaError(.propertyListReadCorrupt)
         }
-
         return tags
     }
 

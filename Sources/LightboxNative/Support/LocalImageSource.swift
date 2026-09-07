@@ -141,6 +141,7 @@ enum LocalImageSource {
         rootURL: URL,
         query: LightboxSearchQuery,
         recursive: Bool,
+        showsHiddenItems: Bool = false,
         maxResults: Int = 300,
         maxVisited: Int = 20_000
     ) -> LightboxSearchScanResult {
@@ -179,7 +180,7 @@ enum LocalImageSource {
         }
 
         func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
-            let result = searchDirectoryEntries(in: folder)
+            let result = searchDirectoryEntries(in: folder, showsHiddenItems: showsHiddenItems)
             if result.availability != .available {
                 directoryReadFailed = true
             }
@@ -233,14 +234,15 @@ enum LocalImageSource {
         probeMetadata: Bool = true,
         probeFolderTags: Bool = true,
         initialMetadataLimit: Int = 0,
+        showsHiddenItems: Bool = false,
         cachedDimensions: [String: CachedAssetDimensions] = [:]
     ) -> LocalFolderSnapshot {
         let readStartedAt = Date()
         let posixResult = posixDirectoryEntries(
             in: folder.standardizedFileURL,
-            options: [.skipsHiddenFiles]
+            options: showsHiddenItems ? [] : [.skipsHiddenFiles]
         )
-        var entries = posixResult.urls
+        var entries = visibleDirectoryEntries(posixResult.urls, showsHiddenItems: showsHiddenItems)
         var availability = posixResult.availability
         if case .unavailable(.cancelled) = availability {
             let directoryReadSeconds = Date().timeIntervalSince(readStartedAt)
@@ -259,11 +261,12 @@ enum LocalImageSource {
             let fallbackResult = directoryChildrenResult(
                 in: folder,
                 includingPropertiesForKeys: [],
-                options: [.skipsHiddenFiles]
+                options: showsHiddenItems ? [] : [.skipsHiddenFiles]
             )
             entries = fallbackResult.urls.map {
                 POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil)
             }
+            entries = visibleDirectoryEntries(entries, showsHiddenItems: showsHiddenItems)
             availability = fallbackResult.availability
         }
         let directoryReadSeconds = Date().timeIntervalSince(readStartedAt)
@@ -415,6 +418,10 @@ enum LocalImageSource {
         rootURL: URL,
         query: LightboxSearchQuery,
         recursive: Bool,
+        showsHiddenItems: Bool = false,
+        collectsFolders: Bool = true,
+        probeDimensions: Bool = false,
+        skipsPackages: Bool = false,
         maxResults: Int = 2_000,
         maxFolderResults: Int = 300,
         maxVisited: Int = 20_000
@@ -430,7 +437,7 @@ enum LocalImageSource {
         var resultLimitReached = false
 
         func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
-            let result = searchDirectoryEntries(in: folder)
+            let result = searchDirectoryEntries(in: folder, showsHiddenItems: showsHiddenItems)
             if result.availability != .available {
                 resultLimitReached = true
             }
@@ -458,7 +465,7 @@ enum LocalImageSource {
                 return true
             }
 
-            let mayMatchFolder = query.mayMatchFolderName(url.lastPathComponent)
+            let mayMatchFolder = collectsFolders && query.mayMatchFolderName(url.lastPathComponent)
             let mayMatchAsset = isSupportedImageURL(url) && query.mayMatchAssetName(url.lastPathComponent)
             guard mayMatchFolder || mayMatchAsset else {
                 return false
@@ -483,9 +490,15 @@ enum LocalImageSource {
             }
 
             guard mayMatchAsset else { return false }
-            if let isRegularFile = entry.isRegularFile, !isRegularFile { return false }
+            if let isRegularFile = entry.isRegularFile {
+                if !isRegularFile { return false }
+            } else {
+                let kind = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard kind?.isSymbolicLink != true, kind?.isRegularFile == true else { return false }
+            }
 
             let fallbackSize = MockLibrary.importFallbackSizes[assets.count % MockLibrary.importFallbackSizes.count]
+            let dimensions = probeDimensions ? autoreleasepool { ImageProbe.dimensions(for: url) } : nil
             let values = try? url.resourceValues(forKeys: [
                 .addedToDirectoryDateKey,
                 .creationDateKey,
@@ -494,15 +507,15 @@ enum LocalImageSource {
             ])
             let asset = LightboxAsset(
                 originalName: url.lastPathComponent,
-                width: fallbackSize.width,
-                height: fallbackSize.height,
+                width: dimensions?.width ?? fallbackSize.width,
+                height: dimensions?.height ?? fallbackSize.height,
                 tags: FinderTagStore.colorTags(for: url),
                 sourceURL: url,
                 addedAt: addedDate(from: values) ?? .distantPast,
                 contentModifiedAt: values?.contentModificationDate,
                 fileSize: fileSize(from: values),
                 palette: MockPalette.imported[assets.count % MockPalette.imported.count],
-                metadataLoaded: false
+                metadataLoaded: dimensions != nil
             )
 
             guard query.matches(asset) else { return false }
@@ -523,6 +536,7 @@ enum LocalImageSource {
                     guard !Task.isCancelled, !traversalLimitReached else { break }
                     let entryIsDirectory = isDirectory(entry)
                     if entryIsDirectory {
+                        if skipsPackages, (try? entry.url.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true { continue }
                         if visit(entry, knownIsDirectory: true) {
                             break
                         }
@@ -700,24 +714,41 @@ enum LocalImageSource {
         )
     }
 
-    private static func searchDirectoryEntries(in folder: URL) -> POSIXDirectoryEntriesResult {
-        let posixResult = posixDirectoryEntries(in: folder, options: [.skipsHiddenFiles])
+    private static func searchDirectoryEntries(
+        in folder: URL,
+        showsHiddenItems: Bool
+    ) -> POSIXDirectoryEntriesResult {
+        let options: FileManager.DirectoryEnumerationOptions = showsHiddenItems ? [] : [.skipsHiddenFiles]
+        let posixResult = posixDirectoryEntries(in: folder, options: options)
         if posixResult.availability == .unavailable(.cancelled) {
             return posixResult
         }
-        guard posixResult.availability != .available else { return posixResult }
+        guard posixResult.availability != .available else {
+            return POSIXDirectoryEntriesResult(
+                urls: visibleDirectoryEntries(posixResult.urls, showsHiddenItems: showsHiddenItems),
+                availability: posixResult.availability
+            )
+        }
 
         let fallbackResult = directoryChildrenResult(
             in: folder,
             includingPropertiesForKeys: [],
-            options: [.skipsHiddenFiles]
+            options: options
         )
         return POSIXDirectoryEntriesResult(
-            urls: fallbackResult.urls.map {
+            urls: visibleDirectoryEntries(fallbackResult.urls.map {
                 POSIXDirectoryEntry(url: $0, isDirectory: nil, isRegularFile: nil)
-            },
+            }, showsHiddenItems: showsHiddenItems),
             availability: fallbackResult.availability
         )
+    }
+
+    private static func visibleDirectoryEntries(
+        _ entries: [POSIXDirectoryEntry],
+        showsHiddenItems: Bool
+    ) -> [POSIXDirectoryEntry] {
+        guard !showsHiddenItems else { return entries }
+        return entries.filter { !isHiddenItemURL($0.url) }
     }
 
     private static func posixDirectoryEntries(
@@ -811,8 +842,17 @@ enum LocalImageSource {
         }
     }
 
-    static func folders(in folder: URL, sourceID: LibrarySource.ID, rootURL: URL) -> [LibraryFolderEntry] {
-        let entries = posixDirectoryEntries(in: folder.standardizedFileURL, options: [.skipsHiddenFiles]).urls
+    static func folders(
+        in folder: URL,
+        sourceID: LibrarySource.ID,
+        rootURL: URL,
+        showsHiddenItems: Bool = false
+    ) -> [LibraryFolderEntry] {
+        let options: FileManager.DirectoryEnumerationOptions = showsHiddenItems ? [] : [.skipsHiddenFiles]
+        let entries = visibleDirectoryEntries(
+            posixDirectoryEntries(in: folder.standardizedFileURL, options: options).urls,
+            showsHiddenItems: showsHiddenItems
+        )
         return entries.compactMap { entry in
             let isDirectory = entry.isDirectory
                 ?? (try? entry.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory)
@@ -831,6 +871,10 @@ enum LocalImageSource {
         .sorted { lhs, rhs in
             lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
+    }
+
+    static func isHiddenItemURL(_ url: URL) -> Bool {
+        url.lastPathComponent.hasPrefix(".")
     }
 
     static func tags(for size: CGSize, base: [String] = []) -> [String] {
