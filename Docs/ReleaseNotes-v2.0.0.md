@@ -20,8 +20,3 @@
 - **Apple Silicon，macOS 15 或更新版本**：`Lightbox-v2.0.0.zip`。
 - **Intel 或 Apple Silicon，macOS 13 或更新版本**：`Lightbox-Intel-x86-v2.0.0.zip`。兼容包包含两种架构，Apple Silicon 正常启动时使用 ARM 原生架构。
 - 两个 ZIP 均附带 SHA-256 校验文件。
-
-## 已知限制
-
-- 本版本使用 ad-hoc 签名，尚未完成 Developer ID 签名及 Apple 公证；首次启动可能被 macOS 安全检查拦截。
-- Intel 架构已通过本机 Rosetta 功能与自动化测试，尚未完成 macOS 13 Intel 真机验收；不代表 Intel 真机性能测试结果。
