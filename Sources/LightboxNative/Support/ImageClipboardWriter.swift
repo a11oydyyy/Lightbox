@@ -4,13 +4,7 @@ enum ImageClipboardWriter {
     static func copyImage(at url: URL) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-
-        var objects: [NSPasteboardWriting] = [url as NSURL]
-        if let image = NSImage(contentsOf: url) {
-            objects.insert(image, at: 0)
-        }
-
-        pasteboard.writeObjects(objects)
+        pasteboard.writeObjects([url as NSURL])
     }
 
     static func copyImages(at urls: [URL]) {

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum GalleryScrollDirection {
@@ -135,6 +136,101 @@ struct GalleryAssetFrameLifecycle {
     }
 }
 
+struct GalleryAssetFrameSnapshot: Equatable {
+    var selectionFrames: [LightboxAsset.ID: CGRect] = [:]
+    var previewFrames: [LightboxAsset.ID: CGRect] = [:]
+
+    mutating func merge(_ next: GalleryAssetFrameSnapshot) {
+        selectionFrames.merge(next.selectionFrames, uniquingKeysWith: { _, new in new })
+        previewFrames.merge(next.previewFrames, uniquingKeysWith: { _, new in new })
+    }
+}
+
+@MainActor
+final class GalleryFrameUpdateCoordinator {
+    private var snapshot = GalleryAssetFrameSnapshot()
+    private var pendingActiveAssetIDs: Set<LightboxAsset.ID> = []
+    private var task: Task<Void, Never>?
+
+    func submit(
+        _ snapshot: GalleryAssetFrameSnapshot,
+        activeAssetIDs: Set<LightboxAsset.ID>,
+        apply: @escaping @MainActor (GalleryAssetFrameSnapshot, Set<LightboxAsset.ID>) -> Void
+    ) {
+        self.snapshot.merge(snapshot)
+        pendingActiveAssetIDs = activeAssetIDs
+        guard task == nil else { return }
+
+        task = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard let self, !Task.isCancelled else { return }
+            self.task = nil
+            apply(self.snapshot, self.pendingActiveAssetIDs)
+        }
+    }
+
+    func flush(apply: @MainActor (GalleryAssetFrameSnapshot, Set<LightboxAsset.ID>) -> Void) {
+        task?.cancel()
+        task = nil
+        apply(snapshot, pendingActiveAssetIDs)
+    }
+
+    func remove(
+        _ assetID: LightboxAsset.ID,
+        activeAssetIDs: Set<LightboxAsset.ID>,
+        apply: @escaping @MainActor (GalleryAssetFrameSnapshot, Set<LightboxAsset.ID>) -> Void
+    ) {
+        snapshot.selectionFrames.removeValue(forKey: assetID)
+        snapshot.previewFrames.removeValue(forKey: assetID)
+        submit(GalleryAssetFrameSnapshot(), activeAssetIDs: activeAssetIDs, apply: apply)
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+        snapshot = GalleryAssetFrameSnapshot()
+        pendingActiveAssetIDs = []
+    }
+}
+
+@MainActor
+private final class GalleryMasonryColumnCache {
+    private struct Key: Hashable {
+        var identity: String
+        var columnCount: Int
+        var itemWidthTenths: Int
+    }
+
+    private var revision = -1
+    private var columnsByKey: [Key: [[LightboxAsset]]] = [:]
+
+    func columns(
+        identity: String,
+        revision: Int,
+        columnCount: Int,
+        itemWidth: CGFloat,
+        compute: () -> [[LightboxAsset]]
+    ) -> [[LightboxAsset]] {
+        if self.revision != revision {
+            self.revision = revision
+            columnsByKey.removeAll(keepingCapacity: true)
+        }
+
+        let key = Key(
+            identity: identity,
+            columnCount: columnCount,
+            itemWidthTenths: Int((itemWidth * 10).rounded())
+        )
+        if let cached = columnsByKey[key] {
+            return cached
+        }
+
+        let columns = compute()
+        columnsByKey[key] = columns
+        return columns
+    }
+}
+
 struct GalleryPerformanceProfile: Equatable {
     var isCompatibilityMode: Bool
 
@@ -211,14 +307,23 @@ struct GalleryView: View {
     @State private var scrollVisibilityGeneration = 0
     @State private var scrollFadeTask: Task<Void, Never>?
     @State private var contentVisible = true
+    @State private var restoredScrollGeneration = -1
+    @State private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
+    @State private var masonryColumnCache = GalleryMasonryColumnCache()
 
-    private let horizontalPadding: CGFloat = 18
+    private let horizontalPadding = GalleryThumbnailSizing.horizontalPadding
 
     // Changes only on real navigation (source / folder / filter), not when the
     // asset array mutates during metadata streaming — so the entrance plays on
     // navigation, never on every background metadata batch.
     private var navigationToken: String {
-        "\(appState.selectedSourceID)|\(appState.currentFolderURL.path)|\(appState.selectedFilter.identityKey)"
+        "\(appState.activeTabID.uuidString)|\(appState.selectedSourceID)|\(appState.currentFolderURL.path)|\(appState.selectedFilter.identityKey)"
+    }
+
+    private var scrollRestoreAvailabilityToken: String {
+        let anchorID = appState.activeTabScrollAnchorAssetID
+        let isAvailable = anchorID.map { id in appState.activeAssets.contains(where: { $0.id == id }) } ?? true
+        return "\(appState.scrollRestoreGeneration)|\(isAvailable)"
     }
 
     // Container-level entrance: a single gentle fade + settle for the whole grid,
@@ -287,26 +392,35 @@ struct GalleryView: View {
             let usesReducedHover = appState.libraryLoadingStatus != nil || performanceProfile.reducesHoverEffects
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
-            let searchGroups = appState.hasSearchQuery ? appState.searchAssetGroups : []
-            let shouldGroupSearchAssets = appState.hasSearchQuery && searchGroups.count > 1
+            let searchGroups = appState.usesRecursiveResults ? appState.searchAssetGroups : []
+            let shouldGroupSearchAssets = appState.usesRecursiveResults && searchGroups.count > 1
             let showsSearchLimitHint = appState.searchStatus?.limitReached == true
 
             ZStack(alignment: .trailing) {
-                ScrollView(.vertical) {
+                ScrollViewReader { scrollProxy in
+                    ScrollView(.vertical) {
                     VStack(spacing: 0) {
                         ScrollOffsetProbe()
 
                         if !visibleFolders.isEmpty {
                             FolderRowView(
                                 folders: visibleFolders,
+                                title: appState.localized(.folders),
                                 showInFinderTitle: appState.localized(.showInFinder),
+                                openInNewTabTitle: appState.localized(.openInNewTab),
                                 showsRelativePath: appState.hasSearchQuery
                             ) { folder in
-                                appState.openFolder(folder)
+                                if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
+                                    appState.openFolderInNewTab(folder)
+                                } else {
+                                    appState.openFolder(folder)
+                                }
+                            } openInNewTab: { folder in
+                                appState.openFolderInNewTab(folder)
                             } reveal: { folder in
                                 appState.revealFolderInFinder(folder)
                             }
-                            .padding(.top, 70)
+                            .padding(.top, 58)
                             .padding(.horizontal, folderHorizontalPadding)
                             .padding(.bottom, 16)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -314,8 +428,8 @@ struct GalleryView: View {
                         }
 
                         if showsSearchLimitHint {
-                            SearchLimitHint(message: appState.localized(.searchResultsLimited))
-                                .padding(.top, visibleFolders.isEmpty ? 70 : 0)
+                            SearchLimitHint(message: appState.localized(appState.includesSubfolders ? .recursiveResultsIncomplete : .searchResultsLimited))
+                                .padding(.top, visibleFolders.isEmpty ? 58 : 0)
                                 .padding(.horizontal, horizontalPadding)
                                 .padding(.bottom, 14)
                         }
@@ -326,10 +440,17 @@ struct GalleryView: View {
                                     ForEach(searchGroups) { group in
                                         VStack(alignment: .leading, spacing: 10) {
                                             SearchGroupHeader(title: group.title, count: group.assets.count)
+                                                .frame(width: galleryMetrics(
+                                                    viewportWidth: viewport.size.width,
+                                                    minimumColumns: min(GalleryThumbnailSizing.maximumZoomColumnCount, max(1, group.assets.count))
+                                                ).usedWidth)
+                                                .frame(maxWidth: .infinity)
                                                 .padding(.horizontal, horizontalPadding)
 
                                             assetGrid(
                                                 activeAssets: group.assets,
+                                                activeAssetIDs: activeAssetIDs,
+                                                cacheIdentity: group.id,
                                                 viewportWidth: viewport.size.width,
                                                 loadableAssetIDs: loadableAssetIDs,
                                                 prioritizedAssetIDs: prioritizedAssetIDs,
@@ -347,6 +468,8 @@ struct GalleryView: View {
                             } else {
                                 assetGrid(
                                     activeAssets: activeAssets,
+                                    activeAssetIDs: activeAssetIDs,
+                                    cacheIdentity: "active",
                                     viewportWidth: viewport.size.width,
                                     loadableAssetIDs: loadableAssetIDs,
                                     prioritizedAssetIDs: prioritizedAssetIDs,
@@ -360,7 +483,7 @@ struct GalleryView: View {
                                 .padding(.horizontal, horizontalPadding)
                             }
                         }
-                        .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? 70 : 0)
+                        .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? 58 : 0)
                         .padding(.bottom, 92)
                         .background(ContentHeightProbe())
                         .opacity(contentVisible ? 1 : 0)
@@ -368,58 +491,63 @@ struct GalleryView: View {
                         .animation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion), value: appState.thumbnailWidth)
                         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.galleryLayoutMode)
                     }
-                }
-                .scrollIndicators(.hidden)
-                .id(navigationToken)
-                .coordinateSpace(name: "GalleryScroll")
-                .contextMenu {
-                    backgroundContextMenu
-                }
-                .onPreferenceChange(AssetFramePreferenceKey.self) { frames in
-                    updateAssetFramesIfNeeded(frames, activeAssetIDs: activeAssetIDs)
-                }
-                .onPreferenceChange(PreviewSpaceAssetFramePreferenceKey.self) { frames in
-                    appState.updatePreviewSpaceAssetFrames(
-                        GalleryAssetFrameLifecycle.activeFrames(frames, activeAssetIDs: activeAssetIDs)
-                    )
-                }
-                .onPreferenceChange(FolderRowFramePreferenceKey.self) { frame in
-                    folderRowFrame = frame
-                }
-                .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
-                    noteScroll(
-                        offset: offset,
-                        contentHeight: scrollContentHeight,
-                        viewportHeight: viewport.size.height
-                    )
-                }
-                .onPreferenceChange(ContentHeightPreferenceKey.self) { height in
-                    noteScroll(
-                        offset: scrollOffset,
-                        contentHeight: height,
-                        viewportHeight: viewport.size.height
-                    )
-                }
-                .onAppear {
-                    playContentEntrance()
-                    lastViewportWidth = viewport.size.width
-                }
-                .onChange(of: navigationToken) { _ in
-                    assetFrames = [:]
-                    folderRowFrame = nil
-                    selectionRect = nil
-                    appState.updatePreviewSpaceAssetFrames([:])
-                    playContentEntrance()
-                }
-                .onChange(of: viewport.size.width) { width in
-                    lastViewportWidth = width
-                }
-                .onChange(of: isResizingSidebar) { resizing in
-                    if resizing {
-                        frozenColumns = galleryMetrics(viewportWidth: lastViewportWidth).columns
-                    } else {
-                        withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
-                            frozenColumns = nil
+                    }
+                    .scrollIndicators(.hidden)
+                    .id(navigationToken)
+                    .coordinateSpace(name: "GalleryScroll")
+                    .contextMenu {
+                        backgroundContextMenu
+                    }
+                    .onPreferenceChange(FolderRowFramePreferenceKey.self) { frame in
+                        folderRowFrame = frame
+                    }
+                    .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
+                        noteScroll(
+                            offset: offset,
+                            contentHeight: scrollContentHeight,
+                            viewportHeight: viewport.size.height
+                        )
+                    }
+                    .onPreferenceChange(ContentHeightPreferenceKey.self) { height in
+                        noteScroll(
+                            offset: scrollOffset,
+                            contentHeight: height,
+                            viewportHeight: viewport.size.height
+                        )
+                    }
+                    .onAppear {
+                        playContentEntrance()
+                        lastViewportWidth = viewport.size.width
+                        restoreScrollIfNeeded(using: scrollProxy)
+                    }
+                    .onChange(of: navigationToken) { _ in
+                        frameUpdateCoordinator.cancel()
+                        assetFrames = [:]
+                        folderRowFrame = nil
+                        selectionRect = nil
+                        appState.updatePreviewSpaceAssetFrames([:])
+                        playContentEntrance()
+                        restoreScrollIfNeeded(using: scrollProxy)
+                    }
+                    .onChange(of: appState.galleryKeyboardScrollGeneration) { _ in
+                        guard !appState.hasActiveOverlay, let id = appState.galleryKeyboardFocusID else { return }
+                        if let frame = appState.previewSpaceFrame(for: id),
+                           frame.minY >= 52, frame.maxY <= viewport.size.height - 55 { return }
+                        scrollProxy.scrollTo(id, anchor: .center)
+                    }
+                    .onChange(of: scrollRestoreAvailabilityToken) { _ in
+                        restoreScrollIfNeeded(using: scrollProxy)
+                    }
+                    .onChange(of: viewport.size.width) { width in
+                        lastViewportWidth = width
+                    }
+                    .onChange(of: isResizingSidebar) { resizing in
+                        if resizing {
+                            frozenColumns = galleryMetrics(viewportWidth: lastViewportWidth).columns
+                        } else {
+                            withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
+                                frozenColumns = nil
+                            }
                         }
                     }
                 }
@@ -456,7 +584,7 @@ struct GalleryView: View {
                 if let status = appState.libraryLoadingStatus {
                     GalleryLoadingIndicator(label: appState.loadingStatusText(status))
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                        .padding(.top, 70)
+                        .padding(.top, 58)
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
                 }
 
@@ -471,7 +599,7 @@ struct GalleryView: View {
                         appState.openFullDiskAccessSettings()
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                    .padding(.top, 70)
+                    .padding(.top, 58)
                     .transition(.opacity.combined(with: .lightboxBlurReplace))
                 }
 
@@ -481,16 +609,16 @@ struct GalleryView: View {
                         title: emptyStateTitle
                     )
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                        .padding(.top, 70)
+                        .padding(.top, 58)
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
                 }
 
                 if appState.searchStatus?.isSearching == true {
-                    ProgressView()
+                    ProgressView(appState.localized(appState.includesSubfolders ? .scanningSubfolders : .searchingImages))
                         .progressViewStyle(.circular)
                         .controlSize(.regular)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                        .padding(.top, 70)
+                        .padding(.top, 58)
                         .transition(.opacity)
                         .allowsHitTesting(false)
                 }
@@ -553,6 +681,7 @@ struct GalleryView: View {
         scrollOffset = nextOffset
         scrollContentHeight = nextContentHeight
         scrollViewportHeight = nextViewportHeight
+        updateScrollAnchor(using: assetFrames)
 
         if nextIndicatorVisible {
             scrollIndicatorVisible = true
@@ -583,6 +712,48 @@ struct GalleryView: View {
             activeAssetIDs: activeAssetIDs
         ) {
             assetFrames = replacement
+            updateScrollAnchor(using: replacement)
+        }
+    }
+
+    private func applyAssetFrameSnapshot(
+        _ snapshot: GalleryAssetFrameSnapshot,
+        activeAssetIDs: Set<LightboxAsset.ID>
+    ) {
+        updateAssetFramesIfNeeded(snapshot.selectionFrames, activeAssetIDs: activeAssetIDs)
+        appState.updatePreviewSpaceAssetFrames(
+            GalleryAssetFrameLifecycle.activeFrames(
+                snapshot.previewFrames,
+                activeAssetIDs: activeAssetIDs
+            )
+        )
+    }
+
+    private func updateScrollAnchor(using frames: [LightboxAsset.ID: CGRect]) {
+        guard scrollOffset > 40 else {
+            appState.updateActiveTabScrollAnchor(nil)
+            return
+        }
+
+        let anchorID = frames
+            .filter { $0.value.maxY >= 0 }
+            .min { abs($0.value.minY) < abs($1.value.minY) }?
+            .key
+        appState.updateActiveTabScrollAnchor(anchorID)
+    }
+
+    private func restoreScrollIfNeeded(using proxy: ScrollViewProxy) {
+        let generation = appState.scrollRestoreGeneration
+        guard restoredScrollGeneration != generation else { return }
+        guard let anchorID = appState.activeTabScrollAnchorAssetID else {
+            restoredScrollGeneration = generation
+            return
+        }
+        guard appState.activeAssets.contains(where: { $0.id == anchorID }) else { return }
+
+        restoredScrollGeneration = generation
+        DispatchQueue.main.async {
+            proxy.scrollTo(anchorID, anchor: .top)
         }
     }
 
@@ -644,6 +815,8 @@ struct GalleryView: View {
     @ViewBuilder
     private func assetGrid(
         activeAssets: [LightboxAsset],
+        activeAssetIDs: Set<LightboxAsset.ID>,
+        cacheIdentity: String,
         viewportWidth: CGFloat,
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
@@ -654,67 +827,56 @@ struct GalleryView: View {
         performanceProfile: GalleryPerformanceProfile,
         menuTitles: AssetContextMenuTitles
     ) -> some View {
-        let metrics = galleryMetrics(viewportWidth: viewportWidth)
+        let minimumColumns = min(
+            GalleryThumbnailSizing.maximumZoomColumnCount,
+            max(1, activeAssets.count)
+        )
+        let metrics = galleryMetrics(
+            viewportWidth: viewportWidth,
+            minimumColumns: minimumColumns
+        )
 
-        switch appState.galleryLayoutMode {
-        case .masonry:
-            let columns = masonryColumns(for: activeAssets, columnCount: metrics.columns, itemWidth: metrics.itemWidth)
-            HStack(alignment: .top, spacing: SpacingTokens.regular) {
-                ForEach(Array(columns.enumerated()), id: \.offset) { _, columnAssets in
-                    LazyVStack(spacing: SpacingTokens.regular) {
-                        ForEach(columnAssets) { asset in
-                            assetCard(
-                                asset,
-                                itemWidth: metrics.itemWidth,
-                                itemHeight: metrics.itemWidth / max(0.35, asset.aspectRatio),
-                                loadableAssetIDs: loadableAssetIDs,
-                                prioritizedAssetIDs: prioritizedAssetIDs,
-                                thumbnailQuality: thumbnailQuality,
-                                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
-                                prefersFastRawThumbnails: prefersFastRawThumbnails,
-                                usesReducedHover: usesReducedHover,
-                                performanceProfile: performanceProfile,
-                                menuTitles: menuTitles
-                            )
-                        }
-                    }
-                    .frame(width: metrics.itemWidth)
-                }
-            }
-            .frame(width: metrics.usedWidth)
-            .frame(maxWidth: .infinity, alignment: .center)
-
-        case .grid:
-            let columns = Array(
-                repeating: GridItem(.fixed(metrics.itemWidth), spacing: SpacingTokens.regular),
-                count: metrics.columns
-            )
-            LazyVGrid(columns: columns, alignment: .center, spacing: SpacingTokens.regular) {
-                ForEach(activeAssets) { asset in
-                    assetCard(
-                        asset,
-                        itemWidth: metrics.itemWidth,
-                        itemHeight: metrics.itemWidth,
-                        loadableAssetIDs: loadableAssetIDs,
-                        prioritizedAssetIDs: prioritizedAssetIDs,
-                        thumbnailQuality: thumbnailQuality,
-                        permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
-                        prefersFastRawThumbnails: prefersFastRawThumbnails,
-                        usesReducedHover: usesReducedHover,
-                        performanceProfile: performanceProfile,
-                        menuTitles: menuTitles
-                    )
-                }
-            }
-            .frame(width: metrics.usedWidth)
-            .frame(maxWidth: .infinity, alignment: .center)
+        let columns = masonryColumnCache.columns(
+            identity: cacheIdentity,
+            revision: appState.activeAssetsRevision,
+            columnCount: metrics.columns,
+            itemWidth: metrics.itemWidth
+        ) {
+            masonryColumns(for: activeAssets, columnCount: metrics.columns, itemWidth: metrics.itemWidth)
         }
+        HStack(alignment: .top, spacing: SpacingTokens.regular) {
+            ForEach(Array(columns.enumerated()), id: \.offset) { _, columnAssets in
+                LazyVStack(spacing: SpacingTokens.regular) {
+                    ForEach(columnAssets) { asset in
+                        assetCard(
+                            asset,
+                            itemWidth: metrics.itemWidth,
+                            itemHeight: metrics.itemWidth / max(0.35, asset.aspectRatio),
+                            activeAssetIDs: activeAssetIDs,
+                            loadableAssetIDs: loadableAssetIDs,
+                            prioritizedAssetIDs: prioritizedAssetIDs,
+                            thumbnailQuality: thumbnailQuality,
+                            permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
+                            prefersFastRawThumbnails: prefersFastRawThumbnails,
+                            usesReducedHover: usesReducedHover,
+                            performanceProfile: performanceProfile,
+                            menuTitles: menuTitles
+                        )
+                    }
+                }
+                .frame(width: metrics.itemWidth)
+            }
+        }
+        .frame(width: metrics.usedWidth)
+        .frame(maxWidth: .infinity, alignment: .center)
+
     }
 
     private func assetCard(
         _ asset: LightboxAsset,
         itemWidth: CGFloat,
         itemHeight: CGFloat,
+        activeAssetIDs: Set<LightboxAsset.ID>,
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
         thumbnailQuality: ImageCacheQuality,
@@ -726,6 +888,11 @@ struct GalleryView: View {
     ) -> some View {
         return AssetCardView(
             asset: asset,
+            keyboardFocusRequested: appState.galleryKeyboardFocusID == asset.id,
+            onKeyboard: { key, modifiers in appState.handleGalleryKey(key, modifiers: modifiers, from: asset.id) },
+            onActivate: {
+                appState.showPreview(for: asset, sourceFrame: appState.previewSpaceFrame(for: asset.id))
+            },
             // Suppress the source card's selection glow while its preview is
             // presented/closing — otherwise the card un-hides (at the source-reveal
             // delay) still "selected" and the glow flashes for a few frames before
@@ -750,12 +917,16 @@ struct GalleryView: View {
             usesReducedHover: usesReducedHover,
             isComparePulse: appState.compareTrayPulseID == asset.id,
             showsPressFeedback: !appState.hasExplicitSelection,
+            dragSourceURLs: { appState.dragSourceURLs(for: asset) },
             onClick: { click in
+                frameUpdateCoordinator.flush { snapshot, ids in
+                    applyAssetFrameSnapshot(snapshot, activeAssetIDs: ids)
+                }
                 appState.handleAssetClick(
                     asset,
                     modifiers: click.modifierFlags,
                     click: click,
-                    sourceFrame: appState.previewSpaceFrame(for: asset.id) ?? assetFrames[asset.id]
+                    sourceFrame: appState.previewSpaceFrame(for: asset.id) ?? click.windowTopLeftFrame
                 )
             },
             onRestore: {
@@ -786,7 +957,17 @@ struct GalleryView: View {
         .equatable()
         .id(asset.id)
         .frame(width: itemWidth, height: itemHeight)
-        .background(AssetFrameProbe(id: asset.id))
+        .background {
+            AssetFrameProbe(id: asset.id) { snapshot in
+                frameUpdateCoordinator.submit(snapshot, activeAssetIDs: activeAssetIDs) { snapshot, activeAssetIDs in
+                    applyAssetFrameSnapshot(snapshot, activeAssetIDs: activeAssetIDs)
+                }
+            } onDisappear: {
+                frameUpdateCoordinator.remove(asset.id, activeAssetIDs: activeAssetIDs) { snapshot, activeAssetIDs in
+                    applyAssetFrameSnapshot(snapshot, activeAssetIDs: activeAssetIDs)
+                }
+            }
+        }
     }
 
     private func compareMenuTitle(for asset: LightboxAsset) -> String {
@@ -815,18 +996,39 @@ struct GalleryView: View {
     }
 
     private func imageColumnInset(viewportWidth: CGFloat) -> CGFloat {
-        galleryMetrics(viewportWidth: viewportWidth).leadingInset
+        let minimumColumns = min(
+            GalleryThumbnailSizing.maximumZoomColumnCount,
+            max(1, appState.activeAssets.count)
+        )
+        return galleryMetrics(
+            viewportWidth: viewportWidth,
+            minimumColumns: minimumColumns
+        ).leadingInset
     }
 
-    private func galleryMetrics(viewportWidth: CGFloat) -> (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat, leadingInset: CGFloat) {
+    private func galleryMetrics(
+        viewportWidth: CGFloat,
+        minimumColumns: Int = GalleryThumbnailSizing.maximumZoomColumnCount
+    ) -> (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat, leadingInset: CGFloat) {
         let availableWidth = max(1, viewportWidth - horizontalPadding * 2)
         let spacing = SpacingTokens.regular
-        let computedColumns = max(1, Int((availableWidth + spacing) / (appState.thumbnailWidth + spacing)))
+        let minimumColumns = max(1, minimumColumns)
+        let effectiveThumbnailWidth = min(
+            appState.thumbnailWidth,
+            GalleryThumbnailSizing.maximumWidth(
+                viewportWidth: viewportWidth,
+                columnCount: minimumColumns
+            )
+        )
+        let computedColumns = max(
+            minimumColumns,
+            Int((availableWidth + spacing) / (effectiveThumbnailWidth + spacing))
+        )
         // While resizing the sidebar, hold the column count steady (only itemWidth
         // shrinks) so images don't jump between columns every frame; re-column on release.
         let columns = isResizingSidebar ? (frozenColumns ?? computedColumns) : computedColumns
         let maxItemWidth = floor((availableWidth - CGFloat(columns - 1) * spacing) / CGFloat(columns))
-        let itemWidth = min(appState.thumbnailWidth, maxItemWidth)
+        let itemWidth = min(effectiveThumbnailWidth, maxItemWidth)
         let usedWidth = CGFloat(columns) * itemWidth + CGFloat(columns - 1) * spacing
         let leadingInset = max(0, floor((availableWidth - usedWidth) / 2))
         return (columns, itemWidth, usedWidth, leadingInset)
@@ -859,18 +1061,18 @@ private struct TrashAccessHint: View {
         HStack(spacing: 12) {
             Text(message)
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.primary.opacity(0.72))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
                 .lineLimit(1)
 
             Button(action: action) {
                 Text(actionTitle)
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.primary.opacity(0.88))
+                    .foregroundStyle(LightboxColorTokens.primaryText)
                     .padding(.horizontal, 10)
                     .frame(height: 24)
                     .contentShape(Capsule())
             }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.018, glowOpacity: 0.14))
+            .buttonStyle(LightboxButtonHoverStyle(shape: Capsule()))
         }
         .padding(.leading, 14)
         .padding(.trailing, 7)
@@ -884,7 +1086,7 @@ private struct TrashAccessHint: View {
             Capsule()
                 .stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
         }
-        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 4)
+        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 3)
     }
 }
 
@@ -901,7 +1103,7 @@ private struct GalleryEmptyState: View {
 
             Text(title)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.46))
+                .foregroundStyle(LightboxColorTokens.mutedText)
         }
         .allowsHitTesting(false)
     }
@@ -915,13 +1117,13 @@ private struct SearchGroupHeader: View {
         HStack(spacing: 8) {
             Text(title)
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.primary.opacity(0.70))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
                 .lineLimit(1)
                 .truncationMode(.middle)
 
             Text("\(count)")
                 .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(.secondary.opacity(0.72))
+                .foregroundStyle(LightboxColorTokens.mutedText)
                 .monospacedDigit()
 
             Rectangle()
@@ -948,11 +1150,11 @@ private struct SearchLimitHint: View {
             Image(systemName: "exclamationmark.circle")
                 .font(.system(size: 12, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(Color.primary.opacity(0.52))
+                .foregroundStyle(LightboxColorTokens.mutedText)
 
             Text(message)
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.primary.opacity(0.66))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
         }
@@ -967,7 +1169,7 @@ private struct SearchLimitHint: View {
             Capsule()
                 .stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
         }
-        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 4)
+        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 3)
         .frame(maxWidth: .infinity, alignment: .center)
     }
 }
@@ -989,7 +1191,7 @@ private struct GalleryLoadingIndicator: View {
 
             Text(label)
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.primary.opacity(0.72))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
                 .monospacedDigit()
         }
         .padding(.horizontal, 13)
@@ -1003,7 +1205,7 @@ private struct GalleryLoadingIndicator: View {
             Capsule()
                 .stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
         }
-        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 4)
+        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 3)
             .allowsHitTesting(false)
     }
 }
@@ -1036,54 +1238,73 @@ private struct LightboxLoadingSpinner: View {
 }
 
 private struct FolderRowView: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @AppStorage("Lightbox.folderTileWidth") private var folderTileWidth: Double = 180
-    private static let bulkFolderInteractionThreshold = 160
+    @EnvironmentObject private var appState: AppState
+    private let folderTileWidth: CGFloat = 180
+    @State private var isExpanded = true
 
     var folders: [LibraryFolderEntry]
+    var title: String
     var showInFinderTitle: String
+    var openInNewTabTitle: String
     var showsRelativePath = false
     var open: (LibraryFolderEntry) -> Void
+    var openInNewTab: (LibraryFolderEntry) -> Void
     var reveal: (LibraryFolderEntry) -> Void
 
-    // The slider controls the minimum tile width; adaptive columns then stretch
-    // to consume the row so wide windows do not leave a large blank gutter.
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: CGFloat(folderTileWidth)), spacing: 10, alignment: .leading)]
+        [GridItem(.adaptive(minimum: max(160, CGFloat(folderTileWidth))), spacing: 16, alignment: .leading)]
     }
 
     var body: some View {
-        let usesBulkInteractionMode = folders.count >= Self.bulkFolderInteractionThreshold
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
-            ForEach(folders) { folder in
-                FolderCardView(
-                    folder: folder,
-                    showInFinderTitle: showInFinderTitle,
-                    showsRelativePath: showsRelativePath,
-                    usesBulkInteractionMode: usesBulkInteractionMode,
-                    open: open,
-                    reveal: reveal
-                )
+        VStack(alignment: .leading, spacing: 6) {
+            Button { isExpanded.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 12)
+                    Text("\(title) · \(folders.count)")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(LightboxColorTokens.mutedText)
+                .frame(height: 26)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(appState.localized(isExpanded ? .expandedState : .collapsedState))
+
+            if isExpanded {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 2) {
+                    ForEach(folders) { folder in
+                        FolderCardView(
+                            folder: folder,
+                            showInFinderTitle: showInFinderTitle,
+                            openInNewTabTitle: openInNewTabTitle,
+                            showsRelativePath: showsRelativePath,
+                            isSelected: appState.selectedGalleryFolderID == folder.id,
+                            clearSelection: { appState.clearSelection() },
+                            open: open,
+                            openInNewTab: openInNewTab,
+                            reveal: reveal
+                        )
+                    }
+                }
             }
         }
-        .transaction { transaction in
-            if usesBulkInteractionMode {
-                transaction.animation = nil
-            }
-        }
-        .animation(
-            usesBulkInteractionMode ? nil : MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion),
-            value: folderTileWidth
-        )
     }
 }
 
 private struct FolderCardView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var folder: LibraryFolderEntry
     var showInFinderTitle: String
+    var openInNewTabTitle: String
     var showsRelativePath: Bool
-    var usesBulkInteractionMode: Bool
+    var isSelected: Bool
+    var clearSelection: () -> Void
+    @FocusState private var hasFocus: Bool
+    @State private var isHovering = false
     var open: (LibraryFolderEntry) -> Void
+    var openInNewTab: (LibraryFolderEntry) -> Void
     var reveal: (LibraryFolderEntry) -> Void
 
     @State private var loadedTags: [String]?
@@ -1098,8 +1319,7 @@ private struct FolderCardView: View {
 
     var body: some View {
         let tags = resolvedTags
-        let tint = folderTint(tags)
-        let iconColor = tint?.opacity(0.92) ?? Color.secondary
+        let iconColor = LightboxColorTokens.folderColor(tags)
 
         Button {
             open(folder)
@@ -1113,8 +1333,8 @@ private struct FolderCardView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(folder.name)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.primary.opacity(0.88))
-                        .lineLimit(showsRelativePath ? 1 : 2)
+                        .foregroundStyle(LightboxColorTokens.primaryText)
+                        .lineLimit(1)
                         .truncationMode(.middle)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1124,7 +1344,7 @@ private struct FolderCardView: View {
                        folder.relativePath != folder.name {
                         Text(folder.relativePath)
                             .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary.opacity(0.78))
+                            .foregroundStyle(LightboxColorTokens.mutedText)
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
@@ -1134,25 +1354,33 @@ private struct FolderCardView: View {
 
                 FolderTagDots(tags: tags)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, minHeight: showsRelativePath ? 44 : 36, alignment: .leading)
             .background {
-                RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
-                    .fill(folderFillColor(tint))
+                RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)
+                    .fill(isSelected ? LightboxColorTokens.navigationSelection : (isHovering ? LightboxColorTokens.primaryText.opacity(LightboxControlMetrics.hoverOpacity) : Color.clear))
+                    .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isHovering)
+                    .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isSelected)
             }
             .overlay {
-                RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
-                    .stroke(folderStrokeColor(tint), lineWidth: 0.7)
+                if hasFocus && !isSelected {
+                    RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)
+                        .strokeBorder(LightboxColorTokens.secondaryText, lineWidth: LightboxControlMetrics.focusLineWidth)
+                        .allowsHitTesting(false)
+                }
             }
-            .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
+            .contentShape(Rectangle())
         }
-        .buttonStyle(LightboxButtonHoverStyle(
-            shape: RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous),
-            hoverScale: usesBulkInteractionMode ? 1.0 : 1.018,
-            glowOpacity: usesBulkInteractionMode ? 0.04 : 0.13
-        ))
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .onDrag { NSItemProvider(object: folder.url as NSURL) }
         .contextMenu {
+            Button {
+                openInNewTab(folder)
+            } label: {
+                Text(openInNewTabTitle)
+            }
+
             Button {
                 reveal(folder)
             } label: {
@@ -1161,7 +1389,17 @@ private struct FolderCardView: View {
         }
         .help(folder.name)
         .accessibilityElement(children: .ignore)
+        .focusable()
+        .modifier(FolderFocusEffect(open: { open(folder) }))
+        .focused($hasFocus)
+        .background(FolderFocusDismissal(isFocused: hasFocus) { hasFocus = false })
+        .onExitCommand(perform: clearSelection)
+        .onChange(of: isSelected) { selected in
+            if selected { hasFocus = true }
+        }
         .accessibilityLabel(folderAccessibilityLabel(tags))
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { open(folder) }
         .task(id: tagLoadID) {
             await loadTagsIfNeeded()
         }
@@ -1190,30 +1428,71 @@ private struct FolderCardView: View {
         return ([folder.name] + sortedTags).joined(separator: ", ")
     }
 
-    private func folderTint(_ tags: [String]) -> Color? {
-        guard let firstName = tags.first,
-              let tag = MacColorTag.all.first(where: { $0.name == firstName })
-        else {
-            return nil
-        }
 
-        return tag.color
+}
+
+private struct FolderFocusDismissal: NSViewRepresentable {
+    var isFocused: Bool
+    var dismiss: () -> Void
+
+    func makeNSView(context: Context) -> FolderFocusDismissalView {
+        FolderFocusDismissalView()
     }
 
-    private func folderFillColor(_ tint: Color?) -> Color {
-        if let tint {
-            return tint.opacity(0.075)
-        }
-
-        return Color(nsColor: .controlBackgroundColor).opacity(0.48)
+    func updateNSView(_ view: FolderFocusDismissalView, context: Context) {
+        view.dismiss = dismiss
+        view.setObserving(isFocused)
     }
 
-    private func folderStrokeColor(_ tint: Color?) -> Color {
-        if let tint {
-            return tint.opacity(0.22)
-        }
+    static func dismantleNSView(_ view: FolderFocusDismissalView, coordinator: ()) {
+        view.setObserving(false)
+    }
+}
 
-        return .black.opacity(0.06)
+private final class FolderFocusDismissalView: NSView {
+    var dismiss: () -> Void = {}
+    nonisolated(unsafe) private var monitor: Any?
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setObserving(_ enabled: Bool) {
+        if !enabled {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        } else if monitor == nil {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                MainActor.assumeIsolated {
+                    if let self, let window = self.window, event.window === window,
+                       !self.bounds.contains(self.convert(event.locationInWindow, from: nil)) {
+                        self.dismiss()
+                    }
+                }
+                return event
+            }
+        }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+}
+
+private struct FolderFocusEffect: ViewModifier {
+    var open: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+                .onKeyPress(keys: [.space, .return]) { press in
+                    guard press.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
+                    guard press.phase == .down else { return .handled }
+                    open()
+                    return .handled
+                }
+        } else {
+            content
+        }
     }
 }
 
@@ -1247,17 +1526,25 @@ private struct FolderTagDots: View {
 
 private struct AssetFrameProbe: View {
     var id: LightboxAsset.ID
+    var onUpdate: (GalleryAssetFrameSnapshot) -> Void
+    var onDisappear: () -> Void
 
     var body: some View {
         GeometryReader { proxy in
-            Color.clear.preference(
-                key: AssetFramePreferenceKey.self,
-                value: [id: proxy.frame(in: .named("GallerySelectionSpace"))]
-            )
-            .preference(
-                key: PreviewSpaceAssetFramePreferenceKey.self,
-                value: [id: proxy.frame(in: .named("PreviewSpace"))]
-            )
+            let snapshot = GalleryAssetFrameSnapshot(
+                    selectionFrames: [id: proxy.frame(in: .named("GallerySelectionSpace"))],
+                    previewFrames: [id: proxy.frame(in: .named("PreviewSpace"))]
+                )
+            Color.clear
+                .onAppear {
+                    onUpdate(snapshot)
+                }
+                .onChange(of: snapshot) { updatedSnapshot in
+                    onUpdate(updatedSnapshot)
+                }
+                .onDisappear {
+                    onDisappear()
+                }
         }
     }
 }
@@ -1270,22 +1557,6 @@ private struct FolderRowFrameProbe: View {
                 value: proxy.frame(in: .named("GallerySelectionSpace"))
             )
         }
-    }
-}
-
-private struct AssetFramePreferenceKey: PreferenceKey {
-    static let defaultValue: [LightboxAsset.ID: CGRect] = [:]
-
-    static func reduce(value: inout [LightboxAsset.ID: CGRect], nextValue: () -> [LightboxAsset.ID: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-private struct PreviewSpaceAssetFramePreferenceKey: PreferenceKey {
-    static let defaultValue: [LightboxAsset.ID: CGRect] = [:]
-
-    static func reduce(value: inout [LightboxAsset.ID: CGRect], nextValue: () -> [LightboxAsset.ID: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

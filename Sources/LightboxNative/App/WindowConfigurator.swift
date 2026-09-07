@@ -2,8 +2,10 @@ import AppKit
 import SwiftUI
 
 struct WindowConfigurator: NSViewRepresentable {
+    @ObservedObject var appState: AppState
+
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(appState: appState)
     }
 
     func makeNSView(context: Context) -> NSView {
@@ -14,10 +16,64 @@ struct WindowConfigurator: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.configureIfNeeded(from: nsView)
+        context.coordinator.updateSidebarButton()
     }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject, NSToolbarDelegate {
+        private let appState: AppState
+        private var headerAccessory: NSTitlebarAccessoryViewController?
+        private var headerHost: NativeNavigationBar?
+        private let sidebarItemID = NSToolbarItem.Identifier("Lightbox.ToggleSidebar")
+        private var sidebarButton: NSButton?
+        private var sidebarItem: NSToolbarItem?
+
+        init(appState: AppState) {
+            self.appState = appState
+            super.init()
+        }
+
+        func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+            [sidebarItemID]
+        }
+
+        func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+            [sidebarItemID]
+        }
+
+        func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+            guard itemIdentifier == sidebarItemID else { return nil }
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.isNavigational = true
+            let button = NSButton(image: NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: nil)!, target: self, action: #selector(toggleSidebar))
+            button.bezelStyle = .texturedRounded
+            button.isBordered = false
+            button.imagePosition = .imageOnly
+            button.setFrameSize(NSSize(width: 36, height: 32))
+            item.view = button
+            item.label = appState.localized(.openSidebar)
+            sidebarItem = item
+            sidebarButton = button
+            updateSidebarButton()
+            return item
+        }
+
+        func updateSidebarButton() {
+            let title = appState.localized(appState.sidebarCollapsed ? .openSidebar : .closeSidebar)
+            sidebarItem?.label = title
+            sidebarItem?.toolTip = title
+            sidebarButton?.toolTip = title
+            sidebarButton?.setAccessibilityLabel(title)
+            sidebarButton?.isEnabled = appState.previewAssetID == nil && !appState.isComparing
+            headerHost?.refresh()
+        }
+
+        @objc private func toggleSidebar() {
+            guard appState.previewAssetID == nil && !appState.isComparing else { return }
+            appState.sidebarCollapsed.toggle()
+            updateSidebarButton()
+        }
+
         private weak var configuredWindow: NSWindow?
         private var pendingConfigure = false
 
@@ -29,7 +85,7 @@ struct WindowConfigurator: NSViewRepresentable {
 
             guard configuredWindow !== window else { return }
             configuredWindow = window
-            Self.configure(window: window)
+            configure(window: window)
         }
 
         private func scheduleConfigure(from view: NSView) {
@@ -43,35 +99,46 @@ struct WindowConfigurator: NSViewRepresentable {
             }
         }
 
-        private static func configure(window: NSWindow) {
+        private func configure(window: NSWindow) {
             window.title = "Lightbox"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isMovableByWindowBackground = false
             window.styleMask.insert(.fullSizeContentView)
-            window.toolbarStyle = .unifiedCompact
+            window.toolbarStyle = .unified
+            let toolbar = NSToolbar(identifier: "Lightbox.WindowHeader")
+            toolbar.delegate = self
+            toolbar.displayMode = .iconOnly
+            toolbar.showsBaselineSeparator = false
+            toolbar.allowsUserCustomization = false
+            // Display-mode customization is independent of item customization.
+            // Text modes change native toolbar geometry around our fixed-height accessory.
+            if #available(macOS 15.0, *) {
+                toolbar.allowsDisplayModeCustomization = false
+            }
+            window.toolbar = toolbar
+            let host = NativeNavigationBar(appState: appState)
+            let width = max(300, window.frame.width - 152)
+            host.frame = NSRect(x: 0, y: 0, width: width, height: 52)
+            let accessory = NSTitlebarAccessoryViewController()
+            accessory.layoutAttribute = .right
+            accessory.view = host
+            window.addTitlebarAccessoryViewController(accessory)
+            headerAccessory = accessory
+            headerHost = host
             window.minSize = NSSize(width: 980, height: 680)
             window.backgroundColor = .clear
-            installTitlebarInteractionZone(in: window)
+            NotificationCenter.default.addObserver(self, selector: #selector(resizeHeader), name: NSWindow.didResizeNotification, object: window)
+            DispatchQueue.main.async { [weak self] in self?.resizeHeader() }
         }
 
-        private static func installTitlebarInteractionZone(in window: NSWindow) {
-            guard let titlebarView = window.standardWindowButton(.closeButton)?.superview,
-                  titlebarView.subviews.contains(where: { $0 is TitlebarInteractionView }) == false
-            else {
-                return
-            }
+        deinit { NotificationCenter.default.removeObserver(self) }
 
-            let interactionView = TitlebarInteractionView()
-            interactionView.translatesAutoresizingMaskIntoConstraints = false
-            titlebarView.addSubview(interactionView)
-
-            NSLayoutConstraint.activate([
-                interactionView.leadingAnchor.constraint(equalTo: titlebarView.leadingAnchor, constant: 220),
-                interactionView.trailingAnchor.constraint(equalTo: titlebarView.trailingAnchor),
-                interactionView.topAnchor.constraint(equalTo: titlebarView.topAnchor),
-                interactionView.bottomAnchor.constraint(equalTo: titlebarView.bottomAnchor)
-            ])
+        @objc private func resizeHeader() {
+            guard let window = configuredWindow, let host = headerHost else { return }
+            let width = max(300, window.frame.width - 152)
+            host.setFrameSize(NSSize(width: width, height: 52))
+            host.needsLayout = true
         }
     }
 }
@@ -90,4 +157,10 @@ private final class TitlebarInteractionView: NSView {
             super.mouseDown(with: event)
         }
     }
+}
+
+/// Native toolbar geometry supplies the window controls and their standard behavior.
+struct WindowHeaderDragArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { TitlebarInteractionView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

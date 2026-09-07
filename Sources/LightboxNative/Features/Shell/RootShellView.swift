@@ -46,9 +46,14 @@ struct RootShellView: View {
         usesCompatibilitySidebarMotion ? sidebarContentVisible : !appState.sidebarCollapsed
     }
 
+    private var chromeLeadingInset: CGFloat {
+        effectiveSidebarSlotExpanded ? sidebarSlotWidth : 0
+    }
+
     var body: some View {
-        ZStack {
-            AppBackdrop()
+        GeometryReader { window in
+            ZStack {
+                AppBackdrop()
 
             HStack(spacing: 0) {
                 // Resident sidebar: collapse by animating the slot width + opacity
@@ -63,6 +68,7 @@ struct RootShellView: View {
                 // the slide, so clipping bought nothing but the artifact.
                 HStack(spacing: 0) {
                     GlassSidebar()
+                        .accessibilityHidden(appState.hasActiveOverlay || appState.sidebarCollapsed)
                     SidebarResizeHandle(isResizing: $isResizingSidebar)
                 }
                 .frame(width: effectiveSidebarSlotExpanded ? sidebarSlotWidth : 0, alignment: .trailing)
@@ -80,8 +86,16 @@ struct RootShellView: View {
                     // Hold the gallery's column count steady while the sidebar slot
                     // animates, so the grid doesn't re-column every frame of the
                     // width change; it re-flows once on settle.
+                    if appState.isShowingStartPage {
+                        NewTabView()
+                            .id(appState.activeTabID)
+                            .accessibilityHidden(appState.hasActiveOverlay)
+                            .disabled(appState.hasActiveOverlay)
+                            .allowsHitTesting(!overlayIsPresented)
+                    } else {
                     GalleryView(isResizingSidebar: isResizingSidebar || isTogglingSidebar)
-                        .id(appState.selectedFilter)
+                        .accessibilityHidden(appState.hasActiveOverlay)
+                        .id("\(appState.activeTabID.uuidString)|\(appState.selectedFilter.identityKey)")
                         .allowsHitTesting(!overlayIsPresented)
                         .transition(
                             .asymmetric(
@@ -89,32 +103,27 @@ struct RootShellView: View {
                                 removal: .opacity
                             )
                         )
+                    }
 
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .saturation(appState.isComparing ? 0.82 : 1)
 
-            // Explicit z-order (back→front): top chrome (1) < comparison (2) <
-            // bottom chrome (3) < preview (4). Two reasons the preview must sit on
-            // top of both chrome bars:
-            //   1. As the image scales back to its card it can pass under a capsule;
-            //      if the capsule were on top it would clip/occlude the shrinking
-            //      photo. Topmost preview is never occluded.
-            //   2. The capsules' live `ultraThinMaterial` samples whatever renders
-            //      below them. With the preview above, the bars blur the static
-            //      gallery — not the moving preview image — which removes the frame
-            //      drop when chrome returns during a close.
-            // Bottom chrome stays above comparison (3 > 2) so its intentional faint
-            // (0.42) state still shows over the opaque comparison backdrop.
-            VStack {
-                TopPathBar()
-                    .previewChromePresentation(isVisible: overlayChromeVisible, reduceMotion: reduceMotion)
-                    .allowsHitTesting(overlayChromeVisible && !overlayIsPresented)
-                    .padding(.top, 17)
-                Spacer()
+            // Native titlebar controls remain above this opaque, non-interactive
+            // surface so scrolling images cannot bleed through the header.
+            VStack(spacing: 0) {
+                LightboxColorTokens.canvas
+                    .frame(height: 52)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(LightboxColorTokens.border.opacity(0.55))
+                            .frame(height: 0.7)
+                    }
+                    .padding(.leading, chromeLeadingInset)
+                Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .allowsHitTesting(false)
             .zIndex(1)
 
             let comparisonAssets = appState.comparisonAssets
@@ -123,15 +132,25 @@ struct RootShellView: View {
                     .zIndex(2)
             }
 
+            if !appState.isShowingStartPage {
             VStack {
                 Spacer()
-                BottomScaleControl()
+                BottomScaleControl(
+                    maximumThumbnailWidth: GalleryThumbnailSizing.maximumWidth(
+                        viewportWidth: max(1, window.size.width - chromeLeadingInset)
+                    )
+                )
+                    .frame(maxWidth: .infinity)
+                    .padding(.leading, chromeLeadingInset)
                     .opacity(appState.isComparing ? 0.42 : 1)
                     .bottomPreviewChromePresentation(isVisible: overlayChromeVisible, reduceMotion: reduceMotion)
                     .allowsHitTesting(overlayChromeVisible && !previewIsPresented && !appState.isComparing)
+                    .accessibilityHidden(appState.hasActiveOverlay)
+                    .disabled(appState.hasActiveOverlay)
                     .padding(.bottom, 18)
             }
             .zIndex(3)
+            }
 
             if let asset = appState.previewAsset {
                 PreviewOverlay(asset: asset)
@@ -142,12 +161,14 @@ struct RootShellView: View {
             PreviewRootClickCatcherLayer(appState: appState)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .zIndex(5)
+            }
+            .coordinateSpace(name: "PreviewSpace")
         }
-        .coordinateSpace(name: "PreviewSpace")
+        .ignoresSafeArea(.container, edges: .top)
         .animation(
             usesCompatibilitySidebarMotion
                 ? nil
-                : MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion),
+                : MotionTokens.ifAllowed(MotionTokens.sidebarChrome, reduceMotion: reduceMotion),
             value: appState.sidebarCollapsed
         )
         .animation(MotionTokens.ifAllowed(MotionTokens.preview, reduceMotion: reduceMotion), value: appState.isComparing)
@@ -311,34 +332,9 @@ private final class PreviewRootClickCatcherView: NSView {
 }
 
 private struct AppBackdrop: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var isDarkMode: Bool {
-        colorScheme == .dark
-    }
-
     var body: some View {
-        ZStack {
-            ZStack {
-                Color(nsColor: .windowBackgroundColor)
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.96, green: 0.98, blue: 1.0).opacity(0.42),
-                        .clear,
-                        .black.opacity(0.035)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            }
-            .opacity(isDarkMode ? 0 : 1)
-
-            Color(red: 0.11, green: 0.11, blue: 0.12)
-                .opacity(isDarkMode ? 1 : 0)
-        }
-        .ignoresSafeArea()
-        .animation(MotionTokens.ifAllowed(.easeInOut(duration: 0.24), reduceMotion: reduceMotion), value: isDarkMode)
+        LightboxColorTokens.canvas
+            .ignoresSafeArea()
     }
 }
 

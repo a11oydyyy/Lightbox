@@ -3,6 +3,8 @@ import Foundation
 
 enum LightboxUpdateChecker {
     static let repositoryURL = URL(string: "https://github.com/a11oydyyy/Lightbox")!
+    static let releasesURL = repositoryURL.appendingPathComponent("releases")
+    static let issuesURL = repositoryURL.appendingPathComponent("issues")
     static let latestReleaseAPIURL = URL(string: "https://api.github.com/repos/a11oydyyy/Lightbox/releases/latest")!
 
     struct Release: Decodable {
@@ -38,7 +40,7 @@ enum LightboxUpdateChecker {
         currentVersion: String = currentAppVersion,
         compatibility: Bool = LightboxRuntime.isCompatibilityApp
     ) async throws -> CheckResult {
-        var request = URLRequest(url: latestReleaseAPIURL)
+        var request = URLRequest(url: latestReleaseAPIURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("Lightbox/\(currentVersion)", forHTTPHeaderField: "User-Agent")
 
@@ -57,7 +59,7 @@ enum LightboxUpdateChecker {
         let latestVersion = normalizedVersion(release.tagName)
 
         guard isVersion(latestVersion, newerThan: currentVersion) else {
-            return .upToDate(version: latestVersion, releaseURL: release.htmlURL)
+            return .upToDate(version: normalizedVersion(currentVersion), releaseURL: release.htmlURL)
         }
         guard let asset = preferredAsset(in: release, compatibility: compatibility) else {
             throw UpdateError.compatibleAssetMissing

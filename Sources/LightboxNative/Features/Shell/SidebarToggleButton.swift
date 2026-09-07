@@ -51,7 +51,7 @@ struct SidebarToggleButton: View {
                     .frame(width: 34, height: 34)
                     .contentShape(Circle())
             }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.045, glowOpacity: 0.24))
+            .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
 
             if isExpanded {
                 Capsule()
@@ -94,7 +94,7 @@ struct SidebarToggleButton: View {
     }
 
     private func choose(_ filter: LibraryFilter) {
-        withAnimation(MotionTokens.ifAllowed(.easeOut(duration: 0.24), reduceMotion: reduceMotion)) {
+        withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
             appState.selectedFilter = filter
         }
         var transaction = Transaction()
@@ -177,19 +177,13 @@ private struct FilterSegment: View {
                 .frame(width: width, height: 24)
                 .background {
                     if isSelected {
-                        Capsule()
-                            .fill(.white.opacity(0.20))
+                        LightboxSelectionSurface(shape: Capsule(style: .continuous))
                             .matchedGeometryEffect(id: "libraryTrashSelection", in: selectionNamespace)
-                            .overlay {
-                                Capsule()
-                                    .stroke(.white.opacity(0.28), lineWidth: 0.7)
-                            }
-                            .blendMode(.screen)
                     }
                 }
-                .contentShape(Capsule())
+                .contentShape(Capsule(style: .continuous))
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.018, glowOpacity: 0.12))
+        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(style: .continuous)))
         .animation(MotionTokens.ifAllowed(MotionTokens.previewChrome, reduceMotion: reduceMotion), value: title)
     }
 }
@@ -236,7 +230,7 @@ private struct TagFilterSegment: View {
             }
             .contentShape(Capsule())
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.04, glowOpacity: 0.16))
+        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule()))
         .help(helpTitle)
     }
 }

@@ -4,7 +4,6 @@ import SwiftUI
 struct ComparisonOverlay: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.colorScheme) private var colorScheme
 
     var assets: [LightboxAsset]
 
@@ -27,7 +26,7 @@ struct ComparisonOverlay: View {
             )
 
             ZStack {
-                ComparisonBackground(colorScheme: colorScheme)
+                ComparisonBackground()
                     .opacity(isPresented ? 1 : 0)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
@@ -47,6 +46,19 @@ struct ComparisonOverlay: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
                 .zIndex(10)
+            }
+            .overlay(alignment: .topTrailing) {
+                Button(action: closeAnimated) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: LightboxControlMetrics.iconSize, weight: .medium))
+                        .foregroundStyle(LightboxColorTokens.secondaryText)
+                        .frame(width: LightboxControlMetrics.iconButtonSize, height: LightboxControlMetrics.iconButtonSize)
+                }
+                .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)))
+                .help(appState.localized(.close))
+                .accessibilityLabel(appState.localized(.close))
+                .padding(.top, 58)
+                .padding(.trailing, 22)
             }
             .coordinateSpace(name: Self.coordinateSpaceName)
             .contentShape(Rectangle())
@@ -69,7 +81,7 @@ struct ComparisonOverlay: View {
                 return
             }
 
-            withAnimation(MotionTokens.preview) {
+            withAnimation(MotionTokens.ifAllowed(MotionTokens.preview, reduceMotion: reduceMotion)) {
                 isPresented = true
             }
         }
@@ -146,8 +158,13 @@ struct ComparisonOverlay: View {
 
     private func installEscapeMonitor() {
         guard escapeMonitor == nil else { return }
-        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.keyCode == 53 else { return event }
+        let ownerWindow = NSApp.keyWindow
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak ownerWindow] event in
+            guard let ownerWindow, event.window === ownerWindow, event.keyCode == 53,
+                  event.window?.isKeyWindow == true,
+                  !(event.window?.firstResponder is NSTextView),
+                  event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+            else { return event }
             closeAnimated()
             return nil
         }
@@ -234,6 +251,7 @@ private struct ComparisonPane: View {
             ZStack(alignment: .topLeading) {
                 AssetImageView(asset: asset, contentMode: .fit, quality: imageQuality)
                     .imageDecodePriority(.high)
+                    .accessibilityLabel(asset.originalName)
                     .clipShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
@@ -243,7 +261,7 @@ private struct ComparisonPane: View {
 
                 Text(label)
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.primary.opacity(0.86))
+                    .foregroundStyle(LightboxColorTokens.primaryText)
                     .frame(width: 24, height: 24)
                     .background(.ultraThinMaterial.opacity(0.76), in: Circle())
                     .overlay {
@@ -258,13 +276,13 @@ private struct ComparisonPane: View {
             VStack(spacing: 3) {
                 Text(asset.originalName)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.primary.opacity(0.88))
+                    .foregroundStyle(LightboxColorTokens.primaryText)
                     .lineLimit(1)
                     .truncationMode(.middle)
 
                 Text(dimensions)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary.opacity(0.90))
+                    .foregroundStyle(LightboxColorTokens.secondaryText)
                     .monospacedDigit()
             }
             .frame(maxWidth: .infinity)
@@ -277,19 +295,7 @@ private struct ComparisonPane: View {
 }
 
 private struct ComparisonBackground: View {
-    var colorScheme: ColorScheme
-
     var body: some View {
-        Color(nsColor: .windowBackgroundColor)
-            .overlay {
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(colorScheme == .dark ? 0.04 : 0.34),
-                        Color.black.opacity(colorScheme == .dark ? 0.18 : 0.035)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            }
+        LightboxColorTokens.inspection
     }
 }

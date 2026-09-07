@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct FloatingScrollIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var viewportHeight: CGFloat
     var contentHeight: CGFloat
     var fraction: CGFloat
@@ -26,7 +27,7 @@ struct FloatingScrollIndicator: View {
             .frame(width: 18, height: viewportHeight, alignment: .top)
             .lightboxGlass(Capsule())
             .opacity(isVisible ? 1 : 0)
-            .animation(MotionTokens.quick, value: isVisible)
+            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isVisible)
             .allowsHitTesting(false)
     }
 }

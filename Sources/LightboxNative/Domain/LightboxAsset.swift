@@ -132,7 +132,7 @@ struct FileContentSignature: Equatable, Hashable, Sendable {
     }
 }
 
-enum GallerySortField: String, CaseIterable, Hashable {
+enum GallerySortField: String, CaseIterable, Codable, Hashable, Sendable {
     case time
     case size
     case tag
@@ -140,7 +140,7 @@ enum GallerySortField: String, CaseIterable, Hashable {
     case type
 }
 
-enum GallerySortDirection: String, CaseIterable, Hashable {
+enum GallerySortDirection: String, CaseIterable, Codable, Hashable, Sendable {
     case ascending
     case descending
 
@@ -236,7 +236,7 @@ enum GalleryAssetSorter {
     }
 }
 
-enum LibraryFilter: Hashable {
+enum LibraryFilter: Hashable, Sendable {
     case all
     case tag(String)
     case trash
@@ -253,26 +253,26 @@ enum LibraryFilter: Hashable {
     }
 }
 
-enum GalleryLayoutMode: String, Hashable {
+// Retain the persisted type/key while the control now selects browsing scope.
+enum GalleryLayoutMode: String, Codable, Hashable, Sendable {
     case masonry
-    case grid
+    case recursive
 
-    var next: GalleryLayoutMode {
-        switch self {
-        case .masonry:
-            .grid
-        case .grid:
-            .masonry
+    var next: GalleryLayoutMode { self == .masonry ? .recursive : .masonry }
+    var iconName: String { self == .masonry ? "folder" : "square.stack.3d.up" }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        switch value {
+        case "masonry", "grid": self = .masonry
+        case "recursive": self = .recursive
+        default: throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown gallery scope")
         }
     }
 
-    var iconName: String {
-        switch self {
-        case .masonry:
-            "rectangle.grid.2x2"
-        case .grid:
-            "square.grid.3x3"
-        }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
-
 }

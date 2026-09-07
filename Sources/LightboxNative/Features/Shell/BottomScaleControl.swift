@@ -6,99 +6,69 @@ struct BottomScaleControl: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var layoutModeNamespace
     @Namespace private var tagFilterNamespace
-    @AppStorage("Lightbox.folderTileWidth") private var folderTileWidth: Double = 180
-    // Transient: the folder slider is a separate pop-out capsule that auto-hides
-    // once the pointer leaves it after use.
-    @State private var folderSliderVisible = false
-    @State private var enteredFolderSlider = false
+    var maximumThumbnailWidth: CGFloat
 
     private var bottomShadowOpacity: Double {
         GlassTokens.floatingCapsuleShadowOpacity(appState.glassOpacity)
     }
 
     private var thumbnailWidthBinding: Binding<CGFloat> {
-        Binding(
+        let range = thumbnailScaleRange
+        return Binding(
             get: {
-                appState.thumbnailWidth
+                min(range.upperBound, max(range.lowerBound, appState.thumbnailWidth))
             },
             set: { value in
                 withAnimation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion)) {
-                    appState.thumbnailWidth = value
+                    appState.thumbnailWidth = GalleryThumbnailSizing.clampedStoredWidth(value)
                 }
             }
         )
     }
 
-    private var folderWidthBinding: Binding<CGFloat> {
-        Binding(
-            get: { CGFloat(folderTileWidth) },
-            set: { value in
-                withAnimation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion)) {
-                    folderTileWidth = Double(value)
-                }
-            }
+    private var thumbnailScaleRange: ClosedRange<CGFloat> {
+        GalleryThumbnailSizing.minimumWidth...max(
+            GalleryThumbnailSizing.minimumWidth,
+            min(GalleryThumbnailSizing.maximumStoredWidth, maximumThumbnailWidth)
         )
-    }
-
-    private var folderSliderHelp: String {
-        appState.localized(.folderTileWidth)
     }
 
     var body: some View {
         GlassGroup(spacing: 8) {
-            // A separate folder-width capsule pops up above the main control and
-            // auto-hides after use; the main control keeps its size/position.
-            // Leading alignment keeps the pop-out capsule lined up with the main
-            // control's left edge (not centered over main + compare tray).
-            VStack(alignment: .leading, spacing: 8) {
-                if folderSliderVisible {
-                    folderSliderCapsule
-                        .transition(
-                            .opacity
-                                .combined(with: .move(edge: .bottom))
-                                .combined(with: .scale(scale: 0.85, anchor: .bottom))
-                        )
-                }
+            HStack(spacing: 8) {
+                mainControlsRow
+                    .frame(height: 34)
+                    .padding(.leading, 13)
+                    .padding(.trailing, 9)
+                    .bottomControlGlass(Capsule())
+                    .shadow(color: .black.opacity(bottomShadowOpacity), radius: 8, y: 3)
 
-                HStack(spacing: 8) {
-                    mainControlsRow
-                        .frame(height: 34)
-                        .padding(.leading, 13)
-                        .padding(.trailing, 9)
-                        .bottomControlGlass(Capsule())
-                        .shadow(color: .black.opacity(bottomShadowOpacity), radius: 8, y: 3)
-
-                    if !appState.compareTrayAssets.isEmpty {
-                        CompareTrayControl()
-                            .transition(.move(edge: .leading).combined(with: .opacity))
-                    }
+                if !appState.compareTrayAssets.isEmpty {
+                    CompareTrayControl()
+                        .transition(.move(edge: .leading).combined(with: .opacity))
                 }
             }
-            // Slight spring bounce on pop ("QQ jelly", but restrained).
-            .animation(MotionTokens.ifAllowed(.spring(response: 0.34, dampingFraction: 0.64), reduceMotion: reduceMotion), value: folderSliderVisible)
         }
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.compareTrayAssets.map(\.id))
     }
 
     private var mainControlsRow: some View {
         HStack(spacing: 10) {
-            // 12pt slot matches the folder row's leading icon so the two sliders
-            // line up (same left edge → same track length/position).
             Circle()
-                .fill(.primary.opacity(0.68))
+                .fill(LightboxColorTokens.mutedText)
                 .frame(width: 5, height: 5)
                 .frame(width: 12)
 
-            ThumbnailScaleSlider(value: thumbnailWidthBinding, range: 148...312)
+            ThumbnailScaleSlider(value: thumbnailWidthBinding, range: thumbnailScaleRange)
+                .accessibilityLabel(appState.localized(.imageSize))
+                .accessibilityValue("\(Int(appState.thumbnailWidth)) pt")
 
             Circle()
-                .fill(.primary.opacity(0.74))
+                .fill(LightboxColorTokens.secondaryText)
                 .frame(width: 12, height: 12)
 
-            folderSliderToggle
-
             Capsule()
-                .fill(.primary.opacity(0.10))
+                .fill(LightboxColorTokens.border)
                 .frame(width: 1, height: 16)
                 .padding(.horizontal, 1)
 
@@ -106,7 +76,7 @@ struct BottomScaleControl: View {
 
             if !appState.libraryColorTags.isEmpty {
                 Capsule()
-                    .fill(.primary.opacity(0.10))
+                    .fill(LightboxColorTokens.border)
                     .frame(width: 1, height: 16)
                     .padding(.horizontal, 1)
 
@@ -117,61 +87,6 @@ struct BottomScaleControl: View {
         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.libraryColorTags.map(\.id))
     }
 
-    private var folderSliderToggle: some View {
-        Button {
-            enteredFolderSlider = false
-            withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
-                folderSliderVisible.toggle()
-            }
-        } label: {
-            Image(systemName: "chevron.up")
-                .font(.system(size: 9, weight: .bold))
-                .rotationEffect(.degrees(folderSliderVisible ? 180 : 0))
-                .foregroundStyle(.primary.opacity(folderSliderVisible ? 0.82 : 0.5))
-                .frame(width: 22, height: 26)
-                .contentShape(Circle())
-        }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.05, glowOpacity: 0.14))
-        .help(folderSliderHelp)
-    }
-
-    // Its own glass pill that floats above the main control. End markers use
-    // small→large folder glyphs (vs the image slider's dots). Auto-hides once the
-    // pointer leaves after the user has interacted with it.
-    private var folderSliderCapsule: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "folder")
-                .font(.system(size: 9, weight: .semibold))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.secondary.opacity(0.72))
-                .frame(width: 12)
-
-            ThumbnailScaleSlider(value: folderWidthBinding, range: 130...260)
-
-            Image(systemName: "folder.fill")
-                .font(.system(size: 13, weight: .medium))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.secondary.opacity(0.85))
-                .frame(width: 16)
-        }
-        .padding(.horizontal, 13)
-        // Sized to content (short pill); the slider itself aligns with the main
-        // row's slider because both leading markers use the same 12pt slot.
-        .frame(height: 34)
-        .bottomControlGlass(Capsule())
-        .shadow(color: .black.opacity(bottomShadowOpacity), radius: 8, y: 3)
-        .help(folderSliderHelp)
-        .onHover { hovering in
-            if hovering {
-                enteredFolderSlider = true
-            } else if enteredFolderSlider {
-                enteredFolderSlider = false
-                withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
-                    folderSliderVisible = false
-                }
-            }
-        }
-    }
 }
 
 private struct LayoutModeTextToggle: View {
@@ -181,14 +96,15 @@ private struct LayoutModeTextToggle: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            modeButton(.masonry, title: appState.localized(.masonry), width: 58)
-            modeButton(.grid, title: appState.localized(.grid), width: 36)
+            modeButton(.masonry, title: appState.localized(.currentFolderScope))
+            modeButton(.recursive, title: appState.localized(.includeSubfolders))
         }
         .frame(height: 26)
-        .help(appState.localized(appState.galleryLayoutMode == .masonry ? .switchToGrid : .switchToMasonry))
+        .disabled(appState.isViewingTrash)
+        .help(appState.localized(.includeSubfoldersHelp))
     }
 
-    private func modeButton(_ mode: GalleryLayoutMode, title: String, width: CGFloat) -> some View {
+    private func modeButton(_ mode: GalleryLayoutMode, title: String) -> some View {
         let isSelected = appState.galleryLayoutMode == mode
 
         return Button {
@@ -199,24 +115,21 @@ private struct LayoutModeTextToggle: View {
         } label: {
             Text(title)
                 .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
-                .foregroundStyle(isSelected ? Color.primary.opacity(0.92) : Color.secondary.opacity(0.82))
+                .foregroundStyle(isSelected ? LightboxColorTokens.primaryText : LightboxColorTokens.secondaryText)
                 .lineLimit(1)
-                .minimumScaleFactor(0.86)
-                .frame(width: width, height: 24)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 12)
+                .frame(height: 24)
                 .background {
                     if isSelected {
-                        Capsule()
-                            .fill(Color(nsColor: .controlBackgroundColor).opacity(0.70))
+                        LightboxSelectionSurface(shape: Capsule(style: .continuous))
                             .matchedGeometryEffect(id: "layoutModeSelection", in: selectionNamespace)
-                            .overlay {
-                                Capsule()
-                                    .stroke(.white.opacity(0.20), lineWidth: 0.7)
-                            }
                     }
                 }
-                .contentShape(Capsule())
+                .contentShape(Capsule(style: .continuous))
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.018, glowOpacity: 0.12))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(style: .continuous)))
     }
 }
 
@@ -286,7 +199,7 @@ private struct BottomTagFilterButton: View {
             .frame(width: MacTagDotMetrics.selectionHitWidth, height: MacTagDotMetrics.selectionHeight)
             .contentShape(Circle())
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.06, glowOpacity: 0.16))
+        .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
         .help(appState.localizedColorTagFilterTitle(tag.name))
     }
 }
@@ -332,22 +245,22 @@ private struct BottomControlGlassModifier<S: Shape>: ViewModifier {
 
         if #available(macOS 26.0, *) {
             content
-                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
                 .background {
-                    shape.fill(Color(nsColor: .controlBackgroundColor).opacity(fillOpacity))
+                    shape.fill(LightboxColorTokens.control.opacity(fillOpacity))
                 }
-                .glassEffect(.clear.interactive(true), in: shape)
+                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
+                .glassEffect(.clear, in: shape)
                 .overlay {
-                    shape.stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
+                    shape.stroke(LightboxColorTokens.primaryText.opacity(strokeOpacity), lineWidth: 0.7)
                 }
         } else {
             content
-                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
                 .background {
-                    shape.fill(Color(nsColor: .controlBackgroundColor).opacity(fillOpacity))
+                    shape.fill(LightboxColorTokens.control.opacity(fillOpacity))
                 }
+                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
                 .overlay {
-                    shape.stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
+                    shape.stroke(LightboxColorTokens.primaryText.opacity(strokeOpacity), lineWidth: 0.7)
                 }
         }
     }
@@ -373,7 +286,7 @@ private struct CompareTrayControl: View {
             HStack(spacing: 5) {
                 ForEach(Array(appState.compareTrayAssets.enumerated()), id: \.element.id) { index, asset in
                     CompareTrayThumbnail(asset: asset, label: label(for: index))
-                        .scaleEffect(appState.compareTrayPulseID == asset.id ? 1.10 : 1)
+                        .scaleEffect(appState.compareTrayPulseID == asset.id ? 1.025 : 1)
                         .onDrag {
                             appState.beginCompareTrayDrag(asset.id)
                             return NSItemProvider(object: asset.id as NSString)
@@ -387,7 +300,7 @@ private struct CompareTrayControl: View {
 
             Text("\(appState.compareTrayAssets.count)")
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.primary.opacity(0.76))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
                 .monospacedDigit()
                 .frame(minWidth: 10)
 
@@ -401,7 +314,7 @@ private struct CompareTrayControl: View {
                     .frame(height: 24)
                     .padding(.horizontal, 8)
             }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(), hoverScale: 1.018, glowOpacity: 0.12))
+            .buttonStyle(LightboxButtonHoverStyle(shape: Capsule()))
             .disabled(!appState.canStartCompareTrayComparison)
             .opacity(appState.canStartCompareTrayComparison ? 1 : 0.48)
 
@@ -414,7 +327,7 @@ private struct CompareTrayControl: View {
                     .font(.system(size: 10, weight: .bold))
                     .frame(width: 24, height: 24)
             }
-            .buttonStyle(LightboxButtonHoverStyle(shape: Circle(), hoverScale: 1.04, glowOpacity: 0.12))
+            .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
             .help(appState.localized(.clearCompareTray))
         }
         .padding(.leading, 8)
@@ -426,7 +339,6 @@ private struct CompareTrayControl: View {
             Capsule()
                 .stroke(compareTrayStrokeColor, lineWidth: 1)
         }
-        .scaleEffect(isDropTargeted ? 1.012 : 1)
         .onDrop(of: dropTypes, isTargeted: $isDropTargeted) { providers in
             appState.handleCompareTrayDrop(providers: providers)
         }
@@ -443,7 +355,7 @@ private struct CompareTrayControl: View {
         if rejectFlash {
             return .red.opacity(0.42)
         }
-        return isDropTargeted ? Color.accentColor.opacity(0.42) : .clear
+        return isDropTargeted ? LightboxColorTokens.accent.opacity(0.42) : .clear
     }
 
     private func flashRejectFeedback() {
@@ -478,7 +390,7 @@ private struct CompareTrayThumbnail: View {
                 .overlay(alignment: .bottomLeading) {
                     Text(label)
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.primary.opacity(0.86))
+                        .foregroundStyle(LightboxColorTokens.primaryText)
                         .frame(width: 14, height: 14)
                         .background(.ultraThinMaterial.opacity(0.80), in: Circle())
                         .padding(2)
@@ -491,15 +403,12 @@ private struct CompareTrayThumbnail: View {
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 6.5, weight: .bold))
-                    .foregroundStyle(.primary.opacity(0.72))
+                    .foregroundStyle(LightboxColorTokens.secondaryText)
                     .frame(width: 13, height: 13)
                     .background(.ultraThinMaterial.opacity(0.86), in: Circle())
             }
             .buttonStyle(LightboxButtonHoverStyle(
-                shape: Circle(),
-                hoverScale: 1.08,
-                pressedScale: 0.92,
-                glowOpacity: 0.18
+                shape: Circle()
             ))
             .offset(x: 4, y: -4)
             .help(appState.localized(.remove))

@@ -6,8 +6,8 @@ APP_NAME="LightboxNative"
 APP_BUNDLE_NAME="Lightbox"
 BUNDLE_ID="io.github.a11oydyyy.Lightbox"
 MIN_SYSTEM_VERSION="15.0"
-VERSION="1.3.6"
-BUILD_NUMBER="101"
+VERSION="2.0.0"
+BUILD_NUMBER="112"
 BUILD_ARCH_ARGS=()
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -100,6 +100,19 @@ build_bundle() {
   <string>Lightbox asks Finder to restore images from the system Trash.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.data</string>
+      </array>
+      <key>UTTypeDescription</key>
+      <string>Lightbox Internal Asset Drag</string>
+      <key>UTTypeIdentifier</key>
+      <string>io.github.a11oydyyy.lightbox.internal-asset-drag</string>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
@@ -107,18 +120,30 @@ PLIST
 
 sign_app_bundle() {
   local bundle="${1:-$APP_BUNDLE}"
+  local uses_stable_local_identity="${2:-false}"
+  local signing_identity="${LIGHTBOX_CODESIGN_IDENTITY:--}"
+  local signing_arguments=(--force --sign "$signing_identity" --identifier "$BUNDLE_ID")
+
+  if [ "$signing_identity" != "-" ]; then
+    signing_arguments+=(--options runtime --timestamp)
+  fi
+
+  if [ "$signing_identity" = "-" ] && [ "$uses_stable_local_identity" = "true" ]; then
+    signing_arguments+=(--requirements "=designated => identifier \"$BUNDLE_ID\"")
+  fi
+
   /usr/bin/xattr -cr "$bundle" >/dev/null 2>&1 || true
   /usr/bin/codesign --remove-signature "$bundle" >/dev/null 2>&1 || true
-  /usr/bin/codesign --force --sign "${LIGHTBOX_CODESIGN_IDENTITY:--}" --identifier "$BUNDLE_ID" "$bundle"
+  /usr/bin/codesign "${signing_arguments[@]}" "$bundle"
   /usr/bin/xattr -cr "$bundle" >/dev/null 2>&1 || true
 }
 
 install_app_bundle() {
-  sign_app_bundle "$APP_BUNDLE"
+  sign_app_bundle "$APP_BUNDLE" true
   pkill -x "$APP_NAME" >/dev/null 2>&1 || true
   rm -rf "$INSTALL_APP_BUNDLE"
   /usr/bin/ditto "$APP_BUNDLE" "$INSTALL_APP_BUNDLE"
-  sign_app_bundle "$INSTALL_APP_BUNDLE"
+  sign_app_bundle "$INSTALL_APP_BUNDLE" true
   "$LSREGISTER" -f "$INSTALL_APP_BUNDLE" >/dev/null 2>&1 || true
   rm -rf "$APP_BUNDLE"
 }

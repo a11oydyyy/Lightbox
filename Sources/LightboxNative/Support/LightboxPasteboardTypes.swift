@@ -7,4 +7,17 @@ enum LightboxPasteboardTypes {
 
 enum LightboxDragState {
     @MainActor static var isDraggingAsset = false
+    @MainActor static var sourceURLs: [URL] = []
+
+    @MainActor
+    static func beginAssetDrag(sourceURLs: [URL]) {
+        isDraggingAsset = true
+        self.sourceURLs = sourceURLs
+    }
+
+    @MainActor
+    static func endAssetDrag() {
+        isDraggingAsset = false
+        sourceURLs = []
+    }
 }

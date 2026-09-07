@@ -62,6 +62,9 @@ struct AssetContextMenuTitles: Equatable {
 
 struct AssetCardView: View, Equatable {
     var asset: LightboxAsset
+    var keyboardFocusRequested = false
+    var onKeyboard: (UInt16, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onActivate: (() -> Void)? = nil
     var isSelected: Bool
     var isExplicitlySelected: Bool
     var showsSelectionControl: Bool
@@ -76,6 +79,7 @@ struct AssetCardView: View, Equatable {
     var usesReducedHover = false
     var isComparePulse = false
     var showsPressFeedback = true
+    var dragSourceURLs: () -> [URL] = { [] }
     var onClick: (LightboxClickContext) -> Void
     var onRestore: () -> Void
     var onMoveToTrash: () -> Void
@@ -87,6 +91,7 @@ struct AssetCardView: View, Equatable {
     var onAddToCompareTray: () -> Void
 
     nonisolated static func == (lhs: AssetCardView, rhs: AssetCardView) -> Bool {
+        lhs.keyboardFocusRequested == rhs.keyboardFocusRequested &&
         lhs.asset.id == rhs.asset.id &&
         lhs.asset.sourceURL == rhs.asset.sourceURL &&
         lhs.asset.deletedAt == rhs.asset.deletedAt &&
@@ -107,11 +112,14 @@ struct AssetCardView: View, Equatable {
             lhs.showsPressFeedback == rhs.showsPressFeedback
     }
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isPressed = false
+    @State private var showsKeyboardFocus = false
 
     var body: some View {
         AssetImageView(asset: asset, quality: imageQuality, loadsImage: loadsImage)
             .imageDecodePriority(imagePriority)
+            .accessibilityHidden(true)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
@@ -123,7 +131,7 @@ struct AssetCardView: View, Equatable {
                     .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.6)
             }
             .overlay {
-                if isSelected {
+                if isSelected && !showsKeyboardFocus {
                     SelectionGlow(cornerRadius: RadiusTokens.card)
                         .transition(.opacity)
                 }
@@ -142,10 +150,11 @@ struct AssetCardView: View, Equatable {
             }
             .overlay(alignment: .topLeading) {
                 SelectionCheckbox(isSelected: isExplicitlySelected)
+                    .accessibilityHidden(true)
                     .opacity(showsSelectionControl || isExplicitlySelected ? 1 : 0)
                     .padding(8)
                     .allowsHitTesting(false)
-                    .animation(MotionTokens.quick, value: isExplicitlySelected)
+                    .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isExplicitlySelected)
             }
             .overlay(alignment: .topTrailing) {
                 if let compareTrayLabel {
@@ -165,10 +174,15 @@ struct AssetCardView: View, Equatable {
             // rounded corners can't overhang under hover3D / scaleEffect.
             .compositingGroup()
             .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
-            .scaleEffect(isComparePulse ? 1.006 : 1)
-            .hover3D(isReduced: usesReducedHover, isEnabled: isInteractionEnabled)
+            .hover3D(isReduced: usesReducedHover, isEnabled: isInteractionEnabled && !isPreviewSourceHidden,
+                     isFocused: showsKeyboardFocus, isSelected: isSelected)
             .overlay {
                 AssetInteractionLayer(
+                    keyboardFocusRequested: keyboardFocusRequested,
+                    accessibilitySelected: isExplicitlySelected,
+                    onKeyboard: onKeyboard,
+                    onActivate: onActivate,
+                    onFocusChanged: { showsKeyboardFocus = $0 },
                     debugSurface: "gallery-card",
                     debugTargetName: asset.originalName,
                     assetTags: asset.tags,
@@ -179,6 +193,7 @@ struct AssetCardView: View, Equatable {
                     compareMenuTitle: compareMenuTitle,
                     menuTitles: menuTitles,
                     showsPressFeedback: showsPressFeedback,
+                    dragSourceURLs: dragSourceURLs,
                     onPressChanged: { isPressed in
                         self.isPressed = isPressed
                     },
@@ -193,13 +208,18 @@ struct AssetCardView: View, Equatable {
                     onAddToCompareTray: onAddToCompareTray
                 )
             }
-            .animation(MotionTokens.quick, value: isComparePulse)
-            .animation(MotionTokens.quick, value: isPressed)
-            .animation(MotionTokens.quick, value: isSelected)
+            .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: isComparePulse)
+            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isPressed)
+            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isSelected)
     }
 }
 
 struct AssetInteractionLayer: NSViewRepresentable {
+    var keyboardFocusRequested = false
+    var accessibilitySelected = false
+    var onKeyboard: (UInt16, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onActivate: (() -> Void)? = nil
+    var onFocusChanged: (Bool) -> Void = { _ in }
     var debugSurface = "asset"
     var debugTargetName = "unknown"
     var assetTags: [String]
@@ -210,6 +230,7 @@ struct AssetInteractionLayer: NSViewRepresentable {
     var compareMenuTitle: String
     var menuTitles: AssetContextMenuTitles
     var showsPressFeedback: Bool
+    var dragSourceURLs: () -> [URL]
     var triggersClickOnMouseDown = false
     var onPressChanged: (Bool) -> Void
     var onClick: (LightboxClickContext) -> Void
@@ -237,6 +258,7 @@ struct AssetInteractionLayer: NSViewRepresentable {
         nsView.compareMenuTitle = compareMenuTitle
         nsView.menuTitles = menuTitles
         nsView.showsPressFeedback = showsPressFeedback
+        nsView.dragSourceURLs = dragSourceURLs
         nsView.triggersClickOnMouseDown = triggersClickOnMouseDown
         nsView.onPressChanged = onPressChanged
         nsView.onClick = onClick
@@ -248,10 +270,122 @@ struct AssetInteractionLayer: NSViewRepresentable {
         nsView.onCopy = onCopy
         nsView.onShare = onShare
         nsView.onAddToCompareTray = onAddToCompareTray
+        nsView.onKeyboard = onKeyboard
+        nsView.onActivate = onActivate
+        nsView.onFocusChanged = onFocusChanged
+        nsView.setAccessibilityElement(isInteractionEnabled)
+        nsView.setAccessibilityRole(onActivate == nil ? .image : .button)
+        nsView.setAccessibilityLabel(([debugTargetName] + assetTags).joined(separator: ", "))
+        nsView.setAccessibilitySelected(accessibilitySelected)
+        nsView.setAccessibilityEnabled(isInteractionEnabled)
+        nsView.toolTip = debugTargetName
+        nsView.setAccessibilityCustomActions([
+            NSAccessibilityCustomAction(name: menuTitles.copy, target: nsView, selector: #selector(AssetInteractionView.accessibilityCopy)),
+            NSAccessibilityCustomAction(name: compareMenuTitle, target: nsView, selector: #selector(AssetInteractionView.accessibilityCompare))
+        ])
+        let requestsFocus = keyboardFocusRequested && isInteractionEnabled
+        nsView.requestedKeyboardFocus = requestsFocus
     }
 }
 
 final class AssetInteractionView: NSView, NSDraggingSource {
+    static func canRestoreGalleryFocus(over responder: NSResponder?) -> Bool {
+        !(responder is NSTextView) && !(responder is NSControl)
+    }
+    private var showsKeyboardFocus = false
+    var onFocusChanged: (Bool) -> Void = { _ in }
+
+    private func publishFocusAppearance() {
+        // AppKit can move focus while SwiftUI is updating; publish after the
+        // responder transition, using its final state rather than a stale event.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.onFocusChanged(self.isInteractionEnabled && self.showsKeyboardFocus && self.window?.firstResponder === self)
+        }
+    }
+    var requestedKeyboardFocus = false {
+        didSet { if requestedKeyboardFocus && !oldValue { restoreFocusWhenAttached() } }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        restoreFocusWhenAttached()
+        publishFocusAppearance()
+    }
+
+    private func restoreFocusWhenAttached() {
+        guard requestedKeyboardFocus, window != nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.requestedKeyboardFocus, self.isInteractionEnabled,
+                  Self.canRestoreGalleryFocus(over: self.window?.firstResponder)
+            else { return }
+            self.window?.makeFirstResponder(self)
+        }
+    }
+    var onKeyboard: (UInt16, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onActivate: (() -> Void)?
+    override var acceptsFirstResponder: Bool { isInteractionEnabled && debugSurface == "gallery-card" }
+
+    override func becomeFirstResponder() -> Bool {
+        showsKeyboardFocus = requestedKeyboardFocus || NSApp.currentEvent?.type == .keyDown
+        publishFocusAppearance()
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        publishFocusAppearance()
+        return true
+    }
+
+    @objc func copy(_ sender: Any?) { onCopy() }
+    override func selectAll(_ sender: Any?) { onKeyboard(0, .command) }
+    @objc func accessibilityCopy() -> Bool { guard isInteractionEnabled else { return false }; onCopy(); return true }
+    @objc func accessibilityCompare() -> Bool { guard isInteractionEnabled else { return false }; onAddToCompareTray(); return true }
+
+    override func accessibilityPerformShowMenu() -> Bool {
+        guard isInteractionEnabled, let window,
+              let event = NSEvent.mouseEvent(with: .rightMouseDown,
+                  location: convert(NSPoint(x: bounds.midX, y: bounds.midY), to: nil),
+                  modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                  windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)
+        else { return false }
+        showMenu(with: event)
+        return true
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isInteractionEnabled, let onActivate else { return false }
+        onActivate()
+        return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard isInteractionEnabled else { return }
+        showsKeyboardFocus = true
+        publishFocusAppearance()
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Leave system shortcuts, VoiceOver chords, and text handling to AppKit.
+        guard !modifiers.contains(.control), !modifiers.contains(.option) else {
+            super.keyDown(with: event); return
+        }
+        if event.keyCode == 109, modifiers.contains(.shift) {
+            _ = accessibilityPerformShowMenu(); return
+        }
+        if !modifiers.contains(.command), [36, 49, 76].contains(event.keyCode), let onActivate {
+            onActivate(); return
+        }
+        if [123, 124, 125, 126, 53].contains(event.keyCode), !modifiers.contains(.command) {
+            onKeyboard(event.keyCode, modifiers); return
+        }
+        if modifiers.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "a" {
+            onKeyboard(0, modifiers); return
+        }
+        if modifiers.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "c" {
+            onCopy(); return
+        }
+        super.keyDown(with: event)
+    }
+
     var debugSurface = "asset"
     var debugTargetName = "unknown"
     var assetTags: [String] = []
@@ -266,6 +400,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     var compareMenuTitle = "Add to Compare Tray"
     var menuTitles = AssetContextMenuTitles.english
     var showsPressFeedback = true
+    var dragSourceURLs: () -> [URL] = { [] }
     var triggersClickOnMouseDown = false
     var onPressChanged: (Bool) -> Void = { _ in }
     var onClick: (LightboxClickContext) -> Void = { _ in }
@@ -306,6 +441,15 @@ final class AssetInteractionView: NSView, NSDraggingSource {
             return
         }
 
+        if event.clickCount >= 2, event.modifierFlags.intersection([.command, .shift]).isEmpty,
+           let onActivate {
+            onActivate()
+            return
+        }
+        if debugSurface == "gallery-card",
+           !showsPressFeedback || !event.modifierFlags.intersection([.command, .shift]).isEmpty {
+            window?.makeFirstResponder(self)
+        }
         trackClickOrDrag(from: event)
     }
 
@@ -355,6 +499,10 @@ final class AssetInteractionView: NSView, NSDraggingSource {
                     return
                 }
             case .leftMouseUp:
+                guard bounds.contains(convert(nextEvent.locationInWindow, from: nil)) else {
+                    onPressChanged(false)
+                    return
+                }
                 let click = LightboxClickContext(event: nextEvent, in: self, trigger: .mouseUp)
                 if shouldShowPress {
                     logClick(click)
@@ -379,26 +527,30 @@ final class AssetInteractionView: NSView, NSDraggingSource {
 
     private func beginExternalDrag(with event: NSEvent) {
         guard let assetURL else { return }
+        let resolvedDragURLs = dragSourceURLs()
+        let urls = resolvedDragURLs.isEmpty ? [assetURL] : resolvedDragURLs
+        let draggingItems = urls.map { url in
+            let pasteboardItem = NSPasteboardItem()
+            pasteboardItem.setString(url.absoluteString, forType: .fileURL)
+            pasteboardItem.setString(url.absoluteString, forType: .URL)
+            pasteboardItem.setString("1", forType: LightboxPasteboardTypes.internalAssetDrag)
 
-        let pasteboardItem = NSPasteboardItem()
-        pasteboardItem.setString(assetURL.absoluteString, forType: .fileURL)
-        pasteboardItem.setString(assetURL.absoluteString, forType: .URL)
-        pasteboardItem.setString("1", forType: LightboxPasteboardTypes.internalAssetDrag)
-
-        let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
-        draggingItem.setDraggingFrame(
-            NSRect(x: bounds.midX, y: bounds.midY, width: 1, height: 1),
-            contents: NSImage(size: NSSize(width: 1, height: 1))
-        )
-        LightboxDragState.isDraggingAsset = true
-        beginDraggingSession(with: [draggingItem], event: event, source: self)
+            let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+            draggingItem.setDraggingFrame(
+                NSRect(x: bounds.midX, y: bounds.midY, width: 1, height: 1),
+                contents: NSImage(size: NSSize(width: 1, height: 1))
+            )
+            return draggingItem
+        }
+        LightboxDragState.beginAssetDrag(sourceURLs: urls)
+        beginDraggingSession(with: draggingItems, event: event, source: self)
     }
 
     func draggingSession(
         _ session: NSDraggingSession,
         sourceOperationMaskFor context: NSDraggingContext
     ) -> NSDragOperation {
-        .copy
+        context == .outsideApplication ? .copy : [.copy, .move]
     }
 
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool {
@@ -410,7 +562,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         endedAt screenPoint: NSPoint,
         operation: NSDragOperation
     ) {
-        LightboxDragState.isDraggingAsset = false
+        LightboxDragState.endAssetDrag()
     }
 
     private func showMenu(with event: NSEvent) {
@@ -432,13 +584,14 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         }
         menu.addItem(openWithItem)
 
+        menu.addItem(.separator())
         if isDeleted {
             menu.addItem(actionItem(title: menuTitles.restore, action: #selector(restore)))
         } else {
             let compareItem = actionItem(title: compareMenuTitle, action: #selector(addToCompareTray))
             compareItem.isEnabled = assetURL != nil
             menu.addItem(compareItem)
-            menu.addItem(actionItem(title: menuTitles.moveToTrash, action: #selector(moveToTrash)))
+
         }
 
         let revealItem = actionItem(title: menuTitles.showInFinder, action: #selector(revealInFinder))
@@ -458,6 +611,10 @@ final class AssetInteractionView: NSView, NSDraggingSource {
             menu.addItem(tagItem)
         }
 
+        if !isDeleted {
+            menu.addItem(.separator())
+            menu.addItem(actionItem(title: menuTitles.moveToTrash, action: #selector(moveToTrash)))
+        }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
@@ -760,29 +917,21 @@ private struct SelectionCheckbox: View {
 }
 
 private struct SelectionGlow: View {
-    @Environment(\.colorScheme) private var colorScheme
     var cornerRadius: CGFloat
-
     var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-            .stroke(.white.opacity(colorScheme == .dark ? 0.70 : 0.84), lineWidth: 1.1)
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(.black.opacity(colorScheme == .dark ? 0.32 : 0.16), lineWidth: 0.7)
-            }
-            .shadow(color: .white.opacity(colorScheme == .dark ? 0.34 : 0.30), radius: 5)
-            .shadow(color: .black.opacity(colorScheme == .dark ? 0.30 : 0.16), radius: 5, y: 2)
+        RoundedRectangle(cornerRadius: cornerRadius + 2, style: .continuous)
+            .stroke(LightboxColorTokens.accent, lineWidth: LightboxControlMetrics.focusLineWidth)
+            .padding(-2)
+            .allowsHitTesting(false)
     }
 }
 
 private struct ComparePulseGlow: View {
     var cornerRadius: CGFloat
-
     var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-            .stroke(.white.opacity(0.86), lineWidth: 1.2)
-            .shadow(color: .white.opacity(0.56), radius: 9)
-            .shadow(color: .black.opacity(0.15), radius: 5, y: 2)
+        RoundedRectangle(cornerRadius: cornerRadius + 2, style: .continuous)
+            .stroke(LightboxColorTokens.accent, lineWidth: LightboxControlMetrics.focusLineWidth)
+            .padding(-2)
             .allowsHitTesting(false)
     }
 }
