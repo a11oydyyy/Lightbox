@@ -950,6 +950,83 @@ private func makeTestAppState(
 }
 
 @MainActor
+@Test func nativeHeaderFadesBackWithoutRestartingOnRefresh() {
+    let state = makeTestAppState()
+    let header = NativeNavigationBar(appState: state)
+    header.refresh()
+    state.previewAssetID = "preview"
+    header.refresh()
+    #expect(header.layer?.opacity == 0)
+    #expect(header.hitTest(.zero) == nil)
+    state.previewAssetID = nil
+    header.refresh()
+    #expect(!header.isHidden)
+    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        let start = header.layer?.animation(forKey: "previewChromeReveal")?.beginTime
+        #expect(start != nil)
+        header.refresh()
+        #expect(header.layer?.animation(forKey: "previewChromeReveal")?.beginTime == start)
+    }
+    state.previewAssetID = "preview"
+    header.refresh()
+    #expect(header.layer?.opacity == 0)
+    #expect(header.hitTest(.zero) == nil)
+    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        #expect(header.layer?.animation(forKey: "previewChromeReveal")?.duration == MotionTokens.chromeHideDurationSeconds)
+    }
+}
+
+@MainActor
+@Test func folderSortPersistsAcrossNavigationTabsAndRestart() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxFolderSort-\(UUID().uuidString)", isDirectory: true)
+    let child = root.appendingPathComponent("Child", isDirectory: true)
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let defaults = LightboxTestUserDefaults()!
+    let state = makeTestAppState(libraryDefaults: defaults)
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    state.openSidebarFolder(child)
+    #expect(state.sortField == .time)
+    #expect(state.sortDirection == .descending)
+    state.sortField = .size
+    state.goBack()
+    #expect(state.currentFolderURL == root.standardizedFileURL)
+    #expect(state.sortField == .fileName)
+    #expect(state.sortDirection == .ascending)
+    state.goForward()
+    #expect(state.sortField == .size)
+    #expect(state.sortDirection == .descending)
+
+    let firstTab = state.activeTabID
+    state.openSidebarFolderInNewTab(child)
+    #expect(state.sortField == .size)
+    state.sortField = .type
+    state.sortDirection = .ascending
+    state.selectTab(firstTab)
+    #expect(state.sortField == .type)
+    #expect(state.sortDirection == .ascending)
+
+    let restored = makeTestAppState(libraryDefaults: defaults)
+    restored.openSidebarFolder(root)
+    #expect(restored.sortField == .fileName)
+    #expect(restored.sortDirection == .ascending)
+    restored.openSidebarFolder(child)
+    #expect(restored.sortField == .type)
+    #expect(restored.sortDirection == .ascending)
+
+    let unconfigured = root.appendingPathComponent("Unconfigured", isDirectory: true)
+    try FileManager.default.createDirectory(at: unconfigured, withIntermediateDirectories: true)
+    restored.openSidebarFolderInNewTab(unconfigured)
+    #expect(restored.sortField == .time)
+    #expect(restored.sortDirection == .descending)
+}
+
+@MainActor
 @Test func tabHistoryNavigatesBackAndForwardAcrossFolders() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("LightboxTabHistoryTests-\(UUID().uuidString)", isDirectory: true)

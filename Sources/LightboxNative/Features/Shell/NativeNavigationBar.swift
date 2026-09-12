@@ -26,6 +26,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     private var lastPathGeneration: Int
     private var lastPath: String = ""
     private var lastViewingTrash = false
+    private var lastChromeVisible: Bool?
     private var lastSidebarCollapsed: Bool?
     private var layoutTargets: [ObjectIdentifier: NSRect] = [:]
 
@@ -160,9 +161,20 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         button.setAccessibilityLabel(text)
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard lastChromeVisible != false else { return nil }
+        return super.hitTest(point)
+    }
+
+    private func updateChromeVisibility(_ visible: Bool) {
+        guard lastChromeVisible != visible else { return }
+        NativeChromeTransition.apply(to: self, visible: visible, wasVisible: lastChromeVisible)
+        lastChromeVisible = visible
+    }
+
     func refresh() {
         let enabled = appState.previewAssetID == nil && !appState.isComparing
-        isHidden = !enabled
+        updateChromeVisibility(enabled)
         label(back, appState.localized(.goBack))
         label(forward, appState.localized(.goForward))
         label(up, appState.localized(.goToParentFolder))
@@ -466,5 +478,32 @@ private final class KeyboardAwareHeaderButton: NSButton {
         line.line(to: NSPoint(x: bounds.width - 5, y: 2))
         line.lineWidth = LightboxControlMetrics.focusLineWidth
         line.stroke()
+    }
+}
+
+/// Shared opacity transition for the titlebar accessory and native sidebar button.
+@MainActor
+enum NativeChromeTransition {
+    static func apply(to view: NSView, visible: Bool, wasVisible: Bool?) {
+        guard wasVisible != visible else { return }
+        let animated = wasVisible != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        view.wantsLayer = true
+        let previousOpacity = view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? (visible ? 0 : 1)
+        view.layer?.removeAnimation(forKey: "previewChromeReveal")
+        view.isHidden = !animated && !visible
+        view.setAccessibilityHidden(!visible)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer?.opacity = visible ? 1 : 0
+        CATransaction.commit()
+        guard animated else { return }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = previousOpacity
+        fade.toValue = Float(visible ? 1 : 0)
+        fade.beginTime = CACurrentMediaTime() + (visible ? MotionTokens.chromeRevealDelaySeconds : 0)
+        fade.duration = visible ? MotionTokens.chromeRevealDurationSeconds : MotionTokens.chromeHideDurationSeconds
+        fade.fillMode = .backwards
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        view.layer?.add(fade, forKey: "previewChromeReveal")
     }
 }
