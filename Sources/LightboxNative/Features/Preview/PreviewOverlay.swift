@@ -80,8 +80,10 @@ struct PreviewOverlay: View {
                 }
                     .ignoresSafeArea()
 
-                PreviewBackgroundVeil(colorScheme: colorScheme)
+                PreviewBackgroundVeil()
                     .opacity(isPresented ? 1 : 0)
+                    .animation(MotionTokens.ifAllowed(isPresented ? MotionTokens.chromeHide : MotionTokens.chromeReveal,
+                                                      reduceMotion: reduceMotion), value: isPresented)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
 
@@ -499,15 +501,10 @@ private func previewDurationDescription(_ duration: Duration) -> String {
 }
 
 private struct PreviewBackgroundVeil: View {
-    var colorScheme: ColorScheme
 
     var body: some View {
-        Rectangle()
-            .fill(.regularMaterial)
-            .overlay {
-                LightboxColorTokens.inspection
-                    .opacity(colorScheme == .dark ? 0.90 : 0.88)
-            }
+        // One opaque veil fades all underlying gallery/sidebar content together.
+        Rectangle().fill(LightboxColorTokens.inspection)
     }
 }
 

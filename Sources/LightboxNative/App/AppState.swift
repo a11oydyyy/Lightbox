@@ -116,6 +116,7 @@ final class AppState: ObservableObject {
             guard selectedFilter != oldValue else { return }
             guard !isApplyingTabState else { return }
             if selectedFilter == .trash || oldValue == .trash {
+                restoreFolderSort()
                 cancelPreviewDimensionResolution(clearPendingStep: true)
             }
             rebuildActiveAssets()
@@ -161,7 +162,13 @@ final class AppState: ObservableObject {
     @Published private(set) var scrollRestoreGeneration = 0
     @Published var selectedSourceID: LibrarySource.ID = LibrarySource.defaultStartupSource().id
     @Published private var temporarySource: LibrarySource?
-    @Published var currentFolderURL: URL = LibrarySource.defaultStartupSource().rootURL
+    @Published var currentFolderURL: URL = LibrarySource.defaultStartupSource().rootURL {
+        didSet {
+            guard currentFolderURL.standardizedFileURL != oldValue.standardizedFileURL,
+                  !isApplyingTabState else { return }
+            restoreFolderSort()
+        }
+    }
     @Published var folderEntries: [LibraryFolderEntry] = [] {
         didSet {
             rebuildActiveFolderEntries()
@@ -188,7 +195,8 @@ final class AppState: ObservableObject {
     @Published private(set) var goToFolderFocusGeneration = 0
     @Published var sortField: GallerySortField = .time {
         didSet {
-            guard sortField != oldValue, !isApplyingTabState else { return }
+            guard sortField != oldValue, !isApplyingTabState, !isRestoringFolderSort else { return }
+            saveFolderSort()
             rebuildActiveAssets()
             rebuildActiveFolderEntries()
             captureActiveTabState()
@@ -196,7 +204,8 @@ final class AppState: ObservableObject {
     }
     @Published var sortDirection: GallerySortDirection = .descending {
         didSet {
-            guard sortDirection != oldValue, !isApplyingTabState else { return }
+            guard sortDirection != oldValue, !isApplyingTabState, !isRestoringFolderSort else { return }
+            saveFolderSort()
             rebuildActiveAssets()
             rebuildActiveFolderEntries()
             captureActiveTabState()
@@ -276,6 +285,7 @@ final class AppState: ObservableObject {
     private var fileTransferFirstFailureName: String?
     private var isApplyingTabState = false
     private var isPerformingHistoryNavigation = false
+    private var isRestoringFolderSort = false
     private var currentScrollAnchorAssetID: LightboxAsset.ID?
     private var preservesUnavailableCurrentFolder = false
     private let compareTrayLimit = 8
@@ -410,6 +420,7 @@ final class AppState: ObservableObject {
         searchText = activeInitialTab.searchText
         sortField = activeInitialTab.sortField
         sortDirection = activeInitialTab.sortDirection
+        restoreFolderSort(resetUnconfigured: false)
         galleryLayoutMode = activeInitialTab.layoutMode
         thumbnailWidth = activeInitialTab.thumbnailWidth
         currentScrollAnchorAssetID = activeInitialTab.scrollAnchorAssetID
@@ -950,6 +961,7 @@ final class AppState: ObservableObject {
         searchText = tab.searchText
         sortField = tab.sortField
         sortDirection = tab.sortDirection
+        restoreFolderSort(resetUnconfigured: false)
         galleryLayoutMode = tab.layoutMode
         thumbnailWidth = tab.thumbnailWidth
         assets = []
@@ -985,8 +997,8 @@ final class AppState: ObservableObject {
             source: source,
             folderURL: folderURL,
             filter: filter,
-            sortField: sortField,
-            sortDirection: sortDirection,
+            sortField: .time,
+            sortDirection: .descending,
             layoutMode: galleryLayoutMode,
             thumbnailWidth: thumbnailWidth
         )
@@ -1058,6 +1070,7 @@ final class AppState: ObservableObject {
         selectedSourceID = resolvedSource.id
         currentFolderURL = destination.folderURL.standardizedFileURL
         selectedFilter = destination.filter
+        restoreFolderSort()
         searchText = ""
         selectedAssetIDs = []
         selectedAssetID = nil
@@ -1112,6 +1125,33 @@ final class AppState: ObservableObject {
         ImageCache.shared.cancelOutstandingRequests(reason: "switch-tab")
     }
 
+    private var folderSortPreferenceKey: String {
+        let location = isViewingTrash ? "trash" : "folder:" + currentFolderURL.standardizedFileURL.path
+        return "Lightbox.folderSort.v1." + location
+    }
+
+    private func saveFolderSort() {
+        guard !isShowingStartPage else { return }
+        libraryDefaults.set(["field": sortField.rawValue, "direction": sortDirection.rawValue],
+                            forKey: folderSortPreferenceKey)
+    }
+
+    private func restoreFolderSort(resetUnconfigured: Bool = true) {
+        guard !isShowingStartPage else { return }
+        let saved = libraryDefaults.object(forKey: folderSortPreferenceKey) as? [String: String]
+        let field = saved?["field"].flatMap(GallerySortField.init(rawValue:))
+        let direction = saved?["direction"].flatMap(GallerySortDirection.init(rawValue:))
+        guard resetUnconfigured || (field != nil && direction != nil) else { return }
+        isRestoringFolderSort = true
+        sortField = field ?? .time
+        sortDirection = direction ?? .descending
+        isRestoringFolderSort = false
+        if !isApplyingTabState {
+            rebuildActiveAssets()
+            rebuildActiveFolderEntries()
+        }
+    }
+
     private func scheduleTabPersistence() {
         guard !tabs.isEmpty else { return }
         tabPersistenceTask?.cancel()
@@ -1129,6 +1169,8 @@ final class AppState: ObservableObject {
         var snapshot = tabs
         if let index = activeTabIndex {
             snapshot[index].scrollAnchorAssetID = currentScrollAnchorAssetID
+            snapshot[index].sortField = sortField
+            snapshot[index].sortDirection = sortDirection
         }
         LightboxTabStore.save(tabs: snapshot, activeTabID: activeTabID, defaults: libraryDefaults)
     }

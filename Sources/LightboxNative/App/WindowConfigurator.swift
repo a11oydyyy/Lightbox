@@ -24,6 +24,7 @@ struct WindowConfigurator: NSViewRepresentable {
         private let appState: AppState
         private var headerAccessory: NSTitlebarAccessoryViewController?
         private var headerHost: NativeNavigationBar?
+        private var sidebarChromeVisible: Bool?
         private let sidebarItemID = NSToolbarItem.Identifier("Lightbox.ToggleSidebar")
         private var sidebarButton: NSButton?
         private var sidebarItem: NSToolbarItem?
@@ -64,7 +65,12 @@ struct WindowConfigurator: NSViewRepresentable {
             sidebarItem?.toolTip = title
             sidebarButton?.toolTip = title
             sidebarButton?.setAccessibilityLabel(title)
-            sidebarButton?.isEnabled = appState.previewAssetID == nil && !appState.isComparing
+            let visible = appState.previewAssetID == nil && !appState.isComparing
+            sidebarButton?.isEnabled = visible
+            if let sidebarButton {
+                NativeChromeTransition.apply(to: sidebarButton, visible: visible, wasVisible: sidebarChromeVisible)
+                sidebarChromeVisible = visible
+            }
             headerHost?.refresh()
         }
 

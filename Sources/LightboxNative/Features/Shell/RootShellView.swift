@@ -203,11 +203,7 @@ struct RootShellView: View {
         overlayChromeRevealTask?.cancel()
 
         if isOverlayPresented {
-            // Hide on open is instantaneous (the previewChromePresentation modifier
-            // only animates the *show*, not the hide). If the pill faded out over
-            // ~0.4s, the image zooming up from a card under the floating pill would
-            // briefly draw on top of the still-visible pill — the "going out"
-            // occlusion. Killing the pill on the frame the zoom begins fixes it.
+            // All controls use the same short opacity fade on entry.
             overlayChromeVisible = false
             return
         }
