@@ -30,6 +30,11 @@ struct SettingsView: View {
                 .pickerStyle(.menu)
             }
 
+            Section(appState.localized(.folders)) {
+                Toggle(appState.localized(.showFolderCards), isOn: $appState.showFolderCards)
+                Toggle(appState.localized(.showHiddenFiles), isOn: $appState.showsHiddenItems)
+            }
+
             Section(appState.localized(.sidebar)) {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -48,9 +53,6 @@ struct SettingsView: View {
                         in: LightboxSettingsStore.sidebarWidthRange
                     )
                 }
-
-                Toggle(appState.localized(.showFolderCards), isOn: $appState.showFolderCards)
-                Toggle(appState.localized(.showHiddenFiles), isOn: $appState.showsHiddenItems)
 
                 SidebarLocationToggle(
                     title: appState.localized(.showApplications),
