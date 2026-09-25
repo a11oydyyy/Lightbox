@@ -4760,6 +4760,30 @@ func fileTransferSkipsDanglingSymlinks(operation: FileTransferOperation) throws 
     #expect(state.searchStatus == nil)
 }
 
+@MainActor
+@Test func recursiveGroupsAndVisibleIDsUpdateWithResults() {
+    let state = makeTestAppState()
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxGroupedResults-\(UUID().uuidString)")
+    let first = previewRouteAsset(
+        id: "first", name: "first.jpg", addedAt: 1,
+        sourceURL: root.appendingPathComponent("A/first.jpg")
+    )
+    let second = previewRouteAsset(
+        id: "second", name: "second.jpg", addedAt: 2,
+        sourceURL: root.appendingPathComponent("B/second.jpg")
+    )
+
+    state.assets = [first, second]
+    #expect(state.searchAssetGroups.count == 2)
+    #expect(state.activeAssetIDs == Set(["first", "second"]))
+    #expect(Set(state.activeAssetIDList) == state.activeAssetIDs)
+
+    state.assets = [second]
+    #expect(state.searchAssetGroups.map(\.id) == [root.appendingPathComponent("B").path])
+    #expect(state.activeAssetIDs == ["second"])
+    #expect(state.activeAssetIDList == ["second"])
+}
+
 
 @Test @MainActor func galleryKeyboardRangeSelectionAllAndEscape() {
     let appState = makeTestAppState()
