@@ -1,33 +1,36 @@
+import AppKit
 import SwiftUI
 
-struct FloatingScrollIndicator: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    var viewportHeight: CGFloat
-    var contentHeight: CGFloat
-    var fraction: CGFloat
-    var isVisible: Bool
-
-    private var thumbHeight: CGFloat {
-        let ratio = viewportHeight / max(viewportHeight, contentHeight)
-        return max(54, viewportHeight * ratio)
+/// Uses AppKit's overlay scroller for native fade timing, dragging and accessibility.
+struct GalleryScrollBarConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> GalleryScrollBarConfigurationView {
+        GalleryScrollBarConfigurationView()
     }
 
-    private var travel: CGFloat {
-        max(0, viewportHeight - thumbHeight - 28)
+    func updateNSView(_ nsView: GalleryScrollBarConfigurationView, context: Context) {
+        nsView.configureScrollView()
+    }
+}
+
+final class GalleryScrollBarConfigurationView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureScrollView()
     }
 
-    var body: some View {
-        Capsule()
-            .fill(.white.opacity(0.24))
-            .overlay {
-                Capsule().stroke(.white.opacity(0.22), lineWidth: 0.8)
-            }
-            .frame(width: 7, height: thumbHeight)
-            .offset(y: 14 + travel * min(1, max(0, fraction)))
-            .frame(width: 18, height: viewportHeight, alignment: .top)
-            .lightboxGlass(Capsule())
-            .opacity(isVisible ? 1 : 0)
-            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isVisible)
-            .allowsHitTesting(false)
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        configureScrollView()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func configureScrollView() {
+        guard let scrollView = enclosingScrollView else { return }
+        scrollView.hasVerticalScroller = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
+        // The gallery extends behind the 52pt header; keep the entire thumb below it.
+        scrollView.scrollerInsets = NSEdgeInsets(top: 58, left: 0, bottom: 6, right: 0)
     }
 }

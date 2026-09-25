@@ -301,12 +301,7 @@ struct GalleryView: View {
     @State private var searchGroupHeaderFrames: [String: CGRect] = [:]
     @State private var selectionRect: CGRect?
     @State private var scrollOffset: CGFloat = 0
-    @State private var scrollContentHeight: CGFloat = 1
-    @State private var scrollViewportHeight: CGFloat = 1
     @State private var scrollDirection: GalleryScrollDirection = .stationary
-    @State private var scrollIndicatorVisible = false
-    @State private var scrollVisibilityGeneration = 0
-    @State private var scrollFadeTask: Task<Void, Never>?
     @State private var contentVisible = true
     @State private var restoredScrollGeneration = -1
     @State private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
@@ -505,14 +500,14 @@ struct GalleryView: View {
                         }
                         .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? 58 : 0)
                         .padding(.bottom, 92)
-                        .background(ContentHeightProbe())
                         .opacity(contentVisible ? 1 : 0)
                         .offset(y: contentVisible ? 0 : 8)
                         .animation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion), value: appState.thumbnailWidth)
                         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.galleryLayoutMode)
                     }
+                    .background(GalleryScrollBarConfigurator())
                     }
-                    .scrollIndicators(.hidden)
+                    .scrollIndicators(.automatic)
                     .id(navigationToken)
                     .coordinateSpace(name: "GalleryScroll")
                     .contextMenu {
@@ -527,18 +522,7 @@ struct GalleryView: View {
                         }
                     }
                     .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
-                        noteScroll(
-                            offset: offset,
-                            contentHeight: scrollContentHeight,
-                            viewportHeight: viewport.size.height
-                        )
-                    }
-                    .onPreferenceChange(ContentHeightPreferenceKey.self) { height in
-                        noteScroll(
-                            offset: scrollOffset,
-                            contentHeight: height,
-                            viewportHeight: viewport.size.height
-                        )
+                        noteScroll(offset: offset)
                     }
                     .onAppear {
                         playContentEntrance()
@@ -582,7 +566,10 @@ struct GalleryView: View {
                 if !activeAssets.isEmpty {
                     RubberBandSelectionLayer(
                         assetFrames: assetFrames,
-                        excludedFrames: folderExclusionFrames + Array(searchGroupHeaderFrames.values),
+                        excludedFrames: folderExclusionFrames + Array(searchGroupHeaderFrames.values) + [CGRect(
+                            x: viewport.size.width - 16, y: 0,
+                            width: 16, height: viewport.size.height
+                        )],
                         visibleAssetIDs: appState.activeAssetIDList,
                         selectedAssetIDs: appState.selectedAssetIDs,
                         onSelectionRectChange: { rect in
@@ -599,14 +586,6 @@ struct GalleryView: View {
                     RubberBandSelectionRect(rect: selectionRect)
                         .allowsHitTesting(false)
                 }
-
-                FloatingScrollIndicator(
-                    viewportHeight: viewport.size.height,
-                    contentHeight: scrollContentHeight,
-                    fraction: scrollFraction,
-                    isVisible: scrollIndicatorVisible
-                )
-                .padding(.trailing, 10)
 
                 if let status = appState.libraryLoadingStatus {
                     GalleryLoadingIndicator(label: appState.loadingStatusText(status))
@@ -681,49 +660,14 @@ struct GalleryView: View {
         return ids
     }
 
-    private var scrollFraction: CGFloat {
-        let available = max(1, scrollContentHeight - scrollViewportHeight)
-        return min(1, max(0, scrollOffset / available))
-    }
-
-    private func noteScroll(offset: CGFloat, contentHeight: CGFloat, viewportHeight: CGFloat) {
+    private func noteScroll(offset: CGFloat) {
         guard !isResizingSidebar else { return }
         let nextOffset = max(0, offset)
-        let nextViewportHeight = max(1, viewportHeight)
-        let nextContentHeight = max(contentHeight, nextViewportHeight)
-        let nextIndicatorVisible = nextContentHeight > nextViewportHeight + 12
-        let offsetChanged = abs(nextOffset - scrollOffset) > 18
-        let contentChanged = abs(nextContentHeight - scrollContentHeight) > 1 || abs(nextViewportHeight - scrollViewportHeight) > 1
-        let visibilityChanged = nextIndicatorVisible != scrollIndicatorVisible
+        guard abs(nextOffset - scrollOffset) > 18 else { return }
 
-        guard offsetChanged || contentChanged || visibilityChanged else {
-            return
-        }
-
-        if nextOffset > scrollOffset + 8 {
-            scrollDirection = .down
-        } else if nextOffset < scrollOffset - 8 {
-            scrollDirection = .up
-        }
+        scrollDirection = nextOffset > scrollOffset ? .down : .up
         scrollOffset = nextOffset
-        scrollContentHeight = nextContentHeight
-        scrollViewportHeight = nextViewportHeight
         updateScrollAnchor(using: assetFrames)
-
-        if nextIndicatorVisible {
-            scrollIndicatorVisible = true
-            scrollVisibilityGeneration += 1
-            let generation = scrollVisibilityGeneration
-            scrollFadeTask?.cancel()
-            scrollFadeTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(760))
-                guard !Task.isCancelled, generation == scrollVisibilityGeneration else { return }
-                scrollIndicatorVisible = false
-            }
-        } else {
-            scrollFadeTask?.cancel()
-            scrollIndicatorVisible = false
-        }
     }
 
     private func updateAssetFramesIfNeeded(
@@ -1671,27 +1615,8 @@ private struct ScrollOffsetProbe: View {
     }
 }
 
-private struct ContentHeightProbe: View {
-    var body: some View {
-        GeometryReader { proxy in
-            Color.clear.preference(
-                key: ContentHeightPreferenceKey.self,
-                value: proxy.frame(in: .named("GalleryScroll")).maxY
-            )
-        }
-    }
-}
-
 private struct ScrollOffsetPreferenceKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private struct ContentHeightPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 1
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
