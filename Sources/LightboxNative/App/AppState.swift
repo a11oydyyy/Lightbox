@@ -270,6 +270,9 @@ final class AppState: ObservableObject {
     private let libraryDefaults: UserDefaults
     private var selectionAnchorID: LightboxAsset.ID?
     @Published private var cachedActiveAssets: [LightboxAsset] = []
+    private var cachedActiveAssetIDs: Set<LightboxAsset.ID> = []
+    private var cachedActiveAssetIDList: [LightboxAsset.ID] = []
+    private var cachedSearchAssetGroups: [SearchAssetGroup] = []
     private(set) var activeAssetsRevision = 0
     @Published private var cachedActiveFolderEntries: [LibraryFolderEntry] = []
     @Published private var cachedLibraryColorTags: [MacColorTag] = []
@@ -1201,18 +1204,13 @@ final class AppState: ObservableObject {
     }
 
     var searchAssetGroups: [SearchAssetGroup] {
-        let activeAssets = activeAssets
-        guard usesRecursiveResults, !activeAssets.isEmpty
-        else {
-            return [
-                SearchAssetGroup(
-                    id: currentFolderURL.standardizedFileURL.path,
-                    title: currentPathTitle,
-                    assets: activeAssets
-                )
-            ]
-        }
+        cachedSearchAssetGroups
+    }
 
+    var activeAssetIDs: Set<LightboxAsset.ID> { cachedActiveAssetIDs }
+    var activeAssetIDList: [LightboxAsset.ID] { cachedActiveAssetIDList }
+
+    private func makeSearchAssetGroups(for activeAssets: [LightboxAsset]) -> [SearchAssetGroup] {
         var grouped: [(path: String, title: String, assets: [LightboxAsset])] = []
         var indexByPath: [String: Int] = [:]
         for asset in activeAssets {
@@ -3664,6 +3662,9 @@ final class AppState: ObservableObject {
 
     private func setCachedActiveAssets(_ nextAssets: [LightboxAsset]) {
         guard cachedActiveAssets != nextAssets else { return }
+        cachedActiveAssetIDList = nextAssets.map(\.id)
+        cachedActiveAssetIDs = Set(cachedActiveAssetIDList)
+        cachedSearchAssetGroups = makeSearchAssetGroups(for: nextAssets)
         activeAssetsRevision &+= 1
         cachedActiveAssets = nextAssets
     }

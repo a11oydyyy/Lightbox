@@ -298,6 +298,7 @@ struct GalleryView: View {
     @State private var lastViewportWidth: CGFloat = 0
     @State private var assetFrames: [LightboxAsset.ID: CGRect] = [:]
     @State private var folderRowFrame: CGRect?
+    @State private var searchGroupHeaderFrames: [String: CGRect] = [:]
     @State private var selectionRect: CGRect?
     @State private var scrollOffset: CGFloat = 0
     @State private var scrollContentHeight: CGFloat = 1
@@ -310,6 +311,7 @@ struct GalleryView: View {
     @State private var restoredScrollGeneration = -1
     @State private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
     @State private var masonryColumnCache = GalleryMasonryColumnCache()
+    @State private var collapsedSearchGroupIDs: Set<String> = []
 
     private let horizontalPadding = GalleryThumbnailSizing.horizontalPadding
 
@@ -368,7 +370,7 @@ struct GalleryView: View {
         GeometryReader { viewport in
             let folderHorizontalPadding = horizontalPadding + imageColumnInset(viewportWidth: viewport.size.width)
             let activeAssets = appState.activeAssets
-            let activeAssetIDs = Set(activeAssets.map(\.id))
+            let activeAssetIDs = appState.activeAssetIDs
             let performanceProfile = GalleryPerformanceProfile.current
             let prefersFastRawThumbnails = prefersFastRawThumbnails(activeAssets: activeAssets)
             let loadableAssetIDs = imageLoadAssetIDs(
@@ -393,7 +395,9 @@ struct GalleryView: View {
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
             let searchGroups = appState.usesRecursiveResults ? appState.searchAssetGroups : []
-            let shouldGroupSearchAssets = appState.usesRecursiveResults && searchGroups.count > 1
+            let shouldGroupSearchAssets = !activeAssets.isEmpty
+                && appState.usesRecursiveResults
+                && (appState.includesSubfolders || searchGroups.count > 1)
             let showsSearchLimitHint = appState.searchStatus?.limitReached == true
 
             ZStack(alignment: .trailing) {
@@ -439,29 +443,45 @@ struct GalleryView: View {
                                 LazyVStack(spacing: 18) {
                                     ForEach(searchGroups) { group in
                                         VStack(alignment: .leading, spacing: 10) {
-                                            SearchGroupHeader(title: group.title, count: group.assets.count)
-                                                .frame(width: galleryMetrics(
-                                                    viewportWidth: viewport.size.width,
-                                                    minimumColumns: min(GalleryThumbnailSizing.maximumZoomColumnCount, max(1, group.assets.count))
-                                                ).usedWidth)
-                                                .frame(maxWidth: .infinity)
-                                                .padding(.horizontal, horizontalPadding)
-
-                                            assetGrid(
-                                                activeAssets: group.assets,
-                                                activeAssetIDs: activeAssetIDs,
-                                                cacheIdentity: group.id,
+                                            SearchGroupHeader(
+                                                title: group.title,
+                                                count: group.assets.count,
+                                                isExpanded: !collapsedSearchGroupIDs.contains(group.id)
+                                            ) {
+                                                if collapsedSearchGroupIDs.contains(group.id) {
+                                                    collapsedSearchGroupIDs.remove(group.id)
+                                                } else {
+                                                    collapsedSearchGroupIDs.insert(group.id)
+                                                    if group.assets.contains(where: { $0.id == appState.galleryKeyboardFocusID }) {
+                                                        appState.galleryKeyboardFocusID = nil
+                                                    }
+                                                }
+                                            }
+                                            .frame(width: galleryMetrics(
                                                 viewportWidth: viewport.size.width,
-                                                loadableAssetIDs: loadableAssetIDs,
-                                                prioritizedAssetIDs: prioritizedAssetIDs,
-                                                thumbnailQuality: thumbnailQuality,
-                                                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
-                                                prefersFastRawThumbnails: prefersFastRawThumbnails,
-                                                usesReducedHover: usesReducedHover,
-                                                performanceProfile: performanceProfile,
-                                                menuTitles: assetMenuTitles
-                                            )
+                                                minimumColumns: min(GalleryThumbnailSizing.maximumZoomColumnCount, max(1, group.assets.count))
+                                            ).usedWidth)
+                                            .frame(maxWidth: .infinity)
                                             .padding(.horizontal, horizontalPadding)
+                                            .background(SearchGroupHeaderFrameProbe(id: group.id))
+
+                                            if !collapsedSearchGroupIDs.contains(group.id) {
+                                                assetGrid(
+                                                    activeAssets: group.assets,
+                                                    activeAssetIDs: activeAssetIDs,
+                                                    cacheIdentity: group.id,
+                                                    viewportWidth: viewport.size.width,
+                                                    loadableAssetIDs: loadableAssetIDs,
+                                                    prioritizedAssetIDs: prioritizedAssetIDs,
+                                                    thumbnailQuality: thumbnailQuality,
+                                                    permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
+                                                    prefersFastRawThumbnails: prefersFastRawThumbnails,
+                                                    usesReducedHover: usesReducedHover,
+                                                    performanceProfile: performanceProfile,
+                                                    menuTitles: assetMenuTitles
+                                                )
+                                                .padding(.horizontal, horizontalPadding)
+                                            }
                                         }
                                     }
                                 }
@@ -501,6 +521,11 @@ struct GalleryView: View {
                     .onPreferenceChange(FolderRowFramePreferenceKey.self) { frame in
                         folderRowFrame = frame
                     }
+                    .onPreferenceChange(SearchGroupHeaderFramePreferenceKey.self) { frames in
+                        if frames != searchGroupHeaderFrames {
+                            searchGroupHeaderFrames = frames
+                        }
+                    }
                     .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
                         noteScroll(
                             offset: offset,
@@ -521,9 +546,11 @@ struct GalleryView: View {
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
                     .onChange(of: navigationToken) { _ in
+                        collapsedSearchGroupIDs.removeAll()
                         frameUpdateCoordinator.cancel()
                         assetFrames = [:]
                         folderRowFrame = nil
+                        searchGroupHeaderFrames = [:]
                         selectionRect = nil
                         appState.updatePreviewSpaceAssetFrames([:])
                         playContentEntrance()
@@ -555,8 +582,8 @@ struct GalleryView: View {
                 if !activeAssets.isEmpty {
                     RubberBandSelectionLayer(
                         assetFrames: assetFrames,
-                        excludedFrames: folderExclusionFrames,
-                        visibleAssetIDs: activeAssets.map(\.id),
+                        excludedFrames: folderExclusionFrames + Array(searchGroupHeaderFrames.values),
+                        visibleAssetIDs: appState.activeAssetIDList,
                         selectedAssetIDs: appState.selectedAssetIDs,
                         onSelectionRectChange: { rect in
                             selectionRect = rect
@@ -1110,27 +1137,40 @@ private struct GalleryEmptyState: View {
 }
 
 private struct SearchGroupHeader: View {
+    @EnvironmentObject private var appState: AppState
     var title: String
     var count: Int
+    var isExpanded: Bool
+    var onToggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(LightboxColorTokens.secondaryText)
-                .lineLimit(1)
-                .truncationMode(.middle)
+        Button(action: onToggle) {
+            HStack(spacing: 8) {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 12)
 
-            Text("\(count)")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(LightboxColorTokens.mutedText)
-                .monospacedDigit()
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
-            Rectangle()
-                .fill(.secondary.opacity(0.16))
-                .frame(height: 1)
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(LightboxColorTokens.mutedText)
+                    .monospacedDigit()
+
+                Rectangle()
+                    .fill(.secondary.opacity(0.16))
+                    .frame(height: 1)
+            }
+            .foregroundStyle(LightboxColorTokens.secondaryText)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 28)
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .buttonStyle(.plain)
+        .accessibilityValue(appState.localized(isExpanded ? .expandedState : .collapsedState))
     }
 }
 
@@ -1567,6 +1607,27 @@ private struct FolderRowFramePreferenceKey: PreferenceKey {
         if let next = nextValue() {
             value = next
         }
+    }
+}
+
+private struct SearchGroupHeaderFrameProbe: View {
+    var id: String
+
+    var body: some View {
+        GeometryReader { proxy in
+            Color.clear.preference(
+                key: SearchGroupHeaderFramePreferenceKey.self,
+                value: [id: proxy.frame(in: .named("GallerySelectionSpace"))]
+            )
+        }
+    }
+}
+
+private struct SearchGroupHeaderFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
