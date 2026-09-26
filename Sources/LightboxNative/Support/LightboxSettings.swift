@@ -87,6 +87,11 @@ enum LightboxTextKey: String, CaseIterable {
     case clearCompareTray
     case close
     case closeTab
+    case closeOtherTabs
+    case closeFollowingTabs
+    case duplicateTab
+    case pinTab
+    case unpinTab
     case closeComparison
     case closeFilters
     case closeSidebar
@@ -423,6 +428,11 @@ enum LightboxLocalization {
         .clearCompareTray: "Clear Compare Tray",
         .close: "Close",
         .closeTab: "Close Tab",
+        .closeOtherTabs: "Close Other Tabs",
+        .closeFollowingTabs: "Close Following Tabs",
+        .duplicateTab: "Duplicate Tab",
+        .pinTab: "Pin Tab",
+        .unpinTab: "Unpin Tab",
         .closeComparison: "Close Comparison",
         .closeFilters: "Close filters",
         .closeSidebar: "Close Sidebar",
@@ -567,6 +577,11 @@ enum LightboxLocalization {
         .clearCompareTray: "清空对比暂存区",
         .close: "关闭",
         .closeTab: "关闭标签页",
+        .closeOtherTabs: "关闭其他标签页",
+        .closeFollowingTabs: "关闭后面的标签页",
+        .duplicateTab: "复制标签页",
+        .pinTab: "固定标签页",
+        .unpinTab: "取消固定标签页",
         .closeComparison: "关闭对比",
         .closeFilters: "收起筛选",
         .closeSidebar: "收起侧边栏",
@@ -711,6 +726,11 @@ enum LightboxLocalization {
         .clearCompareTray: "清空比較暫存區",
         .close: "關閉",
         .closeTab: "關閉標籤頁",
+        .closeOtherTabs: "關閉其他標籤頁",
+        .closeFollowingTabs: "關閉後面的標籤頁",
+        .duplicateTab: "複製標籤頁",
+        .pinTab: "固定標籤頁",
+        .unpinTab: "取消固定標籤頁",
         .closeComparison: "關閉比較",
         .closeFilters: "收起篩選",
         .closeSidebar: "收起側邊欄",
@@ -855,6 +875,11 @@ enum LightboxLocalization {
         .clearCompareTray: "比較トレイをクリア",
         .close: "閉じる",
         .closeTab: "タブを閉じる",
+        .closeOtherTabs: "ほかのタブを閉じる",
+        .closeFollowingTabs: "後ろのタブを閉じる",
+        .duplicateTab: "タブを複製",
+        .pinTab: "タブを固定",
+        .unpinTab: "タブの固定を解除",
         .closeComparison: "比較を閉じる",
         .closeFilters: "フィルタを閉じる",
         .closeSidebar: "サイドバーを閉じる",

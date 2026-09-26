@@ -850,6 +850,12 @@ private struct SidebarTabRow: View {
                         .font(.system(size: 13, weight: active ? .semibold : .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if tab.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(LightboxColorTokens.secondaryText)
+                            .accessibilityLabel(appState.localized(.pinTab))
+                    }
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
@@ -880,6 +886,7 @@ private struct SidebarTabRow: View {
         .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: active)
         .onHover { hovering = $0 }
         .help(appState.tabPath(tab))
+        .contextMenu { TabContextMenu(tab: tab) }
         .onDrag {
             appState.beginTabDrag(tab.id)
             return NSItemProvider(object: tab.id.uuidString as NSString)
