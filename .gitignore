@@ -11,3 +11,15 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Local product/design context and internal working documents
+/PRODUCT.md
+/DESIGN*.md
+/.impeccable/
+/Docs/*
+!/Docs/ReleaseNotes-*.md
+
+# Local experimental app
+/README-CLEAN.md
+/Sources/LightboxClean/
+/script/build_clean_and_run.sh
