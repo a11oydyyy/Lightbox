@@ -112,6 +112,119 @@ private func makeTestAppState(
     #expect(state.scrollRestoreGeneration == scroll)
 }
 
+@Test @MainActor func duplicateInactiveTabPreservesItsBrowsingState() {
+    let state = makeTestAppState()
+    let originalID = state.activeTabID
+    state.searchText = "original search"
+    state.thumbnailWidth = 250
+    state.selectedAssetIDs = ["test-selection"]
+    state.selectedAssetID = "test-selection"
+    state.newTab()
+    let previousActiveID = state.activeTabID
+    state.searchText = "other search"
+
+    state.duplicateTab(originalID)
+
+    #expect(state.tabs.count == 3)
+    #expect(state.tabs[0].id == originalID)
+    #expect(state.tabs[1].id == state.activeTabID)
+    #expect(state.tabs[2].id == previousActiveID)
+    #expect(state.searchText == "original search")
+    #expect(state.thumbnailWidth == 250)
+    #expect(state.selectedAssetIDs.isEmpty)
+    #expect(state.tabs[0].selectedAssetIDs == ["test-selection"])
+}
+
+@Test @MainActor func closeOtherTabsKeepsInactiveTargetAndPersistsSession() {
+    let defaults = LightboxTestUserDefaults()!
+    let state = makeTestAppState(libraryDefaults: defaults)
+    let targetID = state.activeTabID
+    state.searchText = "kept search"
+    state.newTab()
+    state.newTab()
+
+    state.closeOtherTabs(keeping: targetID)
+
+    #expect(state.tabs.map(\.id) == [targetID])
+    #expect(state.activeTabID == targetID)
+    #expect(state.searchText == "kept search")
+    let restored = LightboxTabStore.load(sources: state.sources, defaults: defaults)
+    #expect(restored?.tabs.map(\.id) == [targetID])
+    #expect(restored?.activeTabID == targetID)
+    state.closeOtherTabs(keeping: UUID())
+    #expect(state.tabs.map(\.id) == [targetID])
+}
+
+@Test @MainActor func closeFollowingTabsPreservesEarlierActiveTabAndOrder() {
+    let state = makeTestAppState()
+    let firstID = state.activeTabID
+    state.newTab()
+    let targetID = state.activeTabID
+    state.newTab()
+    #expect(state.canCloseTabsAfter(targetID))
+    state.closeTabsAfter(targetID)
+    #expect(state.tabs.map(\.id) == [firstID, targetID])
+    #expect(state.activeTabID == targetID)
+    #expect(!state.canCloseTabsAfter(targetID))
+
+    state.newTab()
+    state.selectTab(firstID)
+    state.searchText = "active search"
+    state.closeTabsAfter(targetID)
+    #expect(state.tabs.map(\.id) == [firstID, targetID])
+    #expect(state.activeTabID == firstID)
+    #expect(state.searchText == "active search")
+}
+
+@Test @MainActor func pinnedTabsStayFirstAndSurviveBulkClosingAndRestore() {
+    let defaults = LightboxTestUserDefaults()!
+    let state = makeTestAppState(libraryDefaults: defaults)
+    let firstID = state.activeTabID
+    state.newTab()
+    let pinnedID = state.activeTabID
+    state.newTab()
+    let lastID = state.activeTabID
+    state.toggleTabPinned(pinnedID)
+    #expect(state.tabs.map(\.id) == [pinnedID, firstID, lastID])
+    #expect(state.activeTabID == lastID)
+    #expect(state.tabs[0].isPinned)
+    let restored = LightboxTabStore.load(sources: state.sources, defaults: defaults)
+    #expect(restored?.tabs.first?.isPinned == true)
+    #expect(restored?.tabs.first?.id == pinnedID)
+
+    state.closeOtherTabs(keeping: firstID)
+    #expect(state.tabs.map(\.id) == [pinnedID, firstID])
+    #expect(state.activeTabID == firstID)
+    #expect(!state.canCloseOtherTabs(keeping: firstID))
+    state.toggleTabPinned(pinnedID)
+    #expect(state.tabs.first?.isPinned == false)
+    #expect(state.canCloseOtherTabs(keeping: firstID))
+}
+
+@Test @MainActor func newAndDuplicateTabsRemainOutsidePinnedGroup() {
+    let state = makeTestAppState()
+    let firstID = state.activeTabID
+    state.newTab()
+    let secondID = state.activeTabID
+    state.toggleTabPinned(firstID)
+    state.toggleTabPinned(secondID)
+    state.selectTab(firstID)
+    state.newTab()
+    #expect(state.tabs.prefix(2).allSatisfy { $0.isPinned })
+    #expect(!state.tabs[2].isPinned)
+    let newID = state.activeTabID
+    state.beginTabDrag(newID)
+    state.moveDraggedTab(before: firstID)
+    state.endTabDrag()
+    #expect(state.tabs[2].id == newID)
+    state.duplicateTab(firstID)
+    #expect(state.tabs.prefix(2).allSatisfy { $0.isPinned })
+    #expect(!state.tabs[2].isPinned)
+    #expect(state.tabs[2].id == state.activeTabID)
+    state.closeTabsAfter(firstID)
+    #expect(state.tabs.map(\.id) == [firstID, secondID])
+}
+
 @Test func previewTargetFrameIsCenteredInViewport() async throws {
     let viewport = CGSize(width: 1600, height: 1000)
     let assetSize = CGSize(width: 750, height: 909)

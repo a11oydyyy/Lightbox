@@ -519,7 +519,7 @@ final class AppState: ObservableObject {
             sortField: current.sortField, sortDirection: current.sortDirection,
             layoutMode: current.layoutMode, thumbnailWidth: current.thumbnailWidth
         )
-        tabs.insert(tab, at: index + 1)
+        tabs.insert(tab, at: max(index + 1, tabs.filter(\.isPinned).count))
         activateTab(tab.id, capturingCurrent: false)
     }
 
@@ -547,6 +547,73 @@ final class AppState: ObservableObject {
 
     func closeActiveTab() {
         closeTab(activeTabID)
+    }
+
+    func duplicateTab(_ tabID: UUID) {
+        guard tabs.contains(where: { $0.id == tabID }) else { return }
+        captureActiveTabState()
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        var duplicate = tabs[index]
+        duplicate.id = UUID()
+        duplicate.isPinned = false
+        duplicate.selectedAssetIDs = []
+        duplicate.selectedAssetID = nil
+        tabs.insert(duplicate, at: max(index + 1, tabs.filter(\.isPinned).count))
+        activateTab(duplicate.id, capturingCurrent: false)
+    }
+
+    func canCloseTabsAfter(_ tabID: UUID) -> Bool {
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return false }
+        return tabs.dropFirst(index + 1).contains { !$0.isPinned }
+    }
+
+    func canCloseOtherTabs(keeping tabID: UUID) -> Bool {
+        tabs.contains { $0.id != tabID && !$0.isPinned }
+    }
+
+    func toggleTabPinned(_ tabID: UUID) {
+        guard tabs.contains(where: { $0.id == tabID }) else { return }
+        captureActiveTabState()
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        var tab = tabs.remove(at: index)
+        tab.isPinned.toggle()
+        tabs.insert(tab, at: tabs.filter(\.isPinned).count)
+        persistTabsImmediately()
+    }
+
+    func closeOtherTabs(keeping tabID: UUID) {
+        guard tabs.contains(where: { $0.id == tabID }) else { return }
+        closeTabs(Set(tabs.filter { $0.id != tabID && !$0.isPinned }.map(\.id)), keeping: tabID)
+    }
+
+    func closeTabsAfter(_ tabID: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        closeTabs(Set(tabs.dropFirst(index + 1).filter { !$0.isPinned }.map(\.id)), keeping: tabID)
+    }
+
+    private func closeTabs(_ tabIDs: Set<UUID>, keeping tabID: UUID) {
+        guard !tabIDs.isEmpty else { return }
+        captureActiveTabState()
+        let closesActiveTab = tabIDs.contains(activeTabID)
+        tabs.removeAll { tabIDs.contains($0.id) }
+        if closesActiveTab {
+            activateTab(tabID, capturingCurrent: false)
+        } else {
+            persistTabsImmediately()
+        }
+    }
+
+    func copyTabPathToClipboard(_ tabID: UUID) {
+        captureActiveTabState()
+        guard let tab = tabs.first(where: { $0.id == tabID }), !tab.isStartPage else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(tabPath(tab), forType: .string)
+    }
+
+    func revealTabInFinder(_ tabID: UUID) {
+        captureActiveTabState()
+        guard let tab = tabs.first(where: { $0.id == tabID }), !tab.isStartPage else { return }
+        revealSidebarURLInFinder(tab.filter == .trash ? LightboxLibraryStore.primarySystemTrashFolder : tab.folderURL)
     }
 
     func closeTab(_ tabID: UUID) {
@@ -587,6 +654,8 @@ final class AppState: ObservableObject {
         else {
             return
         }
+
+        guard tabs[fromIndex].isPinned == tabs[toIndex].isPinned else { return }
 
         let tab = tabs.remove(at: fromIndex)
         let insertionIndex = fromIndex < toIndex ? toIndex - 1 : toIndex
@@ -1005,7 +1074,7 @@ final class AppState: ObservableObject {
             layoutMode: galleryLayoutMode,
             thumbnailWidth: thumbnailWidth
         )
-        tabs.insert(tab, at: min(insertionIndex, tabs.count))
+        tabs.insert(tab, at: min(max(insertionIndex, tabs.filter(\.isPinned).count), tabs.count))
         activateTab(tab.id, capturingCurrent: false)
     }
 

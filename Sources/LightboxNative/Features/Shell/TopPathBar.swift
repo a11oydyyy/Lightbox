@@ -652,7 +652,7 @@ private struct OverflowTabRow: View {
             onSelect()
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: "folder")
+                Image(systemName: tab.isPinned ? "pin.fill" : "folder")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
                 Text(appState.tabTitle(tab))
@@ -671,6 +671,7 @@ private struct OverflowTabRow: View {
         }
         .buttonStyle(.plain)
         .help(appState.tabPath(tab))
+        .contextMenu { TabContextMenu(tab: tab) }
     }
 }
 
@@ -692,13 +693,19 @@ private struct LightboxTabButton: View {
             Button {
                 appState.selectTab(tab.id)
             } label: {
-                Text(appState.tabTitle(tab))
-                    .font(.system(size: 11, weight: isActive ? .semibold : .medium))
-                    .foregroundStyle(isActive ? TopPathBarColor.strongText : TopPathBarColor.regularText)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+                HStack(spacing: 4) {
+                    if tab.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 9))
+                    }
+                    Text(appState.tabTitle(tab))
+                        .font(.system(size: 11, weight: isActive ? .semibold : .medium))
+                        .foregroundStyle(isActive ? TopPathBarColor.strongText : TopPathBarColor.regularText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
             }
             .buttonStyle(.plain)
 
@@ -753,6 +760,7 @@ private struct LightboxTabButton: View {
         }
         .help(appState.tabPath(tab))
         .accessibilityElement(children: .combine)
+        .contextMenu { TabContextMenu(tab: tab) }
         .accessibilityLabel(appState.tabTitle(tab))
         .accessibilityAddTraits(isActive ? .isSelected : [])
     }
