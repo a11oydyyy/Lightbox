@@ -2091,6 +2091,61 @@ private func previewRouteAsset(
     #expect(decodeCounter.value == 1)
 }
 
+@Test @MainActor func galleryScrollReusesSharperThumbnailWithoutDecodingAgain() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appendingPathComponent("photo.jpg")
+    try Data("original".utf8).write(to: url)
+    let signature = try #require(FileContentSignature(url: url))
+    let image = try #require(makeTestImage(size: 64))
+    let counter = LockedCounter()
+    let cache = ImageCache(diskCache: ThumbnailDiskCache(folder: root.appendingPathComponent("cache"))) { _, _ in
+        counter.increment()
+        return image
+    }
+    for quality in [ImageCacheQuality.thumbnail, .thumbnailFast, .thumbnailBalanced, .thumbnail] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            _ = cache.image(for: url, quality: quality, knownFileSignature: signature) { result in
+                #expect(result === image)
+                continuation.resume()
+            }
+        }
+    }
+    #expect(counter.value == 1)
+    // A same-path replacement must still invalidate every quality of the old image.
+    try Data("replacement with new pixels".utf8).write(to: url, options: .atomic)
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        _ = cache.image(for: url, quality: .thumbnailFast, knownFileSignature: signature) { _ in
+            continuation.resume()
+        }
+    }
+    #expect(counter.value == 2)
+}
+
+@Test @MainActor func galleryQualityUpgradeDoesNotTreatSmallCachedImageAsComplete() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appendingPathComponent("photo.jpg")
+    try Data("source".utf8).write(to: url)
+    let small = try #require(makeTestImage(size: 8))
+    let sharp = try #require(makeTestImage(size: 64))
+    let cache = ImageCache(diskCache: ThumbnailDiskCache(folder: root.appendingPathComponent("cache"))) { _, quality in
+        quality == .thumbnailFast ? small : sharp
+    }
+    for quality in [ImageCacheQuality.thumbnailFast, .thumbnail] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            _ = cache.image(for: url, quality: quality) { result in
+                #expect(result?.size.width == (quality == .thumbnailFast ? 8 : 64))
+                continuation.resume()
+            }
+        }
+    }
+    #expect(cache.bestCachedImage(for: url, quality: .thumbnailFast,
+        knownFileSignature: FileContentSignature(url: url)) === sharp)
+}
+
 @Test @MainActor func imageCacheReloadsFileReplacedAtSamePathWhenKnownSignatureIsStale() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -2778,6 +2833,25 @@ private func previewRouteAsset(
         )
         == .thumbnailBalanced
     )
+}
+
+@Test func largeExternalGalleryOnlyPromotesVisibleImagesAfterScrollingSettles() {
+    let frames: [CGRect?] = [nil,
+        CGRect(x: 0, y: -200, width: 200, height: 200),
+        CGRect(x: 0, y: -100, width: 200, height: 200),
+        CGRect(x: 0, y: 500, width: 200, height: 200),
+        CGRect(x: 0, y: 800, width: 200, height: 200)]
+    for (index, frame) in frames.enumerated() {
+        let visible = GalleryImagePriorityPlanner.isVisible(frame, viewportHeight: 800)
+        #expect(visible == (index == 2 || index == 3))
+        for scrolling in [true, false] {
+            let quality = GalleryImagePriorityPlanner.displayQuality(
+                baseQuality: .thumbnailFast, isPrioritized: true,
+                prefersFastRawThumbnails: true, permitsFullThumbnailPromotion: false,
+                isSettledVisible: !scrolling && visible)
+            #expect(quality == (!scrolling && visible ? .thumbnail : .thumbnailBalanced))
+        }
+    }
 }
 
 @Test func compatibilityGalleryProfileUsesLighterImageLoadingPolicy() async throws {
@@ -4895,6 +4969,74 @@ func fileTransferSkipsDanglingSymlinks(operation: FileTransferOperation) throws 
     #expect(state.searchAssetGroups.map(\.id) == [root.appendingPathComponent("B").path])
     #expect(state.activeAssetIDs == ["second"])
     #expect(state.activeAssetIDList == ["second"])
+}
+
+@MainActor
+@Test func largeTabRestoresImmediatelyAcrossRapidRepeatedSwitches() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxTabCache-\(UUID())")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let state = makeTestAppState()
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    state.assets = (0..<10_000).map { index in
+        previewRouteAsset(id: "large-\(index)", name: "\(index).jpg", addedAt: Double(index),
+            sourceURL: root.appendingPathComponent("\(index).jpg"))
+    }
+    let expectedIDs = state.activeAssetIDList
+    let libraryTab = state.activeTabID
+    state.updateActiveTabScrollAnchor(expectedIDs[5_000])
+    state.newTab()
+    let emptyTab = state.activeTabID
+    var milliseconds: [Double] = []
+    for _ in 0..<3 {
+        let start = Date()
+        state.selectTab(libraryTab)
+        milliseconds.append(Date().timeIntervalSince(start) * 1_000)
+        // No await: content must exist before any disk or scan task can finish.
+        #expect(state.activeAssetIDList == expectedIDs)
+        #expect(state.activeTabScrollAnchorAssetID == expectedIDs[5_000])
+        state.selectTab(emptyTab)
+        #expect(state.activeAssets.isEmpty)
+    }
+    print("10k tab restore main-actor milliseconds: \(milliseconds)")
+}
+
+@MainActor
+@Test func recursiveTabKeepsCachedResultsWhileRefreshingExternalChanges() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxRecursiveTab-\(UUID())")
+    let child = root.appendingPathComponent("child")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let removed = child.appendingPathComponent("old.jpg")
+    try Data().write(to: removed)
+    try Data().write(to: root.appendingPathComponent("cover.jpg"))
+    let state = makeTestAppState()
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState { state.activeAssets.count == 2 && state.searchStatus?.isSearching == false })
+    let libraryTab = state.activeTabID
+    let oldIDs = state.activeAssetIDList
+    state.newTab()
+    try FileManager.default.removeItem(at: removed)
+    try Data().write(to: child.appendingPathComponent("new.jpg"))
+    state.selectTab(libraryTab)
+    #expect(state.activeAssetIDList == oldIDs)
+    #expect(state.searchAssetGroups.count == 2)
+    // Revalidation must not blank the restored grid before publishing its replacement.
+    var sawEmptyGrid = false
+    #expect(await waitForLightboxState {
+        sawEmptyGrid = sawEmptyGrid || state.activeAssets.isEmpty
+        return Set(state.activeAssets.map(\.originalName)) == ["cover.jpg", "new.jpg"]
+            && state.searchStatus?.isSearching == false
+    })
+    #expect(!sawEmptyGrid)
+    state.newTab()
 }
 
 
