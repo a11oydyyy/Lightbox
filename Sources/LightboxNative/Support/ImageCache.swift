@@ -208,7 +208,14 @@ final class ImageCache: @unchecked Sendable {
                     quality: quality,
                     signature: currentSignature
                 )
-                let memoryImage = self.cachedImage(forKey: resolvedKey, quality: quality)
+                // A completed sharper thumbnail satisfies a lighter scroll request too.
+                // Resolve the current signature first so replacements cannot reuse old pixels.
+                let memoryImage = quality.sufficientCacheLookupOrder.lazy.compactMap { candidate in
+                    self.cachedImage(
+                        forKey: self.cacheKey(for: url, quality: candidate, signature: currentSignature),
+                        quality: candidate
+                    )
+                }.first
                 let diskImage = memoryImage == nil && quality.usesDiskCache
                     ? self.diskCache.image(for: url, quality: quality, signature: currentSignature)
                     : nil
@@ -641,12 +648,18 @@ final class ThumbnailDiskCache: @unchecked Sendable {
             return nil
         }
 
-        guard let image = NSImage(contentsOf: cacheURL) else {
+        // NSImage(contentsOf:) can defer JPEG decompression until the main-thread draw.
+        guard let source = CGImageSourceCreateWithURL(cacheURL as CFURL, ImageCache.imageSourceOptions() as CFDictionary),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, [
+                kCGImageSourceShouldCache: true,
+                kCGImageSourceShouldCacheImmediately: true
+              ] as CFDictionary)
+        else {
             try? fileManager.removeItem(at: cacheURL)
             return nil
         }
 
-        return image
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     func store(_ image: NSImage, for url: URL, quality: ImageCacheQuality) {
@@ -793,11 +806,11 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     }
 
     private func encodedData(for image: NSImage) -> Data? {
-        guard let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData)
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else {
             return nil
         }
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
 
         return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.86])
             ?? bitmap.representation(using: .png, properties: [:])
@@ -903,9 +916,9 @@ enum ImageCacheQuality: String {
     var cacheLookupOrder: [ImageCacheQuality] {
         switch self {
         case .thumbnailFast:
-            [.thumbnailFast, .thumbnailBalanced, .thumbnail]
+            [.thumbnail, .thumbnailBalanced, .thumbnailFast]
         case .thumbnailBalanced:
-            [.thumbnailBalanced, .thumbnail, .thumbnailFast]
+            [.thumbnail, .thumbnailBalanced, .thumbnailFast]
         case .thumbnail:
             [.thumbnail, .thumbnailBalanced, .thumbnailFast]
         case .preview:
@@ -913,6 +926,11 @@ enum ImageCacheQuality: String {
         case .comparison:
             [.comparison, .preview, .thumbnail, .thumbnailBalanced, .thumbnailFast]
         }
+    }
+
+    var sufficientCacheLookupOrder: [ImageCacheQuality] {
+        guard let rank = thumbnailRank else { return [self] }
+        return cacheLookupOrder.filter { ($0.thumbnailRank ?? 0) >= rank }
     }
 
     var usesDiskCache: Bool {

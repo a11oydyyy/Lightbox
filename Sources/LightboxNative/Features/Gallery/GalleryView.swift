@@ -14,8 +14,11 @@ struct GalleryImagePriorityPlanner {
         baseQuality: ImageCacheQuality,
         isPrioritized: Bool,
         prefersFastRawThumbnails: Bool = false,
-        permitsFullThumbnailPromotion: Bool = true
+        permitsFullThumbnailPromotion: Bool = true,
+        isSettledVisible: Bool = false
     ) -> ImageCacheQuality {
+        // Storage and library size limit work while moving, not final on-screen quality.
+        if isSettledVisible { return .thumbnail }
         guard isPrioritized else { return baseQuality }
         guard permitsFullThumbnailPromotion else {
             switch baseQuality {
@@ -37,6 +40,11 @@ struct GalleryImagePriorityPlanner {
         case .thumbnail, .preview, .comparison:
             return baseQuality
         }
+    }
+
+    static func isVisible(_ frame: CGRect?, viewportHeight: CGFloat) -> Bool {
+        guard let frame, viewportHeight > 0 else { return false }
+        return frame.maxY > 0 && frame.minY < viewportHeight
     }
 
     static func prioritizedAssetIDs(
@@ -302,6 +310,7 @@ struct GalleryView: View {
     @State private var selectionRect: CGRect?
     @State private var scrollOffset: CGFloat = 0
     @State private var scrollDirection: GalleryScrollDirection = .stationary
+    @State private var isScrolling = false
     @State private var contentVisible = true
     @State private var restoredScrollGeneration = -1
     @State private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
@@ -381,11 +390,16 @@ struct GalleryView: View {
                 scrollDirection: scrollDirection,
                 maxPrioritizedAssetCount: performanceProfile.maxPrioritizedAssetCount
             )
+            let settledVisibleAssetIDs: Set<LightboxAsset.ID> = isScrolling ? [] : Set(
+                assetFrames.compactMap { id, frame in
+                    GalleryImagePriorityPlanner.isVisible(frame, viewportHeight: viewport.size.height) ? id : nil
+                }
+            )
             let thumbnailQuality = galleryThumbnailQuality(assetCount: activeAssets.count, performanceProfile: performanceProfile)
             let permitsFullThumbnailPromotion = galleryPermitsFullThumbnailPromotion(
                 assetCount: activeAssets.count,
                 performanceProfile: performanceProfile
-            )
+            ) && !isScrolling
             let usesReducedHover = appState.libraryLoadingStatus != nil || performanceProfile.reducesHoverEffects
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
@@ -468,6 +482,7 @@ struct GalleryView: View {
                                                     viewportWidth: viewport.size.width,
                                                     loadableAssetIDs: loadableAssetIDs,
                                                     prioritizedAssetIDs: prioritizedAssetIDs,
+                                                    settledVisibleAssetIDs: settledVisibleAssetIDs,
                                                     thumbnailQuality: thumbnailQuality,
                                                     permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                                                     prefersFastRawThumbnails: prefersFastRawThumbnails,
@@ -488,6 +503,7 @@ struct GalleryView: View {
                                     viewportWidth: viewport.size.width,
                                     loadableAssetIDs: loadableAssetIDs,
                                     prioritizedAssetIDs: prioritizedAssetIDs,
+                                    settledVisibleAssetIDs: settledVisibleAssetIDs,
                                     thumbnailQuality: thumbnailQuality,
                                     permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                                     prefersFastRawThumbnails: prefersFastRawThumbnails,
@@ -524,6 +540,13 @@ struct GalleryView: View {
                     .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
                         noteScroll(offset: offset)
                     }
+                    .task(id: scrollOffset) {
+                        guard isScrolling else { return }
+                        try? await Task.sleep(for: .milliseconds(200))
+                        guard !Task.isCancelled else { return }
+                        isScrolling = false
+                        scrollDirection = .stationary
+                    }
                     .onAppear {
                         playContentEntrance()
                         lastViewportWidth = viewport.size.width
@@ -533,6 +556,7 @@ struct GalleryView: View {
                         collapsedSearchGroupIDs.removeAll()
                         frameUpdateCoordinator.cancel()
                         assetFrames = [:]
+                        isScrolling = false
                         folderRowFrame = nil
                         searchGroupHeaderFrames = [:]
                         selectionRect = nil
@@ -642,10 +666,10 @@ struct GalleryView: View {
         performanceProfile: GalleryPerformanceProfile
     ) -> Set<LightboxAsset.ID> {
         let initialWindow = performanceProfile.initialImageLoadWindow(prefersFastRawThumbnails: prefersFastRawThumbnails)
-        var ids = Set(activeAssets.prefix(initialWindow).map(\.id))
         guard !assetFrames.isEmpty else {
-            return ids
+            return Set(activeAssets.prefix(initialWindow).map(\.id))
         }
+        var ids: Set<LightboxAsset.ID> = []
 
         let preloadMargin = performanceProfile.preloadMargin(
             viewportHeight: viewportHeight,
@@ -666,6 +690,7 @@ struct GalleryView: View {
         guard abs(nextOffset - scrollOffset) > 18 else { return }
 
         scrollDirection = nextOffset > scrollOffset ? .down : .up
+        isScrolling = true
         scrollOffset = nextOffset
         updateScrollAnchor(using: assetFrames)
     }
@@ -791,6 +816,7 @@ struct GalleryView: View {
         viewportWidth: CGFloat,
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
+        settledVisibleAssetIDs: Set<LightboxAsset.ID>,
         thumbnailQuality: ImageCacheQuality,
         permitsFullThumbnailPromotion: Bool,
         prefersFastRawThumbnails: Bool,
@@ -826,6 +852,7 @@ struct GalleryView: View {
                             activeAssetIDs: activeAssetIDs,
                             loadableAssetIDs: loadableAssetIDs,
                             prioritizedAssetIDs: prioritizedAssetIDs,
+                            settledVisibleAssetIDs: settledVisibleAssetIDs,
                             thumbnailQuality: thumbnailQuality,
                             permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
                             prefersFastRawThumbnails: prefersFastRawThumbnails,
@@ -850,6 +877,7 @@ struct GalleryView: View {
         activeAssetIDs: Set<LightboxAsset.ID>,
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
+        settledVisibleAssetIDs: Set<LightboxAsset.ID>,
         thumbnailQuality: ImageCacheQuality,
         permitsFullThumbnailPromotion: Bool,
         prefersFastRawThumbnails: Bool,
@@ -877,7 +905,8 @@ struct GalleryView: View {
                 baseQuality: thumbnailQuality,
                 isPrioritized: prioritizedAssetIDs.contains(asset.id),
                 prefersFastRawThumbnails: prefersFastRawThumbnails,
-                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion
+                permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
+                isSettledVisible: settledVisibleAssetIDs.contains(asset.id)
             ),
             loadsImage: loadableAssetIDs.contains(asset.id),
             compareTrayLabel: appState.compareTrayLabel(for: asset.id),

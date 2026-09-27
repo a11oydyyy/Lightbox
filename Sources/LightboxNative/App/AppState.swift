@@ -9,6 +9,24 @@ struct SearchAssetGroup: Identifiable, Equatable {
     var assets: [LightboxAsset]
 }
 
+private struct TabContentSnapshot {
+    var tab: LightboxTab
+    var showsHiddenItems: Bool
+    var assets: [LightboxAsset]
+    var folders: [LibraryFolderEntry]
+    var searchAssets: [LightboxAsset]?
+    var searchFolders: [LibraryFolderEntry]?
+    var searchStatus: LightboxSearchStatus?
+    var activeAssets: [LightboxAsset]
+    var activeIDs: Set<LightboxAsset.ID>
+    var activeIDList: [LightboxAsset.ID]
+    var groups: [SearchAssetGroup]
+    var activeFolders: [LibraryFolderEntry]
+    var colorTags: [MacColorTag]
+
+    var assetCount: Int { assets.count + (searchAssets?.count ?? 0) }
+}
+
 private enum TagMutationAction: Equatable, Sendable {
     case add
     case toggle
@@ -151,8 +169,8 @@ final class AppState: ObservableObject {
     }
     @Published var assets: [LightboxAsset] = [] {
         didSet {
-            rebuildLibraryColorTags()
             guard !isApplyingTabState else { return }
+            rebuildLibraryColorTags()
             rebuildActiveAssets()
         }
     }
@@ -171,6 +189,7 @@ final class AppState: ObservableObject {
     }
     @Published var folderEntries: [LibraryFolderEntry] = [] {
         didSet {
+            guard !isApplyingTabState else { return }
             rebuildActiveFolderEntries()
         }
     }
@@ -188,6 +207,7 @@ final class AppState: ObservableObject {
     @Published private(set) var searchStatus: LightboxSearchStatus?
     @Published private var searchResultFolderEntries: [LibraryFolderEntry]? {
         didSet {
+            guard !isApplyingTabState else { return }
             rebuildActiveFolderEntries()
         }
     }
@@ -287,6 +307,8 @@ final class AppState: ObservableObject {
     private var fileTransferFailureCount = 0
     private var fileTransferFirstFailureName: String?
     private var isApplyingTabState = false
+    private var tabContentSnapshots: [UUID: TabContentSnapshot] = [:]
+    private var tabContentRecency: [UUID] = []
     private var isPerformingHistoryNavigation = false
     private var isRestoringFolderSort = false
     private var currentScrollAnchorAssetID: LightboxAsset.ID?
@@ -596,6 +618,8 @@ final class AppState: ObservableObject {
         captureActiveTabState()
         let closesActiveTab = tabIDs.contains(activeTabID)
         tabs.removeAll { tabIDs.contains($0.id) }
+        for id in tabIDs { tabContentSnapshots.removeValue(forKey: id) }
+        tabContentRecency.removeAll { tabIDs.contains($0) }
         if closesActiveTab {
             activateTab(tabID, capturingCurrent: false)
         } else {
@@ -618,6 +642,8 @@ final class AppState: ObservableObject {
 
     func closeTab(_ tabID: UUID) {
         guard let closingIndex = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        tabContentSnapshots.removeValue(forKey: tabID)
+        tabContentRecency.removeAll { $0 == tabID }
 
         if tabs.count == 1 {
             captureActiveTabState()
@@ -1011,6 +1037,7 @@ final class AppState: ObservableObject {
         if capturingCurrent {
             captureActiveTabState()
         }
+        cacheActiveTabContent()
         closeOverlaysForTabSwitch()
         suspendActiveTabWork()
         applyTab(at: index)
@@ -1018,6 +1045,7 @@ final class AppState: ObservableObject {
 
     private func applyTab(at index: Int) {
         guard tabs.indices.contains(index) else { return }
+        let startedAt = Date()
         let tab = tabs[index]
         let resolvedSource = sources.first { sourceMatches($0, tab.source) } ?? tab.source
 
@@ -1043,19 +1071,76 @@ final class AppState: ObservableObject {
         searchStatus = nil
         selectedAssetIDs = tab.selectedAssetIDs
         selectedAssetID = tab.selectedAssetID
-        selectionAnchorID = tab.selectedAssetID ?? firstVisibleID(in: tab.selectedAssetIDs)
         trashAccessDenied = tab.trashAccessDenied
         currentScrollAnchorAssetID = tab.scrollAnchorAssetID
         preservesUnavailableCurrentFolder = tab.preservesUnavailableFolder
+        let restoredContent = restoreTabContent(tab)
         isApplyingTabState = false
 
-        rebuildActiveAssets()
+        if !restoredContent {
+            rebuildLibraryColorTags()
+            rebuildActiveAssets()
+            rebuildActiveFolderEntries()
+        }
+        selectionAnchorID = tab.selectedAssetID ?? firstVisibleID(in: tab.selectedAssetIDs)
         scrollRestoreGeneration += 1
         LibrarySourceStore.saveSelectedSourceID(resolvedSource.id, defaults: libraryDefaults)
         saveCurrentFolderSession()
         persistTabsImmediately()
         restartLibraryMonitor()
-        refreshLibrary()
+        refreshLibrary(preservingVisibleSnapshot: restoredContent)
+        Self.logger.info("tab applied cached=\(restoredContent) assets=\(self.cachedActiveAssets.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
+    }
+
+    private func cacheActiveTabContent() {
+        let openIDs = Set(tabs.map(\.id))
+        tabContentSnapshots = tabContentSnapshots.filter { openIDs.contains($0.key) }
+        tabContentRecency.removeAll { !openIDs.contains($0) }
+        guard let index = activeTabIndex, !isShowingStartPage, !isViewingTrash,
+              libraryLoadingStatus == nil, searchStatus?.isSearching != true,
+              !usesRecursiveResults || searchResultAssets != nil else { return }
+        let snapshot = TabContentSnapshot(
+            tab: tabs[index], showsHiddenItems: showsHiddenItems,
+            assets: assets, folders: folderEntries,
+            searchAssets: searchResultAssets, searchFolders: searchResultFolderEntries,
+            searchStatus: searchStatus, activeAssets: cachedActiveAssets,
+            activeIDs: cachedActiveAssetIDs, activeIDList: cachedActiveAssetIDList,
+            groups: cachedSearchAssetGroups, activeFolders: cachedActiveFolderEntries,
+            colorTags: cachedLibraryColorTags
+        )
+        // Retain metadata, not decoded pixels; bound both tab count and library size.
+        guard snapshot.assetCount <= 50_000 else { return }
+        tabContentSnapshots[activeTabID] = snapshot
+        tabContentRecency.removeAll { $0 == activeTabID }
+        tabContentRecency.append(activeTabID)
+        while tabContentRecency.count > 3 || tabContentSnapshots.values.reduce(0, { $0 + $1.assetCount }) > 50_000 {
+            tabContentSnapshots.removeValue(forKey: tabContentRecency.removeFirst())
+        }
+    }
+
+    private func restoreTabContent(_ tab: LightboxTab) -> Bool {
+        guard let snapshot = tabContentSnapshots[tab.id],
+              snapshot.tab.source.id == selectedSourceID,
+              snapshot.tab.folderURL == currentFolderURL,
+              snapshot.tab.searchText == searchText,
+              snapshot.tab.filter == selectedFilter,
+              snapshot.tab.sortField == sortField,
+              snapshot.tab.sortDirection == sortDirection,
+              snapshot.tab.layoutMode == galleryLayoutMode,
+              snapshot.showsHiddenItems == showsHiddenItems else { return false }
+        assets = snapshot.assets
+        folderEntries = snapshot.folders
+        searchResultAssets = snapshot.searchAssets
+        searchResultFolderEntries = snapshot.searchFolders
+        searchStatus = snapshot.searchStatus
+        cachedActiveAssetIDs = snapshot.activeIDs
+        cachedActiveAssetIDList = snapshot.activeIDList
+        cachedSearchAssetGroups = snapshot.groups
+        cachedActiveFolderEntries = snapshot.activeFolders
+        cachedLibraryColorTags = snapshot.colorTags
+        activeAssetsRevision &+= 1
+        cachedActiveAssets = snapshot.activeAssets
+        return true
     }
 
     private func insertAndActivateTab(
@@ -1154,6 +1239,7 @@ final class AppState: ObservableObject {
         preservesUnavailableCurrentFolder = true
         isApplyingTabState = false
         rebuildActiveAssets()
+        rebuildActiveFolderEntries()
         scrollRestoreGeneration += 1
         LibrarySourceStore.saveSelectedSourceID(resolvedSource.id, defaults: libraryDefaults)
         saveCurrentFolderSession()
@@ -3103,7 +3189,7 @@ final class AppState: ObservableObject {
         picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
     }
 
-    func refreshLibrary() {
+    func refreshLibrary(preservingVisibleSnapshot: Bool = false) {
         guard !isShowingStartPage else {
             suspendActiveTabWork()
             assets = []
@@ -3153,16 +3239,27 @@ final class AppState: ObservableObject {
             return
         }
         let folderURL = currentFolderURL
-        let hasCachedVisibleSnapshot = applyCachedVisibleSnapshotIfAvailable(source: source, folderURL: folderURL, refreshID: refreshID)
         let usesConservativeExternalLoading = source.usesConservativeExternalLoading
-        let refreshPolicy = LibraryRefreshPolicy(
-            usesConservativeExternalLoading: usesConservativeExternalLoading,
-            hasCachedVisibleSnapshot: hasCachedVisibleSnapshot
-        )
         let indexDatabaseURL = indexDatabaseURL
         let showsHiddenItems = showsHiddenItems
+        let tabID = activeTabID
         libraryLoadTask = Task.detached(priority: .userInitiated) { [weak self, source, showsHiddenItems] in
-            let scanDelayMilliseconds = refreshPolicy.scanStartDelayMilliseconds
+            // SQLite reads and connection setup can wait on disk or another writer.
+            // Never do them inside the main-actor tab activation path.
+            let metadataStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
+            let cachedSnapshot = preservingVisibleSnapshot ? nil : metadataStore.cachedVisibleSnapshot(source: source, folderURL: folderURL)
+            guard !Task.isCancelled else { return }
+            let hasCachedVisibleSnapshot = await MainActor.run { () -> Bool in
+                guard let self, self.refreshSerial == refreshID, self.activeTabID == tabID else { return false }
+                return preservingVisibleSnapshot || self.applyCachedVisibleSnapshotIfAvailable(
+                    cachedSnapshot, source: source, folderURL: folderURL, refreshID: refreshID
+                )
+            }
+            let refreshPolicy = LibraryRefreshPolicy(
+                usesConservativeExternalLoading: usesConservativeExternalLoading,
+                hasCachedVisibleSnapshot: hasCachedVisibleSnapshot
+            )
+            let scanDelayMilliseconds = max(preservingVisibleSnapshot ? 350 : 0, refreshPolicy.scanStartDelayMilliseconds)
             if scanDelayMilliseconds > 0 {
                 Self.logger.info("refresh[\(refreshID)] scan delayed cachedSnapshot=true delayMs=\(scanDelayMilliseconds) folder=\(folderURL.path, privacy: .public)")
                 try? await Task.sleep(for: .milliseconds(scanDelayMilliseconds))
@@ -3173,7 +3270,7 @@ final class AppState: ObservableObject {
             }
             let startedAt = Date()
             Self.logger.info("refresh[\(refreshID)] scan task start source=\(source.id, privacy: .public) sourceKind=\(source.kind.rawValue, privacy: .public) folder=\(folderURL.path, privacy: .public)")
-            let cachedDimensions = LightboxIndexStore(databaseURL: indexDatabaseURL).cachedDimensions(
+            let cachedDimensions = metadataStore.cachedDimensions(
                 sourceID: source.id,
                 parentPath: folderURL.path
             )
@@ -3201,6 +3298,8 @@ final class AppState: ObservableObject {
             await MainActor.run {
                 guard let self,
                       !Task.isCancelled,
+                      self.refreshSerial == refreshID,
+                      self.activeTabID == tabID,
                       !self.isViewingTrash,
                       self.selectedSourceID == source.id,
                       self.currentFolderURL.standardizedFileURL.path == folderURL.standardizedFileURL.path
@@ -3262,7 +3361,7 @@ final class AppState: ObservableObject {
                     loadsFinderTags: true,
                     startDelayMilliseconds: metadataPolicy.startDelayMilliseconds
                 )
-                self.scheduleSearch()
+                self.scheduleSearch(preservingResults: preservingVisibleSnapshot)
                 self.captureActiveTabState()
                 Self.logger.info("refresh[\(refreshID)] apply complete applyTotal=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s folderEntries=\(self.folderEntries.count) storeAssets=\(self.assets.count) visibleSnapshotAssets=\(snapshot.count)")
             }
@@ -3270,11 +3369,12 @@ final class AppState: ObservableObject {
     }
 
     private func applyCachedVisibleSnapshotIfAvailable(
+        _ snapshot: IndexedVisibleSnapshot?,
         source: LibrarySource,
         folderURL: URL,
         refreshID: Int
     ) -> Bool {
-        if let snapshot = indexStore.cachedVisibleSnapshot(source: source, folderURL: folderURL) {
+        if let snapshot {
             let visibleFolders = showsHiddenItems
                 ? snapshot.folders
                 : snapshot.folders.filter { !LocalImageSource.isHiddenItemURL($0.url) }
@@ -3783,11 +3883,11 @@ final class AppState: ObservableObject {
         return searchResultAssets ?? (includesSubfolders ? [] : nil)
     }
 
-    private func scheduleSearch() {
+    private func scheduleSearch(preservingResults: Bool = false) {
         searchTask?.cancel()
         searchGeneration &+= 1
         let generation = searchGeneration
-        clearSearchResults()
+        if !preservingResults { clearSearchResults() }
         searchStatus = nil
 
         let trimmedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
