@@ -2104,6 +2104,7 @@ private func previewRouteAsset(
         counter.increment()
         return image
     }
+    defer { cache.waitForPendingDiskWrites() }
     for quality in [ImageCacheQuality.thumbnail, .thumbnailFast, .thumbnailBalanced, .thumbnail] {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             _ = cache.image(for: url, quality: quality, knownFileSignature: signature) { result in
@@ -2134,6 +2135,7 @@ private func previewRouteAsset(
     let cache = ImageCache(diskCache: ThumbnailDiskCache(folder: root.appendingPathComponent("cache"))) { _, quality in
         quality == .thumbnailFast ? small : sharp
     }
+    defer { cache.waitForPendingDiskWrites() }
     for quality in [ImageCacheQuality.thumbnailFast, .thumbnail] {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             _ = cache.image(for: url, quality: quality) { result in
@@ -2349,6 +2351,7 @@ private func previewRouteAsset(
         decodeImage: { _, _ in image },
         fileSignature: { _ in resolvedSignature }
     )
+    defer { cache.waitForPendingDiskWrites() }
     let url = root.appendingPathComponent("source.jpg")
 
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -2487,6 +2490,7 @@ private func previewRouteAsset(
     let diskCache = ThumbnailDiskCache(folder: root.appendingPathComponent("thumbnails", isDirectory: true))
     let image = try #require(makeTestImage())
     let cache = ImageCache(diskCache: diskCache) { _, _ in image }
+    defer { cache.waitForPendingDiskWrites() }
 
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
         _ = cache.image(for: sourceURL, quality: .thumbnailFast) { decodedImage in
@@ -2494,6 +2498,7 @@ private func previewRouteAsset(
             continuation.resume()
         }
     }
+    await Task.detached { cache.waitForPendingDiskWrites() }.value
     #expect(diskCache.image(for: sourceURL, quality: .thumbnailFast) != nil)
 
     cache.removeMemoryObjects(reason: "test")
@@ -2525,6 +2530,7 @@ private func previewRouteAsset(
             thumbnailImage
         }
     }
+    defer { cache.waitForPendingDiskWrites() }
 
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
         _ = cache.image(for: sourceURL, quality: .thumbnailFast) { decodedImage in
@@ -2590,6 +2596,7 @@ private func previewRouteAsset(
             return thumbnailImage
         }
     }
+    defer { cache.waitForPendingDiskWrites() }
 
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
         _ = cache.image(for: sourceURL, quality: .thumbnailFast) { decodedImage in
@@ -5172,4 +5179,93 @@ private actor UpdateRequestCounter {
     #expect(LightboxLocalization.text(.traditionalChinese, language: .english) == "繁體中文")
     #expect(LightboxLocalization.selectedCount(2, language: .traditionalChinese) == "已選取 2 個項目")
     #expect(LightboxLocalization.colorTagName("Red", language: .traditionalChinese) == "紅色")
+}
+
+
+@MainActor
+@Test func searchMetadataPublishesWholeBatchesInsteadOfIndividualFields() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxMetadataBatch-\(UUID())")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let image = try #require(makeTestImage(size: 24))
+    let representation = try #require(image.representations.first as? NSBitmapImageRep)
+    let data = try #require(representation.representation(using: .png, properties: [:]))
+    for index in 0..<96 {
+        try data.write(to: root.appendingPathComponent("batch-\(index).png"))
+    }
+    let state = makeTestAppState()
+    let source = LibrarySource(id: "metadata-batch", name: "Batch", rootURL: root, kind: .external)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    #expect(await waitForLightboxState { state.assets.count == 96 && state.libraryLoadingStatus == nil })
+    #expect(state.assets.allSatisfy { !$0.metadataLoaded })
+
+    var publications = 0
+    var partialMetadataWasPublished = false
+    let subscription = state.$assets.dropFirst().sink { assets in
+        publications += 1
+        if assets.contains(where: { !$0.metadataLoaded && ($0.width != 1 || $0.height != 1) }) {
+            partialMetadataWasPublished = true
+        }
+    }
+    state.searchText = "batch"
+    #expect(await waitForLightboxState {
+        state.searchStatus?.isSearching == false && state.activeAssets.count == 96
+            && state.activeAssets.allSatisfy { $0.metadataLoaded && $0.width == 24 && $0.height == 24 }
+    })
+    subscription.cancel()
+    #expect(!partialMetadataWasPublished)
+    #expect(publications == 2)
+    #expect(state.assets.allSatisfy { $0.metadataLoaded && $0.width == 24 && $0.height == 24 })
+    print("96-image search metadata asset publications: \(publications)")
+    state.searchText = ""
+    #expect(state.activeAssets.allSatisfy { $0.metadataLoaded && $0.width == 24 && $0.height == 24 })
+}
+
+@MainActor
+@Test func repeatedRubberBandSelectionDoesNotRepublishUnchangedState() {
+    let state = makeTestAppState()
+    state.assets = (0..<10_000).map { index in
+        previewRouteAsset(id: "selection-\(index)", name: "\(index).jpg", addedAt: Double(index))
+    }
+    let selected = Set(state.activeAssetIDList.suffix(4))
+    state.replaceSelection(with: selected)
+    let primary = state.selectedAssetID
+    var publications = 0
+    let subscription = state.objectWillChange.sink { publications += 1 }
+    for _ in 0..<100 { state.replaceSelection(with: selected) }
+    subscription.cancel()
+    #expect(publications == 0)
+    #expect(state.selectedAssetIDs == selected)
+    #expect(state.selectedAssetID == primary)
+    state.replaceSelection(with: [])
+    #expect(state.selectedAssetIDs.isEmpty)
+    #expect(state.selectedAssetID == nil)
+}
+
+
+@MainActor
+@Test func deletingRecursiveSearchResultKeepsCachedIDsAndKeyboardNavigationInSync() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxDeletedSearch-\(UUID())")
+    let child = root.appendingPathComponent("child")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    for index in 0..<3 { try Data().write(to: child.appendingPathComponent("image-\(index).jpg")) }
+    let state = makeTestAppState(systemTrashMover: { _ in true })
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState { state.activeAssets.count == 3 && state.searchStatus?.isSearching == false })
+    let deleted = try #require(state.activeAssets.first)
+    let remainingIDs = state.activeAssetIDList.filter { $0 != deleted.id }
+    state.markDeleted(deleted)
+    #expect(await waitForLightboxState { state.activeAssets.count == 2 })
+    try #require(state.activeAssetIDList == remainingIDs)
+    #expect(state.activeAssetIDs == Set(remainingIDs))
+    #expect(state.searchAssetGroups.flatMap(\.assets).map(\.id) == remainingIDs)
+    state.handleGalleryKey(124, modifiers: [], from: remainingIDs[0])
+    #expect(state.selectedAssetIDs == [remainingIDs[1]])
+    #expect(state.galleryKeyboardFocusID == remainingIDs[1])
 }

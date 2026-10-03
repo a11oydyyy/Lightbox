@@ -170,7 +170,6 @@ enum LocalImageSource {
                 rootURL: rootURL.standardizedFileURL,
                 tags: []
             )
-            guard query.matches(folder) else { return }
             if folders.count < maxResults {
                 folders.append(folder)
                 return
@@ -216,6 +215,9 @@ enum LocalImageSource {
             }
         }
 
+        guard !Task.isCancelled else {
+            return LightboxSearchScanResult(assets: [], folders: [], visitedCount: visitedCount, limitReached: true)
+        }
         let sortedFolders = sortedSearchFolders(folders)
         let resultsIncomplete = limitReached || directoryReadFailed
         logger.info("folder-search complete path=\(folder.path, privacy: .public) recursive=\(recursive) visited=\(visitedCount) folders=\(sortedFolders.count) limit=\(resultsIncomplete) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
@@ -424,7 +426,9 @@ enum LocalImageSource {
         skipsPackages: Bool = false,
         maxResults: Int = 2_000,
         maxFolderResults: Int = 300,
-        maxVisited: Int = 20_000
+        maxVisited: Int = 20_000,
+        dimensionCache: RecursiveImageDimensionCache = .shared,
+        dimensionResolver: (URL) -> CGSize? = { ImageProbe.dimensions(for: $0) }
     ) -> LightboxSearchScanResult {
         let startedAt = Date()
 
@@ -480,7 +484,6 @@ enum LocalImageSource {
                     rootURL: rootURL.standardizedFileURL,
                     tags: []
                 )
-                guard query.matches(folder) else { return false }
                 if folders.count < maxFolderResults {
                     folders.append(folder)
                 } else {
@@ -498,18 +501,26 @@ enum LocalImageSource {
             }
 
             let fallbackSize = MockLibrary.importFallbackSizes[assets.count % MockLibrary.importFallbackSizes.count]
-            let dimensions = probeDimensions ? autoreleasepool { ImageProbe.dimensions(for: url) } : nil
+            let dimensions = probeDimensions ? autoreleasepool {
+                recursive
+                    ? dimensionCache.dimensions(for: url, resolver: dimensionResolver)
+                    : dimensionResolver(url)
+            } : nil
+            guard !Task.isCancelled else { return true }
             let values = try? url.resourceValues(forKeys: [
                 .addedToDirectoryDateKey,
                 .creationDateKey,
                 .contentModificationDateKey,
                 .fileSizeKey
             ])
+            guard !Task.isCancelled else { return true }
+            let tags = FinderTagStore.colorTags(for: url)
+            guard !Task.isCancelled else { return true }
             let asset = LightboxAsset(
                 originalName: url.lastPathComponent,
                 width: dimensions?.width ?? fallbackSize.width,
                 height: dimensions?.height ?? fallbackSize.height,
-                tags: FinderTagStore.colorTags(for: url),
+                tags: tags,
                 sourceURL: url,
                 addedAt: addedDate(from: values) ?? .distantPast,
                 contentModifiedAt: values?.contentModificationDate,
@@ -518,7 +529,6 @@ enum LocalImageSource {
                 metadataLoaded: dimensions != nil
             )
 
-            guard query.matches(asset) else { return false }
             assets.append(asset)
             if assets.count >= maxResults {
                 traversalLimitReached = true
@@ -554,15 +564,21 @@ enum LocalImageSource {
             }
         }
 
-        let sortedAssets = assets.sorted { lhs, rhs in
-            let lhsParent = lhs.sourceURL?.deletingLastPathComponent().path ?? ""
-            let rhsParent = rhs.sourceURL?.deletingLastPathComponent().path ?? ""
-            if lhsParent != rhsParent {
-                return lhsParent.localizedStandardCompare(rhsParent) == .orderedAscending
-            }
-            return lhs.originalName.localizedStandardCompare(rhs.originalName) == .orderedAscending
+        guard !Task.isCancelled else {
+            return LightboxSearchScanResult(assets: [], folders: [], visitedCount: visitedCount, limitReached: true)
         }
+        let sortedAssets = assets.map { asset in
+            (asset: asset, parent: asset.sourceURL?.deletingLastPathComponent().path ?? "")
+        }.sorted { lhs, rhs in
+            if lhs.parent != rhs.parent {
+                return lhs.parent.localizedStandardCompare(rhs.parent) == .orderedAscending
+            }
+            return lhs.asset.originalName.localizedStandardCompare(rhs.asset.originalName) == .orderedAscending
+        }.map(\.asset)
         let sortedFolders = sortedSearchFolders(folders)
+        guard !Task.isCancelled else {
+            return LightboxSearchScanResult(assets: [], folders: [], visitedCount: visitedCount, limitReached: true)
+        }
         logger.info("search scan complete path=\(folder.path, privacy: .public) recursive=\(recursive) visited=\(visitedCount) folders=\(sortedFolders.count) results=\(sortedAssets.count) limit=\(resultLimitReached) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
         return LightboxSearchScanResult(
             assets: sortedAssets,

@@ -8,28 +8,37 @@ final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
     private nonisolated static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "ImageDecode")
 
-    private let cache = NSCache<NSString, NSImage>()
-    private let previewCache = NSCache<NSString, NSImage>()
-    private let comparisonCache = NSCache<NSString, NSImage>()
+    private let cache = NSCache<NSString, CachedImageEntry>()
+    private let previewCache = NSCache<NSString, CachedImageEntry>()
+    private let comparisonCache = NSCache<NSString, CachedImageEntry>()
     private var decodeQueue: OperationQueue
     private let memoryProfile: ImageCacheMemoryProfile
     private let generationLock = NSLock()
     private let requestLock = NSLock()
     private var generation = 0
     private var requestSerial = 0
+    private var signatureResolutionSerial = 0
     private var pendingDecodes: [String: PendingDecode] = [:]
     private let diskCache: ThumbnailDiskCache
+    private let diskWriter: ThumbnailWriteScheduler
     private let telemetry = ImageCacheTelemetry()
     private let fileSignature: @Sendable (URL) -> FileContentSignature?
     private let decodeImage: @Sendable (URL, ImageCacheQuality) -> NSImage?
 
     init(
         diskCache: ThumbnailDiskCache = ThumbnailDiskCache(),
+        diskWriter: ThumbnailWriteScheduler? = nil,
         memoryProfile: ImageCacheMemoryProfile = .current,
         decodeImage: @escaping @Sendable (URL, ImageCacheQuality) -> NSImage? = ImageCache.downsampledImage,
         fileSignature: @escaping @Sendable (URL) -> FileContentSignature? = { FileContentSignature(url: $0) }
     ) {
         self.diskCache = diskCache
+        self.diskWriter = diskWriter ?? ThumbnailWriteScheduler(
+            store: { image, url, quality, signature in
+                diskCache.store(image, for: url, quality: quality, signature: signature)
+            },
+            removeAll: { diskCache.removeAll() }
+        )
         self.decodeImage = decodeImage
         self.fileSignature = fileSignature
         self.memoryProfile = memoryProfile
@@ -47,9 +56,14 @@ final class ImageCache: @unchecked Sendable {
         cache.removeAllObjects()
         previewCache.removeAllObjects()
         comparisonCache.removeAllObjects()
-        diskCache.removeAll()
+        diskWriter.removeAll()
         telemetry.reset()
         Self.logger.info("cache clear generation=\(nextGeneration) cancelledPending=\(pending)")
+    }
+
+    // Use only when the caller explicitly needs completed disk persistence.
+    func waitForPendingDiskWrites() {
+        diskWriter.waitUntilIdle()
     }
 
     func removeMemoryObjects(reason: String) {
@@ -117,24 +131,25 @@ final class ImageCache: @unchecked Sendable {
         let pendingKey = cacheKey(for: url, quality: quality, signature: knownFileSignature)
 
         let requestGeneration = currentGeneration()
+        let diskWriteGeneration = diskWriter.currentGeneration
         let requestID = nextRequestID()
         let subscriberID = UUID()
         let filePath = url.standardizedFileURL.path
         var inheritedCompletions: [UUID: @MainActor @Sendable (NSImage?) -> Void] = [:]
         var operationsToCancel: [Operation] = []
+        var effectivePriority = priority
         requestLock.lock()
         if var pendingDecode = pendingDecodes[pendingKey],
            pendingDecode.generation == requestGeneration {
             pendingDecode.completions[subscriberID] = completion
+            promotePendingDecode(&pendingDecode, to: priority)
             let subscriberCount = pendingDecode.completions.count
             pendingDecodes[pendingKey] = pendingDecode
             requestLock.unlock()
             if requestID <= 8 || subscriberCount >= 4 {
                 Self.logger.info("decode coalesced id=\(requestID) generation=\(requestGeneration) quality=\(quality.rawValue, privacy: .public) subscribers=\(subscriberCount) file=\(url.lastPathComponent, privacy: .public)")
             }
-            return ImageCacheRequest { [weak self] in
-                self?.cancelPendingSubscriber(key: pendingKey, subscriberID: subscriberID)
-            }
+            return requestHandle(for: subscriberID)
         }
 
         if let preferred = pendingDecodes.first(where: { _, pending in
@@ -145,15 +160,14 @@ final class ImageCache: @unchecked Sendable {
         }) {
             var pendingDecode = preferred.value
             pendingDecode.completions[subscriberID] = completion
+            promotePendingDecode(&pendingDecode, to: priority)
             let subscriberCount = pendingDecode.completions.count
             pendingDecodes[preferred.key] = pendingDecode
             requestLock.unlock()
             if requestID <= 8 || subscriberCount >= 4 {
                 Self.logger.info("decode coalesced-up id=\(requestID) generation=\(requestGeneration) requested=\(quality.rawValue, privacy: .public) pending=\(pendingDecode.quality.rawValue, privacy: .public) subscribers=\(subscriberCount) file=\(url.lastPathComponent, privacy: .public)")
             }
-            return ImageCacheRequest { [weak self] in
-                self?.cancelPendingSubscriber(key: preferred.key, subscriberID: subscriberID)
-            }
+            return requestHandle(for: subscriberID)
         }
 
         let promotionKeys = pendingDecodes.compactMap { pendingKey, pending -> String? in
@@ -171,21 +185,20 @@ final class ImageCache: @unchecked Sendable {
         for promotionKey in promotionKeys {
             guard let promoted = pendingDecodes.removeValue(forKey: promotionKey) else { continue }
             inheritedCompletions.merge(promoted.completions) { current, _ in current }
+            if promoted.priority.queuePriority.rawValue > effectivePriority.queuePriority.rawValue {
+                effectivePriority = promoted.priority
+            }
             operationsToCancel.append(promoted.operation)
         }
-        requestLock.unlock()
-
-        for operationToCancel in operationsToCancel {
-            operationToCancel.cancel()
-        }
+        // Keep subscriber migration and replacement registration atomic for request handles.
         if !inheritedCompletions.isEmpty {
             Self.logger.info("decode promote id=\(requestID) generation=\(requestGeneration) quality=\(quality.rawValue, privacy: .public) inherited=\(inheritedCompletions.count) cancelled=\(operationsToCancel.count) file=\(url.lastPathComponent, privacy: .public)")
         }
 
         let operation = BlockOperation()
         let pendingToken = UUID()
-        operation.queuePriority = priority.queuePriority
-        operation.qualityOfService = priority.qualityOfService
+        operation.queuePriority = effectivePriority.queuePriority
+        operation.qualityOfService = effectivePriority.qualityOfService
         let queuedAt = Date()
         operation.addExecutionBlock { [weak self, weak operation] in
             guard let self else { return }
@@ -194,7 +207,8 @@ final class ImageCache: @unchecked Sendable {
             let decodeResult: (
                 image: NSImage?,
                 cacheSource: ImageCacheTelemetrySource,
-                resolvedKey: String
+                resolvedSignature: FileContentSignature?,
+                signatureResolutionOrder: Int
             )? = autoreleasepool {
                 guard operation?.isCancelled == false,
                       self.currentGeneration() == requestGeneration
@@ -203,18 +217,12 @@ final class ImageCache: @unchecked Sendable {
                 }
 
                 let currentSignature = self.fileSignature(url)
-                let resolvedKey = self.cacheKey(
-                    for: url,
-                    quality: quality,
-                    signature: currentSignature
-                )
+                let signatureResolutionOrder = self.nextSignatureResolutionOrder()
                 // A completed sharper thumbnail satisfies a lighter scroll request too.
                 // Resolve the current signature first so replacements cannot reuse old pixels.
                 let memoryImage = quality.sufficientCacheLookupOrder.lazy.compactMap { candidate in
-                    self.cachedImage(
-                        forKey: self.cacheKey(for: url, quality: candidate, signature: currentSignature),
-                        quality: candidate
-                    )
+                    let entry = self.cachedEntry(for: url, quality: candidate)
+                    return entry?.resolvedSignature == currentSignature ? entry?.image : nil
                 }.first
                 let diskImage = memoryImage == nil && quality.usesDiskCache
                     ? self.diskCache.image(for: url, quality: quality, signature: currentSignature)
@@ -232,10 +240,6 @@ final class ImageCache: @unchecked Sendable {
                     return nil
                 }
 
-                if memoryImage == nil, diskImage == nil, let image, quality.usesDiskCache {
-                    self.diskCache.store(image, for: url, quality: quality, signature: currentSignature)
-                }
-
                 let cacheSource: ImageCacheTelemetrySource
                 if memoryImage != nil {
                     cacheSource = .memoryHit
@@ -247,7 +251,7 @@ final class ImageCache: @unchecked Sendable {
                     cacheSource = .failure
                 }
 
-                return (image, cacheSource, resolvedKey)
+                return (image, cacheSource, currentSignature, signatureResolutionOrder)
             }
             guard let decodeResult else { return }
             if let snapshot = self.telemetry.record(decodeResult.cacheSource, quality: quality) {
@@ -278,9 +282,20 @@ final class ImageCache: @unchecked Sendable {
                 }
                 let image = decodeResult.image
                 if let image {
-                    self.store(image, forKey: decodeResult.resolvedKey, quality: quality)
-                    if decodeResult.resolvedKey != pendingKey {
-                        self.store(image, forKey: pendingKey, quality: quality)
+                    self.store(
+                        image,
+                        for: url,
+                        quality: quality,
+                        resolvedSignature: decodeResult.resolvedSignature,
+                        knownSignature: knownFileSignature,
+                        signatureResolutionOrder: decodeResult.signatureResolutionOrder
+                    )
+                    if quality.usesDiskCache, case .decoded = decodeResult.cacheSource,
+                       let signature = decodeResult.resolvedSignature {
+                        self.diskWriter.enqueue(
+                            image, for: url, quality: quality, signature: signature,
+                            expectedGeneration: diskWriteGeneration
+                        )
                     }
                 }
                 let completions = self.finishPendingDecode(
@@ -303,31 +318,62 @@ final class ImageCache: @unchecked Sendable {
         if pending >= 48 && (pending % 48 == 0 || pending >= 144) {
             Self.logger.info("decode backlog pending=\(pending) quality=\(quality.rawValue, privacy: .public) priority=\(priority.logName, privacy: .public)")
         }
-        requestLock.lock()
         inheritedCompletions[subscriberID] = completion
         pendingDecodes[pendingKey] = PendingDecode(
             generation: requestGeneration,
             token: pendingToken,
             operation: operation,
             quality: quality,
+            priority: effectivePriority,
             filePath: filePath,
             fileSignature: knownFileSignature,
             completions: inheritedCompletions
         )
         requestLock.unlock()
-        decodeQueue.addOperation(operation)
-        return ImageCacheRequest { [weak self] in
-            self?.cancelPendingSubscriber(key: pendingKey, subscriberID: subscriberID)
+        for operationToCancel in operationsToCancel {
+            operationToCancel.cancel()
         }
+        decodeQueue.addOperation(operation)
+        return requestHandle(for: subscriberID)
     }
 
-    private func cancelPendingSubscriber(key: String, subscriberID: UUID) {
+    private func requestHandle(for subscriberID: UUID) -> ImageCacheRequest {
+        ImageCacheRequest(
+            cancellation: { [weak self] in
+                self?.cancelPendingSubscriber(subscriberID: subscriberID)
+            },
+            priorityUpdate: { [weak self] priority in
+                self?.updatePendingSubscriberPriority(subscriberID: subscriberID, priority: priority)
+            }
+        )
+    }
+
+    private func updatePendingSubscriberPriority(subscriberID: UUID, priority: ImageDecodePriority) {
         requestLock.lock()
-        guard var pendingDecode = pendingDecodes[key] else {
+        defer { requestLock.unlock() }
+        guard let entry = pendingDecodes.first(where: { $0.value.completions[subscriberID] != nil }) else { return }
+        var pendingDecode = entry.value
+        promotePendingDecode(&pendingDecode, to: priority)
+        pendingDecodes[entry.key] = pendingDecode
+    }
+
+    // Called under requestLock. Raising priority preserves the existing decode and subscribers.
+    private func promotePendingDecode(_ pending: inout PendingDecode, to priority: ImageDecodePriority) {
+        guard priority.queuePriority.rawValue > pending.priority.queuePriority.rawValue else { return }
+        pending.priority = priority
+        pending.operation.queuePriority = priority.queuePriority
+        pending.operation.qualityOfService = priority.qualityOfService
+    }
+
+    private func cancelPendingSubscriber(subscriberID: UUID) {
+        requestLock.lock()
+        guard let entry = pendingDecodes.first(where: { $0.value.completions[subscriberID] != nil }) else {
             requestLock.unlock()
             return
         }
 
+        let key = entry.key
+        var pendingDecode = entry.value
         pendingDecode.completions.removeValue(forKey: subscriberID)
         if pendingDecode.completions.isEmpty {
             pendingDecodes.removeValue(forKey: key)
@@ -366,6 +412,13 @@ final class ImageCache: @unchecked Sendable {
         defer { requestLock.unlock() }
         requestSerial += 1
         return requestSerial
+    }
+
+    private func nextSignatureResolutionOrder() -> Int {
+        requestLock.lock()
+        defer { requestLock.unlock() }
+        signatureResolutionSerial += 1
+        return signatureResolutionSerial
     }
 
     private func currentGeneration() -> Int {
@@ -410,24 +463,52 @@ final class ImageCache: @unchecked Sendable {
     ) -> NSImage? {
         guard let fileSignature = knownFileSignature else { return nil }
         for candidate in quality.cacheLookupOrder {
-            let key = cacheKey(for: url, quality: candidate, signature: fileSignature)
-            if let image = cachedImage(forKey: key, quality: candidate) {
-                return image
+            if let entry = cachedEntry(for: url, quality: candidate),
+               entry.resolvedSignature == fileSignature || entry.knownSignature == fileSignature {
+                return entry.image
             }
         }
 
         return nil
     }
 
-    private func cachedImage(forKey key: String, quality: ImageCacheQuality) -> NSImage? {
-        cache(for: quality).object(forKey: key as NSString)
+    private func memoryCacheKey(for url: URL, quality: ImageCacheQuality) -> NSString {
+        "\(quality.rawValue):\(url.standardizedFileURL.path)" as NSString
     }
 
-    private func store(_ image: NSImage, forKey key: String, quality: ImageCacheQuality) {
-        cache(for: quality).setObject(image, forKey: key as NSString, cost: Self.cost(for: image))
+    private func cachedEntry(for url: URL, quality: ImageCacheQuality) -> CachedImageEntry? {
+        cache(for: quality).object(forKey: memoryCacheKey(for: url, quality: quality))
     }
 
-    private func cache(for quality: ImageCacheQuality) -> NSCache<NSString, NSImage> {
+    @MainActor
+    private func store(
+        _ image: NSImage,
+        for url: URL,
+        quality: ImageCacheQuality,
+        resolvedSignature: FileContentSignature?,
+        knownSignature: FileContentSignature?,
+        signatureResolutionOrder: Int
+    ) {
+        let target = cache(for: quality)
+        let key = memoryCacheKey(for: url, quality: quality)
+        let existing = target.object(forKey: key)
+        // Decode completion order can differ from file observation order. Keep the newer observation.
+        if let existing, existing.signatureResolutionOrder > signatureResolutionOrder { return }
+        var retainedKnownSignature = knownSignature
+        if let existing, existing.resolvedSignature == resolvedSignature,
+           knownSignature == nil || knownSignature == resolvedSignature {
+            retainedKnownSignature = existing.knownSignature ?? knownSignature
+        }
+        let entry = CachedImageEntry(
+            image: image,
+            resolvedSignature: resolvedSignature,
+            knownSignature: retainedKnownSignature,
+            signatureResolutionOrder: signatureResolutionOrder
+        )
+        target.setObject(entry, forKey: key, cost: Self.cost(for: image))
+    }
+
+    private func cache(for quality: ImageCacheQuality) -> NSCache<NSString, CachedImageEntry> {
         switch quality {
         case .preview:
             previewCache
@@ -488,6 +569,25 @@ final class ImageCache: @unchecked Sendable {
 
     private static func logThumbnailCacheSummary(_ snapshot: ImageCacheTelemetrySnapshot) {
         logger.info("thumbnail cache summary total=\(snapshot.total) memory=\(snapshot.memoryHits) disk=\(snapshot.diskHits) decoded=\(snapshot.decoded) failed=\(snapshot.failures) hitRate=\(snapshot.hitRate * 100, format: .fixed(precision: 1))%")
+    }
+}
+
+private final class CachedImageEntry: @unchecked Sendable {
+    let image: NSImage
+    let resolvedSignature: FileContentSignature?
+    let knownSignature: FileContentSignature?
+    let signatureResolutionOrder: Int
+
+    init(
+        image: NSImage,
+        resolvedSignature: FileContentSignature?,
+        knownSignature: FileContentSignature?,
+        signatureResolutionOrder: Int
+    ) {
+        self.image = image
+        self.resolvedSignature = resolvedSignature
+        self.knownSignature = knownSignature
+        self.signatureResolutionOrder = signatureResolutionOrder
     }
 }
 
@@ -825,13 +925,22 @@ private struct ThumbnailDiskCacheEntry {
 
 final class ImageCacheRequest {
     private let cancellation: () -> Void
+    private let priorityUpdate: (ImageDecodePriority) -> Void
 
-    init(cancellation: @escaping () -> Void) {
+    init(
+        cancellation: @escaping () -> Void,
+        priorityUpdate: @escaping (ImageDecodePriority) -> Void
+    ) {
         self.cancellation = cancellation
+        self.priorityUpdate = priorityUpdate
     }
 
     func cancel() {
         cancellation()
+    }
+
+    func updatePriority(_ priority: ImageDecodePriority) {
+        priorityUpdate(priority)
     }
 }
 
@@ -840,6 +949,7 @@ private struct PendingDecode {
     var token: UUID
     var operation: Operation
     var quality: ImageCacheQuality
+    var priority: ImageDecodePriority
     var filePath: String
     var fileSignature: FileContentSignature?
     var completions: [UUID: @MainActor @Sendable (NSImage?) -> Void]

@@ -299,7 +299,11 @@ final class AppState: ObservableObject {
     private var searchResultAssets: [LightboxAsset]?
     private var previewAssetSnapshot: LightboxAsset?
     private var pendingPreviewStepAssetID: LightboxAsset.ID?
-    private var previewSpaceAssetFrames: [LightboxAsset.ID: CGRect] = [:]
+    private var storedPreviewSpaceAssetFrames: [LightboxAsset.ID: CGRect] = [:]
+    private var previewSpaceAssetFrameProvider: (() -> [LightboxAsset.ID: CGRect])?
+    private var previewSpaceAssetFrames: [LightboxAsset.ID: CGRect] {
+        previewSpaceAssetFrameProvider?() ?? storedPreviewSpaceAssetFrames
+    }
     private var compareTrayPulseTask: Task<Void, Never>?
     private var compareTrayDragID: LightboxAsset.ID?
     private var tabDragID: UUID?
@@ -1811,7 +1815,12 @@ final class AppState: ObservableObject {
     }
 
     func updatePreviewSpaceAssetFrames(_ frames: [LightboxAsset.ID: CGRect]) {
-        previewSpaceAssetFrames = frames
+        storedPreviewSpaceAssetFrames = frames
+    }
+
+    func setPreviewSpaceAssetFrameProvider(_ provider: (() -> [LightboxAsset.ID: CGRect])?) {
+        previewSpaceAssetFrameProvider = provider
+        if provider == nil { storedPreviewSpaceAssetFrames = [:] }
     }
 
     func previewSpaceFrame(for assetID: LightboxAsset.ID) -> CGRect? {
@@ -1820,8 +1829,9 @@ final class AppState: ObservableObject {
 
     private func previewSpaceAssetHit(at point: CGPoint?) -> (asset: LightboxAsset, frame: CGRect)? {
         guard let point else { return nil }
+        let frames = previewSpaceAssetFrames
         for asset in activeAssets {
-            guard let frame = previewSpaceAssetFrames[asset.id],
+            guard let frame = frames[asset.id],
                   frame.contains(point)
             else {
                 continue
@@ -1852,8 +1862,9 @@ final class AppState: ObservableObject {
             return "hit=\(hit.asset.originalName) frame=\(Self.frameDescription(hit.frame)) point=\(LightboxClickFormatter.pointDescription(point))"
         }
 
+        let frames = previewSpaceAssetFrames
         guard let nearest = activeAssets.compactMap({ asset -> (LightboxAsset, CGRect, CGFloat)? in
-            guard let frame = previewSpaceAssetFrames[asset.id] else { return nil }
+            guard let frame = frames[asset.id] else { return nil }
             return (asset, frame, Self.distance(from: point, to: frame))
         }).min(by: { $0.2 < $1.2 }) else {
             return "hit=nil frames=0 point=\(LightboxClickFormatter.pointDescription(point))"
@@ -1907,11 +1918,11 @@ final class AppState: ObservableObject {
         guard !hasActiveOverlay, let current = activeAssets.firstIndex(where: { $0.id == id }) else { return }
         if key == 53 { clearSelection(); return }
         if key == 0, modifiers.contains(.command) {
-            replaceSelection(with: Set(activeAssets.map(\.id)), primary: id, anchor: id)
+            replaceSelection(with: activeAssetIDs, primary: id, anchor: id)
             return
         }
         guard let targetIndex = GalleryKeyboardNavigation.targetIndex(
-            key: key, current: current, ids: activeAssets.map(\.id), frames: previewSpaceAssetFrames
+            key: key, current: current, ids: activeAssetIDList, frames: previewSpaceAssetFrames
         ) else { return }
         let target = activeAssets[targetIndex]
         if modifiers.contains(.shift) {
@@ -1925,7 +1936,8 @@ final class AppState: ObservableObject {
     }
 
     func replaceSelection(with ids: Set<LightboxAsset.ID>) {
-        replaceSelection(with: ids, primary: firstVisibleID(in: ids), anchor: firstVisibleID(in: ids))
+        let primary = firstVisibleID(in: ids)
+        replaceSelection(with: ids, primary: primary, anchor: primary)
     }
 
     func selectGalleryFolder(_ id: LibraryFolderEntry.ID) {
@@ -2897,9 +2909,9 @@ final class AppState: ObservableObject {
     private func applySystemTrashSuccesses(_ removedIDs: Set<LightboxAsset.ID>) {
         guard !removedIDs.isEmpty else { return }
 
-        assets.removeAll { removedIDs.contains($0.id) }
+        // Update both sources before the assets observer rebuilds the gallery and its ID caches.
         searchResultAssets?.removeAll { removedIDs.contains($0.id) }
-        cachedActiveAssets.removeAll { removedIDs.contains($0.id) }
+        assets.removeAll { removedIDs.contains($0.id) }
         selectedAssetIDs.subtract(removedIDs)
         if let selectedAssetID, removedIDs.contains(selectedAssetID) {
             self.selectedAssetID = firstVisibleID(in: selectedAssetIDs)
@@ -3750,44 +3762,37 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Publish one complete batch: mutating @Published array elements separately
+        // rebuilds and sorts the entire gallery after every field assignment.
+        var nextAssets = assets
         var assetsChanged = false
-        for index in assets.indices {
-            guard let update = updatesByID[assets[index].id],
+        for index in nextAssets.indices {
+            guard let update = updatesByID[nextAssets[index].id],
                   let width = update.width,
                   let height = update.height
             else {
                 continue
             }
-            assets[index].width = width
-            assets[index].height = height
-            assets[index].metadataLoaded = true
+            nextAssets[index].width = width
+            nextAssets[index].height = height
+            nextAssets[index].metadataLoaded = true
             assetsChanged = true
         }
 
-        for index in cachedActiveAssets.indices {
-            guard let update = updatesByID[cachedActiveAssets[index].id],
-                  let width = update.width,
-                  let height = update.height
-            else {
-                continue
-            }
-            cachedActiveAssets[index].width = width
-            cachedActiveAssets[index].height = height
-            cachedActiveAssets[index].metadataLoaded = true
-            didChange = true
-        }
-
-        if let previewAssetSnapshot,
+        if var previewAssetSnapshot,
            let update = updatesByID[previewAssetSnapshot.id],
            let width = update.width,
            let height = update.height {
-            self.previewAssetSnapshot?.width = width
-            self.previewAssetSnapshot?.height = height
-            self.previewAssetSnapshot?.metadataLoaded = true
-            didChange = true
+            previewAssetSnapshot.width = width
+            previewAssetSnapshot.height = height
+            previewAssetSnapshot.metadataLoaded = true
+            self.previewAssetSnapshot = previewAssetSnapshot
         }
 
-        if assetsChanged || didChange {
+        if assetsChanged {
+            // The assets observer rebuilds the derived gallery exactly once.
+            assets = nextAssets
+        } else if didChange {
             rebuildActiveAssets()
         }
     }
@@ -4229,7 +4234,7 @@ final class AppState: ObservableObject {
     }
 
     private func selectRange(to asset: LightboxAsset, extending: Bool) {
-        let visibleIDs = activeAssets.map(\.id)
+        let visibleIDs = activeAssetIDList
         let anchorID = selectionAnchorID ?? selectedAssetID ?? firstVisibleID(in: selectedAssetIDs) ?? asset.id
 
         guard let anchorIndex = visibleIDs.firstIndex(of: anchorID),
@@ -4250,14 +4255,15 @@ final class AppState: ObservableObject {
         primary: LightboxAsset.ID?,
         anchor: LightboxAsset.ID?
     ) {
-        if !ids.isEmpty { selectedGalleryFolderID = nil }
-        selectedAssetIDs = ids
-        selectedAssetID = primary
+        if !ids.isEmpty, selectedGalleryFolderID != nil { selectedGalleryFolderID = nil }
+        if selectedAssetIDs != ids { selectedAssetIDs = ids }
+        if selectedAssetID != primary { selectedAssetID = primary }
         selectionAnchorID = ids.isEmpty ? nil : anchor
     }
 
     private func firstVisibleID(in ids: Set<LightboxAsset.ID>) -> LightboxAsset.ID? {
-        activeAssets.first { ids.contains($0.id) }?.id
+        guard !ids.isEmpty else { return nil }
+        return activeAssetIDList.first { ids.contains($0) }
     }
 
     nonisolated private static func frameDescription(_ frame: CGRect?) -> String {

@@ -44,6 +44,7 @@ struct LightboxSearchQuery: Equatable, Sendable {
     }
 
     private func containsAllTerms(in value: String) -> Bool {
+        guard !nameTerms.isEmpty else { return true }
         let searchableValue = Self.normalized(value)
         for term in nameTerms where !searchableValue.contains(term) {
             return false

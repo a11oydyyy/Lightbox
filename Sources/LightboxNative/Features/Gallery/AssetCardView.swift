@@ -273,22 +273,62 @@ struct AssetInteractionLayer: NSViewRepresentable {
         nsView.onKeyboard = onKeyboard
         nsView.onActivate = onActivate
         nsView.onFocusChanged = onFocusChanged
-        nsView.setAccessibilityElement(isInteractionEnabled)
-        nsView.setAccessibilityRole(onActivate == nil ? .image : .button)
-        nsView.setAccessibilityLabel(([debugTargetName] + assetTags).joined(separator: ", "))
-        nsView.setAccessibilitySelected(accessibilitySelected)
-        nsView.setAccessibilityEnabled(isInteractionEnabled)
-        nsView.toolTip = debugTargetName
-        nsView.setAccessibilityCustomActions([
-            NSAccessibilityCustomAction(name: menuTitles.copy, target: nsView, selector: #selector(AssetInteractionView.accessibilityCopy)),
-            NSAccessibilityCustomAction(name: compareMenuTitle, target: nsView, selector: #selector(AssetInteractionView.accessibilityCompare))
-        ])
+        nsView.configureAccessibility(selected: accessibilitySelected)
         let requestsFocus = keyboardFocusRequested && isInteractionEnabled
         nsView.requestedKeyboardFocus = requestsFocus
     }
 }
 
 final class AssetInteractionView: NSView, NSDraggingSource {
+    private struct AccessibilityConfiguration: Equatable {
+        var name: String
+        var tags: [String]
+        var selected: Bool
+        var enabled: Bool
+        var hasActivation: Bool
+        var copyTitle: String
+        var compareTitle: String
+    }
+
+    private var accessibilityConfiguration: AccessibilityConfiguration?
+
+    func configureAccessibility(selected: Bool) {
+        let configuration = AccessibilityConfiguration(
+            name: debugTargetName,
+            tags: assetTags,
+            selected: selected,
+            enabled: isInteractionEnabled,
+            hasActivation: onActivate != nil,
+            copyTitle: menuTitles.copy,
+            compareTitle: compareMenuTitle
+        )
+        let previous = accessibilityConfiguration
+        guard previous != configuration else { return }
+        if previous?.enabled != configuration.enabled {
+            setAccessibilityElement(configuration.enabled)
+            setAccessibilityEnabled(configuration.enabled)
+        }
+        if previous?.hasActivation != configuration.hasActivation {
+            setAccessibilityRole(configuration.hasActivation ? .button : .image)
+        }
+        if previous?.name != configuration.name || previous?.tags != configuration.tags {
+            setAccessibilityLabel(([configuration.name] + configuration.tags).joined(separator: ", "))
+        }
+        if previous?.selected != configuration.selected {
+            setAccessibilitySelected(configuration.selected)
+        }
+        if previous?.name != configuration.name {
+            toolTip = configuration.name
+        }
+        if previous?.copyTitle != configuration.copyTitle || previous?.compareTitle != configuration.compareTitle {
+            setAccessibilityCustomActions([
+                NSAccessibilityCustomAction(name: configuration.copyTitle, target: self, selector: #selector(accessibilityCopy)),
+                NSAccessibilityCustomAction(name: configuration.compareTitle, target: self, selector: #selector(accessibilityCompare))
+            ])
+        }
+        accessibilityConfiguration = configuration
+    }
+
     static func canRestoreGalleryFocus(over responder: NSResponder?) -> Bool {
         !(responder is NSTextView) && !(responder is NSControl)
     }
@@ -394,6 +434,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     var canRevealInFinder = false
     var isInteractionEnabled = true {
         didSet {
+            guard isInteractionEnabled != oldValue else { return }
             isHidden = !isInteractionEnabled
         }
     }
@@ -1061,6 +1102,9 @@ struct AssetImageView: View {
                 }
                 imageRequest = nil
             }
+        }
+        .onChange(of: decodePriority) { priority in
+            imageRequest?.updatePriority(priority)
         }
         .onDisappear {
             imageRequest?.cancel()
