@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-enum GalleryScrollDirection {
+enum GalleryScrollDirection: Equatable {
     case stationary
     case up
     case down
@@ -202,40 +202,56 @@ final class GalleryFrameUpdateCoordinator {
 }
 
 @MainActor
-private final class GalleryMasonryColumnCache {
-    private struct Key: Hashable {
-        var identity: String
+final class GalleryMasonryColumnCache {
+    private struct Key: Equatable {
         var columnCount: Int
         var itemWidthTenths: Int
     }
 
-    private var revision = -1
-    private var columnsByKey: [Key: [[LightboxAsset]]] = [:]
+    private struct Entry {
+        var key: Key
+        var revision: Int
+        var assets: [LightboxAsset]
+        var columns: [[LightboxAsset]]
+    }
+
+    // Keep each search group warm without retaining every intermediate resize width.
+    private var columnsByIdentity: [String: Entry] = [:]
 
     func columns(
         identity: String,
         revision: Int,
+        assets: [LightboxAsset],
         columnCount: Int,
         itemWidth: CGFloat,
         compute: () -> [[LightboxAsset]]
     ) -> [[LightboxAsset]] {
-        if self.revision != revision {
-            self.revision = revision
-            columnsByKey.removeAll(keepingCapacity: true)
-        }
-
         let key = Key(
-            identity: identity,
             columnCount: columnCount,
             itemWidthTenths: Int((itemWidth * 10).rounded())
         )
-        if let cached = columnsByKey[key] {
-            return cached
+        if var cached = columnsByIdentity[identity], cached.key == key {
+            if cached.revision == revision { return cached.columns }
+            // A metadata update in one recursive folder must not reflow every folder.
+            // Compare full assets once per revision so cached card metadata stays current.
+            if cached.assets == assets {
+                cached.revision = revision
+                columnsByIdentity[identity] = cached
+                return cached.columns
+            }
         }
 
         let columns = compute()
-        columnsByKey[key] = columns
+        columnsByIdentity[identity] = Entry(key: key, revision: revision, assets: assets, columns: columns)
         return columns
+    }
+
+    func retain(identities: Set<String>) {
+        columnsByIdentity = columnsByIdentity.filter { identities.contains($0.key) }
+    }
+
+    func removeAll() {
+        columnsByIdentity.removeAll(keepingCapacity: true)
     }
 }
 
@@ -304,17 +320,17 @@ struct GalleryView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var frozenColumns: Int?
     @State private var lastViewportWidth: CGFloat = 0
-    @State private var assetFrames: [LightboxAsset.ID: CGRect] = [:]
-    @State private var folderRowFrame: CGRect?
-    @State private var searchGroupHeaderFrames: [String: CGRect] = [:]
+    @State private var lastViewportHeight: CGFloat = 0
+    @State private var scrollGeometry = GalleryScrollGeometry()
+    @State private var renderPlan: GalleryRenderPlan?
     @State private var selectionRect: CGRect?
-    @State private var scrollOffset: CGFloat = 0
     @State private var scrollDirection: GalleryScrollDirection = .stationary
     @State private var isScrolling = false
     @State private var contentVisible = true
     @State private var restoredScrollGeneration = -1
     @State private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
     @State private var masonryColumnCache = GalleryMasonryColumnCache()
+    @State private var storagePerformanceCache = GalleryStoragePerformanceCache()
     @State private var collapsedSearchGroupIDs: Set<String> = []
 
     private let horizontalPadding = GalleryThumbnailSizing.horizontalPadding
@@ -328,7 +344,7 @@ struct GalleryView: View {
 
     private var scrollRestoreAvailabilityToken: String {
         let anchorID = appState.activeTabScrollAnchorAssetID
-        let isAvailable = anchorID.map { id in appState.activeAssets.contains(where: { $0.id == id }) } ?? true
+        let isAvailable = anchorID.map { id in appState.activeAssetIDs.contains(id) } ?? true
         return "\(appState.scrollRestoreGeneration)|\(isAvailable)"
     }
 
@@ -372,29 +388,16 @@ struct GalleryView: View {
 
     var body: some View {
         GeometryReader { viewport in
+            let geometryNavigationToken = navigationToken
             let folderHorizontalPadding = horizontalPadding + imageColumnInset(viewportWidth: viewport.size.width)
             let activeAssets = appState.activeAssets
             let activeAssetIDs = appState.activeAssetIDs
             let performanceProfile = GalleryPerformanceProfile.current
             let prefersFastRawThumbnails = prefersFastRawThumbnails(activeAssets: activeAssets)
-            let loadableAssetIDs = imageLoadAssetIDs(
-                activeAssets: activeAssets,
-                viewportHeight: viewport.size.height,
-                prefersFastRawThumbnails: prefersFastRawThumbnails,
-                performanceProfile: performanceProfile
-            )
-            let prioritizedAssetIDs = GalleryImagePriorityPlanner.prioritizedAssetIDs(
-                activeAssets: activeAssets,
-                assetFrames: assetFrames,
-                viewportHeight: viewport.size.height,
-                scrollDirection: scrollDirection,
-                maxPrioritizedAssetCount: performanceProfile.maxPrioritizedAssetCount
-            )
-            let settledVisibleAssetIDs: Set<LightboxAsset.ID> = isScrolling ? [] : Set(
-                assetFrames.compactMap { id, frame in
-                    GalleryImagePriorityPlanner.isVisible(frame, viewportHeight: viewport.size.height) ? id : nil
-                }
-            )
+            let plan = renderPlan ?? makeRenderPlan(viewportHeight: viewport.size.height)
+            let loadableAssetIDs = plan.loadableAssetIDs
+            let prioritizedAssetIDs = plan.prioritizedAssetIDs
+            let settledVisibleAssetIDs = plan.settledVisibleAssetIDs
             let thumbnailQuality = galleryThumbnailQuality(assetCount: activeAssets.count, performanceProfile: performanceProfile)
             let permitsFullThumbnailPromotion = galleryPermitsFullThumbnailPromotion(
                 assetCount: activeAssets.count,
@@ -413,7 +416,6 @@ struct GalleryView: View {
                 ScrollViewReader { scrollProxy in
                     ScrollView(.vertical) {
                     VStack(spacing: 0) {
-                        ScrollOffsetProbe()
 
                         if !visibleFolders.isEmpty {
                             FolderRowView(
@@ -461,6 +463,8 @@ struct GalleryView: View {
                                                     collapsedSearchGroupIDs.remove(group.id)
                                                 } else {
                                                     collapsedSearchGroupIDs.insert(group.id)
+                                                    for asset in group.assets { scrollGeometry.remove(asset.id) }
+                                                    refreshRenderPlan(viewportHeight: viewport.size.height)
                                                     if group.assets.contains(where: { $0.id == appState.galleryKeyboardFocusID }) {
                                                         appState.galleryKeyboardFocusID = nil
                                                     }
@@ -521,6 +525,13 @@ struct GalleryView: View {
                         .animation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion), value: appState.thumbnailWidth)
                         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.galleryLayoutMode)
                     }
+                    .coordinateSpace(name: "GalleryContent")
+                    .background {
+                        GalleryContentOriginProbe { origin in
+                            guard prepareGeometry(for: geometryNavigationToken) else { return }
+                            noteContentOrigin(origin, viewportHeight: viewport.size.height)
+                        }
+                    }
                     .background(GalleryScrollBarConfigurator())
                     }
                     .scrollIndicators(.automatic)
@@ -530,39 +541,36 @@ struct GalleryView: View {
                         backgroundContextMenu
                     }
                     .onPreferenceChange(FolderRowFramePreferenceKey.self) { frame in
-                        folderRowFrame = frame
+                        guard prepareGeometry(for: geometryNavigationToken) else { return }
+                        scrollGeometry.folderFrame = frame
                     }
                     .onPreferenceChange(SearchGroupHeaderFramePreferenceKey.self) { frames in
-                        if frames != searchGroupHeaderFrames {
-                            searchGroupHeaderFrames = frames
-                        }
-                    }
-                    .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
-                        noteScroll(offset: offset)
-                    }
-                    .task(id: scrollOffset) {
-                        guard isScrolling else { return }
-                        try? await Task.sleep(for: .milliseconds(200))
-                        guard !Task.isCancelled else { return }
-                        isScrolling = false
-                        scrollDirection = .stationary
+                        guard prepareGeometry(for: geometryNavigationToken) else { return }
+                        scrollGeometry.groupHeaderFrames = frames
                     }
                     .onAppear {
+                        guard prepareGeometry(for: geometryNavigationToken) else { return }
                         playContentEntrance()
                         lastViewportWidth = viewport.size.width
+                        lastViewportHeight = viewport.size.height
+                        refreshRenderPlan(viewportHeight: viewport.size.height)
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
                     .onChange(of: navigationToken) { _ in
                         collapsedSearchGroupIDs.removeAll()
-                        frameUpdateCoordinator.cancel()
-                        assetFrames = [:]
-                        isScrolling = false
-                        folderRowFrame = nil
-                        searchGroupHeaderFrames = [:]
+                        _ = prepareGeometry(for: navigationToken)
                         selectionRect = nil
-                        appState.updatePreviewSpaceAssetFrames([:])
                         playContentEntrance()
                         restoreScrollIfNeeded(using: scrollProxy)
+                    }
+                    .onChange(of: appState.activeAssetsRevision) { _ in
+                        masonryColumnCache.retain(identities: Set(appState.searchAssetGroups.map(\.id)).union(["active"]))
+                        scrollGeometry.retain(activeAssetIDs: appState.activeAssetIDs)
+                        refreshRenderPlan(viewportHeight: viewport.size.height)
+                    }
+                    .onChange(of: viewport.size.height) { height in
+                        lastViewportHeight = height
+                        refreshRenderPlan(viewportHeight: viewport.size.height)
                     }
                     .onChange(of: appState.galleryKeyboardScrollGeneration) { _ in
                         guard !appState.hasActiveOverlay, let id = appState.galleryKeyboardFocusID else { return }
@@ -589,12 +597,14 @@ struct GalleryView: View {
 
                 if !activeAssets.isEmpty {
                     RubberBandSelectionLayer(
-                        assetFrames: assetFrames,
-                        excludedFrames: folderExclusionFrames + Array(searchGroupHeaderFrames.values) + [CGRect(
+                        assetFrames: [:],
+                        frameProvider: { scrollGeometry.selectionFrames },
+                        excludedFrameProvider: { scrollGeometry.exclusionFrames },
+                        excludedFrames: [CGRect(
                             x: viewport.size.width - 16, y: 0,
                             width: 16, height: viewport.size.height
                         )],
-                        visibleAssetIDs: appState.activeAssetIDList,
+                        activeAssetIDs: activeAssetIDs,
                         selectedAssetIDs: appState.selectedAssetIDs,
                         onSelectionRectChange: { rect in
                             selectionRect = rect
@@ -657,10 +667,21 @@ struct GalleryView: View {
             .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.libraryLoadingStatus)
             .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: showsEmptyState)
         }
+        .onAppear {
+            appState.setPreviewSpaceAssetFrameProvider { [scrollGeometry] in scrollGeometry.previewFrames }
+        }
+        .onDisappear {
+            frameUpdateCoordinator.cancel()
+            masonryColumnCache.removeAll()
+            scrollGeometry.clear()
+            renderPlan = nil
+            appState.setPreviewSpaceAssetFrameProvider(nil)
+        }
     }
 
     private func imageLoadAssetIDs(
         activeAssets: [LightboxAsset],
+        assetFrames: [LightboxAsset.ID: CGRect],
         viewportHeight: CGFloat,
         prefersFastRawThumbnails: Bool,
         performanceProfile: GalleryPerformanceProfile
@@ -684,49 +705,78 @@ struct GalleryView: View {
         return ids
     }
 
-    private func noteScroll(offset: CGFloat) {
-        guard !isResizingSidebar else { return }
-        let nextOffset = max(0, offset)
-        guard abs(nextOffset - scrollOffset) > 18 else { return }
-
-        scrollDirection = nextOffset > scrollOffset ? .down : .up
-        isScrolling = true
-        scrollOffset = nextOffset
-        updateScrollAnchor(using: assetFrames)
+    // Probes from a replaced scroll subtree can finish after the new one appears.
+    private func prepareGeometry(for token: String) -> Bool {
+        guard token == navigationToken else { return false }
+        if scrollGeometry.resetIfNeeded(navigationToken: token) {
+            frameUpdateCoordinator.cancel()
+            masonryColumnCache.removeAll()
+            renderPlan = nil
+            isScrolling = false
+            scrollDirection = .stationary
+        }
+        return true
     }
 
-    private func updateAssetFramesIfNeeded(
-        _ frames: [LightboxAsset.ID: CGRect],
-        activeAssetIDs: Set<LightboxAsset.ID>
-    ) {
-        // Avoid a per-frame preference→state→re-render storm while the sidebar
-        // is being dragged (rubber-band selection isn't active then anyway).
-        guard !isResizingSidebar else { return }
-        if let replacement = GalleryAssetFrameLifecycle.replacementFrames(
-            current: assetFrames,
-            incoming: frames,
-            activeAssetIDs: activeAssetIDs
-        ) {
-            assetFrames = replacement
-            updateScrollAnchor(using: replacement)
+    private func noteContentOrigin(_ origin: GalleryContentOrigin, viewportHeight: CGFloat) {
+        let previousOffset = scrollGeometry.origin.scrollOffset
+        scrollGeometry.updateOrigin(origin)
+        if origin.scrollOffset != previousOffset, !isResizingSidebar {
+            let direction: GalleryScrollDirection = origin.scrollOffset > previousOffset ? .down : .up
+            if scrollDirection != direction { scrollDirection = direction }
+            if !isScrolling { isScrolling = true }
+            scrollGeometry.scheduleScrollSettled {
+                isScrolling = false
+                scrollDirection = .stationary
+                refreshRenderPlan(viewportHeight: viewportHeight)
+            }
+        }
+        let frames = scrollGeometry.selectionFrames
+        refreshRenderPlan(viewportHeight: viewportHeight, assetFrames: frames)
+        updateScrollAnchor(using: frames)
+    }
+
+    private func flushPendingFrames() {
+        frameUpdateCoordinator.flush { _, _ in
+            let frames = scrollGeometry.selectionFrames
+            refreshRenderPlan(viewportHeight: lastViewportHeight, assetFrames: frames)
+            updateScrollAnchor(using: frames)
         }
     }
 
-    private func applyAssetFrameSnapshot(
-        _ snapshot: GalleryAssetFrameSnapshot,
-        activeAssetIDs: Set<LightboxAsset.ID>
-    ) {
-        updateAssetFramesIfNeeded(snapshot.selectionFrames, activeAssetIDs: activeAssetIDs)
-        appState.updatePreviewSpaceAssetFrames(
-            GalleryAssetFrameLifecycle.activeFrames(
-                snapshot.previewFrames,
-                activeAssetIDs: activeAssetIDs
-            )
+    private func makeRenderPlan(
+        viewportHeight: CGFloat,
+        assetFrames: [LightboxAsset.ID: CGRect]? = nil
+    ) -> GalleryRenderPlan {
+        let assets = appState.activeAssets
+        let frames = assetFrames ?? scrollGeometry.selectionFrames
+        let profile = GalleryPerformanceProfile.current
+        return GalleryRenderPlan(
+            loadableAssetIDs: imageLoadAssetIDs(
+                activeAssets: assets, assetFrames: frames, viewportHeight: viewportHeight,
+                prefersFastRawThumbnails: prefersFastRawThumbnails(activeAssets: assets),
+                performanceProfile: profile
+            ),
+            prioritizedAssetIDs: GalleryImagePriorityPlanner.prioritizedAssetIDs(
+                activeAssets: assets, assetFrames: frames, viewportHeight: viewportHeight,
+                scrollDirection: scrollDirection, maxPrioritizedAssetCount: profile.maxPrioritizedAssetCount
+            ),
+            settledVisibleAssetIDs: isScrolling ? [] : Set(frames.compactMap { id, frame in
+                GalleryImagePriorityPlanner.isVisible(frame, viewportHeight: viewportHeight) ? id : nil
+            })
         )
     }
 
+    private func refreshRenderPlan(
+        viewportHeight: CGFloat,
+        assetFrames: [LightboxAsset.ID: CGRect]? = nil
+    ) {
+        let plan = makeRenderPlan(viewportHeight: viewportHeight, assetFrames: assetFrames)
+        if scrollGeometry.replaceRenderPlan(plan) { renderPlan = plan }
+    }
+
     private func updateScrollAnchor(using frames: [LightboxAsset.ID: CGRect]) {
-        guard scrollOffset > 40 else {
+        guard scrollGeometry.origin.scrollOffset > 40 else {
             appState.updateActiveTabScrollAnchor(nil)
             return
         }
@@ -745,7 +795,7 @@ struct GalleryView: View {
             restoredScrollGeneration = generation
             return
         }
-        guard appState.activeAssets.contains(where: { $0.id == anchorID }) else { return }
+        guard appState.activeAssetIDs.contains(anchorID) else { return }
 
         restoredScrollGeneration = generation
         DispatchQueue.main.async {
@@ -753,20 +803,8 @@ struct GalleryView: View {
         }
     }
 
-    private var folderExclusionFrames: [CGRect] {
-        guard appState.showFolderCards,
-              !appState.folderEntries.isEmpty,
-              !appState.isViewingTrash,
-              let folderRowFrame
-        else {
-            return []
-        }
-
-        return [folderRowFrame]
-    }
-
     private func galleryThumbnailQuality(assetCount: Int, performanceProfile: GalleryPerformanceProfile) -> ImageCacheQuality {
-        let usesConservativeExternalLoading = appState.selectedSource?.usesConservativeExternalLoading == true
+        let usesConservativeExternalLoading = storagePerformance(activeAssets: appState.activeAssets).usesConservativeExternalLoading
         return performanceProfile.thumbnailQuality(
             assetCount: assetCount,
             usesConservativeExternalLoading: usesConservativeExternalLoading
@@ -774,39 +812,24 @@ struct GalleryView: View {
     }
 
     private func galleryPermitsFullThumbnailPromotion(assetCount: Int, performanceProfile: GalleryPerformanceProfile) -> Bool {
-        let usesConservativeExternalLoading = appState.selectedSource?.usesConservativeExternalLoading == true
+        let usesConservativeExternalLoading = storagePerformance(activeAssets: appState.activeAssets).usesConservativeExternalLoading
         return performanceProfile.permitsFullThumbnailPromotion(
             assetCount: assetCount,
             usesConservativeExternalLoading: usesConservativeExternalLoading
         )
     }
 
-    private func prefersFastRawThumbnails(activeAssets: [LightboxAsset]) -> Bool {
-        guard appState.selectedSource?.usesConservativeExternalLoading == true,
-              activeAssets.count >= 500
-        else {
-            return false
-        }
-
-        let sample = Array(activeAssets.prefix(120))
-        guard !sample.isEmpty else { return false }
-        let rawCount = sample.reduce(0) { count, asset in
-            guard let ext = asset.sourceURL?.pathExtension.lowercased(),
-                  Self.rawImageExtensions.contains(ext)
-            else {
-                return count
-            }
-            return count + 1
-        }
-
-        return Double(rawCount) / Double(sample.count) >= 0.60
+    private func storagePerformance(activeAssets: [LightboxAsset]) -> GalleryStoragePerformance {
+        storagePerformanceCache.configuration(
+            source: appState.selectedSource,
+            activeAssets: activeAssets,
+            revision: appState.activeAssetsRevision
+        )
     }
 
-    private static let rawImageExtensions: Set<String> = [
-        "3fr", "ari", "arw", "bay", "cr2", "cr3", "crw", "dcr", "dng", "erf",
-        "fff", "iiq", "k25", "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf",
-        "pef", "raf", "raw", "rw2", "rwl", "sr2", "srf", "x3f"
-    ]
+    private func prefersFastRawThumbnails(activeAssets: [LightboxAsset]) -> Bool {
+        storagePerformance(activeAssets: activeAssets).prefersFastRawThumbnails
+    }
 
     @ViewBuilder
     private func assetGrid(
@@ -836,6 +859,7 @@ struct GalleryView: View {
         let columns = masonryColumnCache.columns(
             identity: cacheIdentity,
             revision: appState.activeAssetsRevision,
+            assets: activeAssets,
             columnCount: metrics.columns,
             itemWidth: metrics.itemWidth
         ) {
@@ -885,11 +909,16 @@ struct GalleryView: View {
         performanceProfile: GalleryPerformanceProfile,
         menuTitles: AssetContextMenuTitles
     ) -> some View {
+        let geometryNavigationToken = navigationToken
         return AssetCardView(
             asset: asset,
             keyboardFocusRequested: appState.galleryKeyboardFocusID == asset.id,
-            onKeyboard: { key, modifiers in appState.handleGalleryKey(key, modifiers: modifiers, from: asset.id) },
+            onKeyboard: { key, modifiers in
+                flushPendingFrames()
+                appState.handleGalleryKey(key, modifiers: modifiers, from: asset.id)
+            },
             onActivate: {
+                flushPendingFrames()
                 appState.showPreview(for: asset, sourceFrame: appState.previewSpaceFrame(for: asset.id))
             },
             // Suppress the source card's selection glow while its preview is
@@ -919,9 +948,7 @@ struct GalleryView: View {
             showsPressFeedback: !appState.hasExplicitSelection,
             dragSourceURLs: { appState.dragSourceURLs(for: asset) },
             onClick: { click in
-                frameUpdateCoordinator.flush { snapshot, ids in
-                    applyAssetFrameSnapshot(snapshot, activeAssetIDs: ids)
-                }
+                flushPendingFrames()
                 appState.handleAssetClick(
                     asset,
                     modifiers: click.modifierFlags,
@@ -958,13 +985,18 @@ struct GalleryView: View {
         .id(asset.id)
         .frame(width: itemWidth, height: itemHeight)
         .background {
-            AssetFrameProbe(id: asset.id) { snapshot in
-                frameUpdateCoordinator.submit(snapshot, activeAssetIDs: activeAssetIDs) { snapshot, activeAssetIDs in
-                    applyAssetFrameSnapshot(snapshot, activeAssetIDs: activeAssetIDs)
+            AssetFrameProbe(id: asset.id) { frame in
+                guard prepareGeometry(for: geometryNavigationToken) else { return }
+                scrollGeometry.updateContentFrame(frame, for: asset.id)
+                frameUpdateCoordinator.submit(.init(selectionFrames: [asset.id: frame]), activeAssetIDs: activeAssetIDs) { _, _ in
+                    refreshRenderPlan(viewportHeight: lastViewportHeight)
                 }
             } onDisappear: {
-                frameUpdateCoordinator.remove(asset.id, activeAssetIDs: activeAssetIDs) { snapshot, activeAssetIDs in
-                    applyAssetFrameSnapshot(snapshot, activeAssetIDs: activeAssetIDs)
+                guard geometryNavigationToken == navigationToken,
+                      geometryNavigationToken == scrollGeometry.navigationToken else { return }
+                scrollGeometry.remove(asset.id)
+                frameUpdateCoordinator.remove(asset.id, activeAssetIDs: activeAssetIDs) { _, _ in
+                    refreshRenderPlan(viewportHeight: lastViewportHeight)
                 }
             }
         }
@@ -1539,25 +1571,33 @@ private struct FolderTagDots: View {
 
 private struct AssetFrameProbe: View {
     var id: LightboxAsset.ID
-    var onUpdate: (GalleryAssetFrameSnapshot) -> Void
+    var onUpdate: (CGRect) -> Void
     var onDisappear: () -> Void
 
     var body: some View {
         GeometryReader { proxy in
-            let snapshot = GalleryAssetFrameSnapshot(
-                    selectionFrames: [id: proxy.frame(in: .named("GallerySelectionSpace"))],
-                    previewFrames: [id: proxy.frame(in: .named("PreviewSpace"))]
-                )
+            let frame = proxy.frame(in: .named("GalleryContent"))
             Color.clear
-                .onAppear {
-                    onUpdate(snapshot)
-                }
-                .onChange(of: snapshot) { updatedSnapshot in
-                    onUpdate(updatedSnapshot)
-                }
-                .onDisappear {
-                    onDisappear()
-                }
+                .onAppear { onUpdate(frame) }
+                .onChange(of: frame) { onUpdate($0) }
+                .onDisappear { onDisappear() }
+        }
+    }
+}
+
+private struct GalleryContentOriginProbe: View {
+    var onUpdate: (GalleryContentOrigin) -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            let origin = GalleryContentOrigin(
+                selection: proxy.frame(in: .named("GallerySelectionSpace")).origin,
+                preview: proxy.frame(in: .named("PreviewSpace")).origin,
+                scrollOffset: max(0, -proxy.frame(in: .named("GalleryScroll")).minY)
+            )
+            Color.clear
+                .onAppear { onUpdate(origin) }
+                .onChange(of: origin) { onUpdate($0) }
         }
     }
 }
@@ -1567,7 +1607,7 @@ private struct FolderRowFrameProbe: View {
         GeometryReader { proxy in
             Color.clear.preference(
                 key: FolderRowFramePreferenceKey.self,
-                value: proxy.frame(in: .named("GallerySelectionSpace"))
+                value: proxy.frame(in: .named("GalleryContent"))
             )
         }
     }
@@ -1590,7 +1630,7 @@ private struct SearchGroupHeaderFrameProbe: View {
         GeometryReader { proxy in
             Color.clear.preference(
                 key: SearchGroupHeaderFramePreferenceKey.self,
-                value: [id: proxy.frame(in: .named("GallerySelectionSpace"))]
+                value: [id: proxy.frame(in: .named("GalleryContent"))]
             )
         }
     }
@@ -1629,25 +1669,5 @@ private struct SelectionCounterText: View {
             .foregroundStyle(.primary)
             .shadow(color: colorScheme == .dark ? .black.opacity(0.62) : .white.opacity(0.86), radius: 5, y: 1)
             .shadow(color: colorScheme == .dark ? .white.opacity(0.10) : .black.opacity(0.18), radius: 1.5, y: 1)
-    }
-}
-
-private struct ScrollOffsetProbe: View {
-    var body: some View {
-        GeometryReader { proxy in
-            Color.clear.preference(
-                key: ScrollOffsetPreferenceKey.self,
-                value: max(0, -proxy.frame(in: .named("GalleryScroll")).minY)
-            )
-        }
-        .frame(height: 0)
-    }
-}
-
-private struct ScrollOffsetPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }

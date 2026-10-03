@@ -6,8 +6,8 @@ APP_NAME="LightboxNative"
 APP_BUNDLE_NAME="Lightbox"
 BUNDLE_ID="io.github.a11oydyyy.Lightbox"
 MIN_SYSTEM_VERSION="15.0"
-VERSION="2.0.5"
-BUILD_NUMBER="117"
+VERSION="2.0.6"
+BUILD_NUMBER="118"
 BUILD_ARCH_ARGS=()
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

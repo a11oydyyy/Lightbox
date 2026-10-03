@@ -3,8 +3,10 @@ import SwiftUI
 
 struct RubberBandSelectionLayer: NSViewRepresentable {
     var assetFrames: [LightboxAsset.ID: CGRect]
+    var frameProvider: (() -> [LightboxAsset.ID: CGRect])? = nil
+    var excludedFrameProvider: (() -> [CGRect])? = nil
     var excludedFrames: [CGRect] = []
-    var visibleAssetIDs: [LightboxAsset.ID]
+    var activeAssetIDs: Set<LightboxAsset.ID>
     var selectedAssetIDs: Set<LightboxAsset.ID>
     var onSelectionRectChange: (CGRect?) -> Void
     var onSelectionChange: (Set<LightboxAsset.ID>) -> Void
@@ -15,8 +17,10 @@ struct RubberBandSelectionLayer: NSViewRepresentable {
 
     func updateNSView(_ nsView: RubberBandSelectionView, context: Context) {
         nsView.assetFrames = assetFrames
+        nsView.frameProvider = frameProvider
+        nsView.excludedFrameProvider = excludedFrameProvider
         nsView.excludedFrames = excludedFrames
-        nsView.visibleAssetIDs = visibleAssetIDs
+        nsView.activeAssetIDs = activeAssetIDs
         nsView.selectedAssetIDs = selectedAssetIDs
         nsView.onSelectionRectChange = onSelectionRectChange
         nsView.onSelectionChange = onSelectionChange
@@ -25,19 +29,20 @@ struct RubberBandSelectionLayer: NSViewRepresentable {
 
 final class RubberBandSelectionView: NSView {
     var assetFrames: [LightboxAsset.ID: CGRect] = [:]
+    var frameProvider: (() -> [LightboxAsset.ID: CGRect])? = nil
+    var excludedFrameProvider: (() -> [CGRect])? = nil
     var excludedFrames: [CGRect] = []
-    var visibleAssetIDs: [LightboxAsset.ID] = []
+    var activeAssetIDs: Set<LightboxAsset.ID> = []
     var selectedAssetIDs: Set<LightboxAsset.ID> = []
     var onSelectionRectChange: (CGRect?) -> Void = { _ in }
     var onSelectionChange: (Set<LightboxAsset.ID>) -> Void = { _ in }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let event = window?.currentEvent ?? NSApp.currentEvent,
-              event.type == .leftMouseDown,
-              !assetFrames.isEmpty
-        else {
-            return nil
-        }
+              event.type == .leftMouseDown else { return nil }
+        let assetFrames = frameProvider?() ?? assetFrames
+        guard !assetFrames.isEmpty else { return nil }
+        let excludedFrames = excludedFrames + (excludedFrameProvider?() ?? [])
 
         let selectionPoint = Self.selectionPoint(from: point, boundsHeight: bounds.height)
         guard !Self.contains(selectionPoint, in: excludedFrames) else {
@@ -139,11 +144,17 @@ final class RubberBandSelectionView: NSView {
     }
 
     private func intersectingAssetIDs(in selectionRect: CGRect) -> Set<LightboxAsset.ID> {
-        Set(
-            visibleAssetIDs.filter { id in
-                guard let frame = assetFrames[id] else { return false }
-                return frame.intersects(selectionRect)
-            }
-        )
+        Self.intersectingAssetIDs(in: selectionRect, assetFrames: frameProvider?() ?? assetFrames, activeAssetIDs: activeAssetIDs)
+    }
+
+    nonisolated static func intersectingAssetIDs(
+        in selectionRect: CGRect,
+        assetFrames: [LightboxAsset.ID: CGRect],
+        activeAssetIDs: Set<LightboxAsset.ID>
+    ) -> Set<LightboxAsset.ID> {
+        assetFrames.reduce(into: []) { selectedIDs, entry in
+            guard activeAssetIDs.contains(entry.key), entry.value.intersects(selectionRect) else { return }
+            selectedIDs.insert(entry.key)
+        }
     }
 }
