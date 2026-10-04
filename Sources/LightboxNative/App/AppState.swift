@@ -9,6 +9,12 @@ struct SearchAssetGroup: Identifiable, Equatable {
     var assets: [LightboxAsset]
 }
 
+private struct RecursiveSearchScope: Equatable {
+    var sourceID: LibrarySource.ID
+    var folderPath: String
+    var showsHiddenItems: Bool
+}
+
 private struct TabContentSnapshot {
     var tab: LightboxTab
     var showsHiddenItems: Bool
@@ -197,7 +203,6 @@ final class AppState: ObservableObject {
         didSet {
             guard searchText != oldValue else { return }
             guard !isApplyingTabState else { return }
-            clearSearchResults()
             scheduleSearch()
             rebuildActiveAssets()
             rebuildActiveFolderEntries()
@@ -277,6 +282,7 @@ final class AppState: ObservableObject {
     private var indexWriteTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var searchGeneration = 0
+    private var recursiveSearchScope: RecursiveSearchScope?
     private var tabPersistenceTask: Task<Void, Never>?
     private var fileTransferTask: Task<Void, Never>?
     private var fileTransferDismissTask: Task<Void, Never>?
@@ -320,6 +326,7 @@ final class AppState: ObservableObject {
     private let compareTrayLimit = 8
     private var sidebarVolumeObserverTokens: [SidebarVolumeObserverToken] = []
     private let previewDimensionProbe: @Sendable (URL) -> CGSize?
+    private let searchDimensionProbe: @Sendable (URL) -> CGSize?
     private let systemTrashMover: @Sendable (URL) -> Bool
     private let finderTagWriter: @Sendable ([String], URL) -> Bool
     private let compareTrayAssetLoader: @Sendable (URL, CGSize, MockPalette) -> LightboxAsset
@@ -332,6 +339,9 @@ final class AppState: ObservableObject {
         indexDatabaseURL: URL = LightboxLibraryStore.indexDatabaseURL,
         libraryDefaults: UserDefaults = .standard,
         previewDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
+            ImageProbe.dimensions(for: $0)
+        },
+        searchDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
             ImageProbe.dimensions(for: $0)
         },
         systemTrashMover: @escaping @Sendable (URL) -> Bool = {
@@ -366,6 +376,7 @@ final class AppState: ObservableObject {
         indexStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
         self.libraryDefaults = libraryDefaults
         self.previewDimensionProbe = previewDimensionProbe
+        self.searchDimensionProbe = searchDimensionProbe
         self.systemTrashMover = systemTrashMover
         self.finderTagWriter = finderTagWriter
         self.compareTrayAssetLoader = compareTrayAssetLoader
@@ -1280,6 +1291,7 @@ final class AppState: ObservableObject {
         searchTask?.cancel()
         searchGeneration &+= 1
         searchTask = nil
+        recursiveSearchScope = nil
         libraryDirectoryMonitor?.stop()
         libraryDirectoryMonitor = nil
         libraryLoadingStatus = nil
@@ -3202,6 +3214,8 @@ final class AppState: ObservableObject {
     }
 
     func refreshLibrary(preservingVisibleSnapshot: Bool = false) {
+        // Explicit refreshes and directory change notifications invalidate the scan.
+        recursiveSearchScope = nil
         guard !isShowingStartPage else {
             suspendActiveTabWork()
             assets = []
@@ -3219,6 +3233,10 @@ final class AppState: ObservableObject {
         assetMetadataTask?.cancel()
         refreshSerial += 1
         let refreshID = refreshSerial
+        if includesSubfolders {
+            // A slow top-level folder snapshot must not delay recursive image results.
+            scheduleSearch(preservingResults: preservingVisibleSnapshot, forceRefresh: true)
+        }
         libraryLoadingStatus = LibraryLoadingStatus(phase: .scanning, processed: 0, total: nil)
         Self.logger.info("refresh[\(refreshID)] begin trash=\(self.isViewingTrash) source=\(self.selectedSourceID, privacy: .public) sourceKind=\(self.selectedSource?.kind.rawValue ?? "none", privacy: .public) folder=\(self.currentFolderURL.path, privacy: .public) cancelledDebounce=\(cancelledRefreshTask) cancelledLoad=\(cancelledLoadTask) cancelledMetadata=\(cancelledMetadataTask)")
         if isViewingTrash {
@@ -3373,7 +3391,7 @@ final class AppState: ObservableObject {
                     loadsFinderTags: true,
                     startDelayMilliseconds: metadataPolicy.startDelayMilliseconds
                 )
-                self.scheduleSearch(preservingResults: preservingVisibleSnapshot)
+                self.scheduleSearch(preservingResults: preservingVisibleSnapshot, forceRefresh: !self.includesSubfolders)
                 self.captureActiveTabState()
                 Self.logger.info("refresh[\(refreshID)] apply complete applyTotal=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s folderEntries=\(self.folderEntries.count) storeAssets=\(self.assets.count) visibleSnapshotAssets=\(snapshot.count)")
             }
@@ -3728,7 +3746,7 @@ final class AppState: ObservableObject {
         _ updates: [AssetMetadataUpdate],
         sourceID: LibrarySource.ID,
         folderPath: String,
-        searchText expectedSearchText: String,
+        searchText expectedSearchText: String?,
         generation: Int
     ) {
         guard !updates.isEmpty,
@@ -3736,7 +3754,7 @@ final class AppState: ObservableObject {
               !isViewingTrash,
               selectedSourceID == sourceID,
               currentFolderURL.standardizedFileURL.path == folderPath,
-              searchText.trimmingCharacters(in: .whitespacesAndNewlines) == expectedSearchText
+              expectedSearchText == nil || searchText.trimmingCharacters(in: .whitespacesAndNewlines) == expectedSearchText
         else {
             return
         }
@@ -3744,18 +3762,21 @@ final class AppState: ObservableObject {
         let updatesByID = Dictionary(uniqueKeysWithValues: updates.map { ($0.id, $0) })
         var didChange = false
 
+        func apply(_ asset: inout LightboxAsset) -> Bool {
+            guard let update = updatesByID[asset.id] else { return false }
+            let previous = asset
+            if let width = update.width, let height = update.height {
+                asset.width = width
+                asset.height = height
+                asset.metadataLoaded = true
+            }
+            if let tags = update.tags { asset.tags = tags }
+            return asset != previous
+        }
+
         if var searchResultAssets {
             for index in searchResultAssets.indices {
-                guard let update = updatesByID[searchResultAssets[index].id],
-                      let width = update.width,
-                      let height = update.height
-                else {
-                    continue
-                }
-                searchResultAssets[index].width = width
-                searchResultAssets[index].height = height
-                searchResultAssets[index].metadataLoaded = true
-                didChange = true
+                if apply(&searchResultAssets[index]) { didChange = true }
             }
             if didChange {
                 self.searchResultAssets = searchResultAssets
@@ -3767,25 +3788,10 @@ final class AppState: ObservableObject {
         var nextAssets = assets
         var assetsChanged = false
         for index in nextAssets.indices {
-            guard let update = updatesByID[nextAssets[index].id],
-                  let width = update.width,
-                  let height = update.height
-            else {
-                continue
-            }
-            nextAssets[index].width = width
-            nextAssets[index].height = height
-            nextAssets[index].metadataLoaded = true
-            assetsChanged = true
+            if apply(&nextAssets[index]) { assetsChanged = true }
         }
 
-        if var previewAssetSnapshot,
-           let update = updatesByID[previewAssetSnapshot.id],
-           let width = update.width,
-           let height = update.height {
-            previewAssetSnapshot.width = width
-            previewAssetSnapshot.height = height
-            previewAssetSnapshot.metadataLoaded = true
+        if var previewAssetSnapshot, apply(&previewAssetSnapshot) {
             self.previewAssetSnapshot = previewAssetSnapshot
         }
 
@@ -3793,7 +3799,16 @@ final class AppState: ObservableObject {
             // The assets observer rebuilds the derived gallery exactly once.
             assets = nextAssets
         } else if didChange {
-            rebuildActiveAssets()
+            rebuildLibraryColorTags()
+            if selectedFilter == .all, sortField != .tag {
+                // Dimensions and tags do not change this ordering or membership.
+                // Avoid sorting the entire recursive library on every metadata batch.
+                var visibleAssets = cachedActiveAssets
+                for index in visibleAssets.indices { _ = apply(&visibleAssets[index]) }
+                setCachedActiveAssets(visibleAssets)
+            } else {
+                rebuildActiveAssets()
+            }
         }
     }
 
@@ -3860,7 +3875,7 @@ final class AppState: ObservableObject {
         }
 
         if let searchResultFolderEntries {
-            setCachedActiveFolderEntries(sortedFolderEntries(searchResultFolderEntries))
+            setCachedActiveFolderEntries(sortedFolderEntries(searchResultFolderEntries.filter(query.matches)))
         } else {
             setCachedActiveFolderEntries(sortedFolderEntries(folderEntries.filter(query.matches)))
         }
@@ -3884,13 +3899,24 @@ final class AppState: ObservableObject {
 
     private var searchResultAssetsForActiveQuery: [LightboxAsset]? {
         guard usesRecursiveResults, !isViewingTrash else { return nil }
-        // Do not expose temporary direct-folder cards while recursive geometry is loading.
+        // Recursive results arrive incrementally; avoid mixing in direct-folder cards.
         return searchResultAssets ?? (includesSubfolders ? [] : nil)
     }
 
-    private func scheduleSearch(preservingResults: Bool = false) {
+    private func scheduleSearch(preservingResults: Bool = false, forceRefresh: Bool = false) {
+        let scope = RecursiveSearchScope(
+            sourceID: selectedSourceID,
+            folderPath: currentFolderURL.standardizedFileURL.path,
+            showsHiddenItems: showsHiddenItems
+        )
+        // A recursive scan already covers every name. Typing filters that snapshot,
+        // including while it is arriving, without restarting NAS I/O or metadata work.
+        if !forceRefresh, includesSubfolders, recursiveSearchScope == scope, searchStatus != nil {
+            return
+        }
         searchTask?.cancel()
         searchGeneration &+= 1
+        recursiveSearchScope = nil
         let generation = searchGeneration
         if !preservingResults { clearSearchResults() }
         searchStatus = nil
@@ -3908,6 +3934,8 @@ final class AppState: ObservableObject {
         guard !query.isEmpty || includesSubfolders else { return }
 
         let recursive = includesSubfolders
+        if recursive { recursiveSearchScope = scope }
+        let scanQuery = recursive ? LightboxSearchQuery.parse("") : query
         let searchFolder = currentFolderURL
         let sourceID = source.id
         let sourceRootURL = source.rootURL
@@ -3915,32 +3943,55 @@ final class AppState: ObservableObject {
         let indexDatabaseURL = indexDatabaseURL
         let showsHiddenItems = showsHiddenItems
         searchStatus = LightboxSearchStatus(isSearching: true)
+        let dimensionProbe = searchDimensionProbe
 
-        searchTask = Task.detached(priority: .utility) { [weak self, query, searchFolder, sourceID, sourceRootURL, currentFolderPath, trimmedSearchText, showsHiddenItems, recursive, generation] in
+        searchTask = Task.detached(priority: .utility) { [weak self, scanQuery, searchFolder, sourceID, sourceRootURL, currentFolderPath, trimmedSearchText, showsHiddenItems, recursive, generation] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
 
-            let result = LocalImageSource.searchAssets(
-                in: searchFolder,
-                sourceID: sourceID,
-                rootURL: sourceRootURL,
-                query: query,
-                recursive: recursive,
-                showsHiddenItems: showsHiddenItems,
-                collectsFolders: !query.isEmpty,
-                probeDimensions: recursive,
-                skipsPackages: true,
-                maxResults: recursive ? Int.max : 2_000,
-                maxFolderResults: recursive ? Int.max : 300,
-                maxVisited: recursive ? Int.max : 20_000
-            )
+            let publishProgress: @Sendable (LightboxSearchScanResult) -> Void = { [weak self] partial in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.searchStatus?.isSearching == true,
+                          self.searchGeneration == generation,
+                          self.selectedSourceID == sourceID,
+                          !self.isViewingTrash,
+                          self.currentFolderURL.standardizedFileURL.path == currentFolderPath,
+                          recursive || self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedSearchText,
+                          partial.visitedCount > (self.searchStatus?.visitedCount ?? 0)
+                    else { return }
+                    self.searchResultAssets = partial.assets
+                    self.searchResultFolderEntries = partial.folders
+                    self.searchStatus = LightboxSearchStatus(
+                        isSearching: true, limitReached: partial.limitReached,
+                        discoveredCount: partial.assets.count, visitedCount: partial.visitedCount
+                    )
+                    self.rebuildLibraryColorTags()
+                    self.rebuildActiveAssets()
+                    self.rebuildActiveFolderEntries()
+                }
+            }
+            let result: LightboxSearchScanResult
+            if recursive {
+                result = await LocalImageSource.scanRecursiveAssets(
+                    in: searchFolder, sourceID: sourceID, rootURL: sourceRootURL,
+                    showsHiddenItems: showsHiddenItems, onProgress: publishProgress
+                )
+            } else {
+                result = LocalImageSource.searchAssets(
+                    in: searchFolder, sourceID: sourceID, rootURL: sourceRootURL,
+                    query: scanQuery, recursive: false, showsHiddenItems: showsHiddenItems,
+                    skipsPackages: true, onProgress: publishProgress
+                )
+            }
 
             let didApplySearchResults = await MainActor.run { () -> Bool in
                 guard let self,
                       !Task.isCancelled,
                       self.searchGeneration == generation,
                       self.selectedSourceID == sourceID,
-                      self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedSearchText,
+                      !self.isViewingTrash,
+                      recursive || self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedSearchText,
                       self.currentFolderURL.standardizedFileURL.path == currentFolderPath
                 else {
                     return false
@@ -3949,42 +4000,59 @@ final class AppState: ObservableObject {
                 self.searchResultAssets = result.assets
                 self.rebuildLibraryColorTags()
                 self.searchResultFolderEntries = result.folders
-                self.searchStatus = LightboxSearchStatus(isSearching: false, limitReached: result.limitReached)
+                self.searchStatus = LightboxSearchStatus(
+                    isSearching: false, limitReached: result.limitReached,
+                    discoveredCount: result.assets.count, visitedCount: result.visitedCount
+                )
                 self.rebuildActiveAssets()
+                self.rebuildActiveFolderEntries()
                 self.removeDetachedSelection()
                 return true
             }
             guard didApplySearchResults else { return }
 
-            let metadataTargets = result.assets
+            // Match the gallery order so visible images receive dimensions first.
+            let orderedAssets = await MainActor.run { self?.sortedAssets(result.assets) ?? result.assets }
+            let metadataTargets = orderedAssets
                 .prefix(recursive ? Int.max : Self.searchMetadataRefreshLimit)
                 .compactMap { asset -> AssetMetadataTarget? in
-                    guard !asset.metadataLoaded, let url = asset.sourceURL else { return nil }
+                    guard recursive || !asset.metadataLoaded, let url = asset.sourceURL else { return nil }
                     return AssetMetadataTarget(
                         id: asset.id,
                         url: url,
-                        shouldLoadDimensions: true,
-                        shouldLoadTags: false
+                        shouldLoadDimensions: !asset.metadataLoaded,
+                        shouldLoadTags: recursive
                     )
                 }
             guard !metadataTargets.isEmpty else { return }
+            await MainActor.run {
+                guard let self, self.searchGeneration == generation else { return }
+                self.searchStatus?.metadataTotal = metadataTargets.count
+            }
 
             let metadataStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
             var batch: [AssetMetadataUpdate] = []
             var processedCount = 0
+            var lastPublishAt = Date()
             for target in metadataTargets {
                 guard !Task.isCancelled else { return }
-                guard let size = ImageProbe.dimensions(for: target.url) else { continue }
+                let size = target.shouldLoadDimensions ? autoreleasepool(invoking: {
+                    RecursiveImageDimensionCache.shared.dimensions(for: target.url, resolver: dimensionProbe)
+                }) : nil
+                guard !Task.isCancelled else { return }
+                let tags = target.shouldLoadTags ? FinderTagStore.colorTags(for: target.url) : nil
+                guard !Task.isCancelled else { return }
                 processedCount += 1
                 batch.append(AssetMetadataUpdate(
                     id: target.id,
                     url: target.url,
-                    width: size.width,
-                    height: size.height,
-                    tags: nil
+                    width: size?.width,
+                    height: size?.height,
+                    tags: tags
                 ))
 
-                if batch.count >= 48 {
+                if (recursive && processedCount == 1) || batch.count >= 48 || Date().timeIntervalSince(lastPublishAt) >= 0.5 {
+                    lastPublishAt = Date()
                     let updates = batch
                     batch.removeAll(keepingCapacity: true)
                     metadataStore.updateCachedMetadata(
@@ -3994,7 +4062,7 @@ final class AppState: ObservableObject {
                                 url: $0.url,
                                 width: $0.width,
                                 height: $0.height,
-                                tags: nil
+                                tags: $0.tags
                             )
                         }
                     )
@@ -4003,9 +4071,12 @@ final class AppState: ObservableObject {
                             updates,
                             sourceID: sourceID,
                             folderPath: currentFolderPath,
-                            searchText: trimmedSearchText,
+                            searchText: recursive ? nil : trimmedSearchText,
                             generation: generation
                         )
+                        if let self, self.searchGeneration == generation {
+                            self.searchStatus?.metadataProcessed = processedCount
+                        }
                     }
                 }
 
@@ -4022,7 +4093,7 @@ final class AppState: ObservableObject {
                         url: $0.url,
                         width: $0.width,
                         height: $0.height,
-                        tags: nil
+                        tags: $0.tags
                     )
                 }
             )
@@ -4031,9 +4102,12 @@ final class AppState: ObservableObject {
                     batch,
                     sourceID: sourceID,
                     folderPath: currentFolderPath,
-                    searchText: trimmedSearchText,
+                    searchText: recursive ? nil : trimmedSearchText,
                     generation: generation
                 )
+                if let self, self.searchGeneration == generation {
+                    self.searchStatus?.metadataProcessed = processedCount
+                }
             }
         }
     }

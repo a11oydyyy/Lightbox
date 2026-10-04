@@ -48,6 +48,9 @@ private func makeTestAppState(
     previewDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
         ImageProbe.dimensions(for: $0)
     },
+    searchDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
+        ImageProbe.dimensions(for: $0)
+    },
     systemTrashMover: @escaping @Sendable (URL) -> Bool = {
         LightboxLibraryStore.moveToSystemTrash($0)
     },
@@ -84,6 +87,7 @@ private func makeTestAppState(
         indexDatabaseURL: databaseURL,
         libraryDefaults: defaults,
         previewDimensionProbe: previewDimensionProbe,
+        searchDimensionProbe: searchDimensionProbe,
         systemTrashMover: systemTrashMover,
         finderTagWriter: finderTagWriter,
         compareTrayAssetLoader: compareTrayAssetLoader,
@@ -5268,4 +5272,140 @@ private actor UpdateRequestCounter {
     state.handleGalleryKey(124, modifiers: [], from: remainingIDs[0])
     #expect(state.selectedAssetIDs == [remainingIDs[1]])
     #expect(state.galleryKeyboardFocusID == remainingIDs[1])
+}
+
+@MainActor
+@Test func recursiveGalleryAppearsWhileDimensionReaderIsBlocked() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxDeferred-\(UUID())")
+    let child = root.appendingPathComponent("child")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data([1]).write(to: child.appendingPathComponent("portrait.jpg"))
+    let readerGate = DispatchSemaphore(value: 0)
+    defer { readerGate.signal() }
+    let state = makeTestAppState(searchDimensionProbe: { _ in
+        _ = readerGate.wait(timeout: .now() + 10)
+        return CGSize(width: 40, height: 60)
+    })
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState {
+        state.activeAssets.count == 1 && state.searchStatus?.isSearching == false
+    })
+    let pending = try #require(state.activeAssets.first)
+    #expect(!pending.metadataLoaded && pending.width == 1 && pending.height == 1)
+    readerGate.signal()
+    #expect(await waitForLightboxState { state.activeAssets.first?.metadataLoaded == true })
+    #expect(state.activeAssets.first?.width == 40 && state.activeAssets.first?.height == 60)
+    state.galleryLayoutMode = .masonry
+}
+
+@MainActor
+@Test func cancelledDimensionReaderCannotOverwriteNewFolder() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxCancelReader-\(UUID())")
+    let first = root.appendingPathComponent("first/child")
+    let second = root.appendingPathComponent("second/child")
+    try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data([1]).write(to: first.appendingPathComponent("old.jpg"))
+    try Data([1]).write(to: second.appendingPathComponent("new.jpg"))
+    let readerStarted = DispatchSemaphore(value: 0)
+    let readerGate = DispatchSemaphore(value: 0)
+    defer { readerGate.signal() }
+    let state = makeTestAppState(searchDimensionProbe: { url in
+        if url.lastPathComponent == "old.jpg" {
+            readerStarted.signal()
+            _ = readerGate.wait(timeout: .now() + 10)
+        }
+        return CGSize(width: 40, height: 60)
+    })
+    let source = LibrarySource.favorites(rootURL: root.appendingPathComponent("first"))
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState { readerStarted.wait(timeout: .now()) == .success })
+    #expect(state.openFolderPath(root.appendingPathComponent("second").path))
+    #expect(await waitForLightboxState { state.activeAssets.map(\.originalName) == ["new.jpg"] })
+    readerGate.signal()
+    try await Task.sleep(for: .milliseconds(400))
+    #expect(state.activeAssets.map(\.originalName) == ["new.jpg"])
+    #expect(state.searchStatus?.isSearching == false)
+    state.galleryLayoutMode = .masonry
+}
+
+@MainActor
+@Test func recursiveSearchFiltersCompletedSnapshotAndRefreshFindsNewImages() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxSearchReuse-\(UUID())")
+    let child = root.appendingPathComponent("nested/folder-match")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    for name in ["alpha.jpg", "beta.jpg"] { try Data([1]).write(to: child.appendingPathComponent(name)) }
+    let state = makeTestAppState(searchDimensionProbe: { _ in CGSize(width: 20, height: 30) })
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState {
+        state.activeAssets.count == 2 && state.searchStatus?.isSearching == false
+    })
+    for term in ["alpha", "beta", "alpha", "missing"] {
+        state.searchText = term
+        #expect(state.searchStatus?.isSearching == false)
+        #expect(state.activeAssets.map(\.originalName) == (term == "missing" ? [] : ["\(term).jpg"]))
+    }
+    state.searchText = "folder-match"
+    #expect(state.activeFolderEntries.map(\.name) == ["folder-match"])
+    state.searchText = "missing"
+    #expect(state.activeFolderEntries.isEmpty)
+    state.searchText = ""
+    #expect(state.activeAssets.count == 2)
+    #expect(state.searchStatus?.discoveredCount == 2)
+    try Data([2]).write(to: child.appendingPathComponent("gamma.jpg"))
+    state.refreshLibrary(preservingVisibleSnapshot: true)
+    #expect(await waitForLightboxState {
+        state.activeAssets.count == 3 && state.searchStatus?.isSearching == false
+    })
+    state.searchText = "gamma"
+    #expect(state.activeAssets.map(\.originalName) == ["gamma.jpg"])
+    #expect(state.searchStatus?.isSearching == false)
+    state.galleryLayoutMode = .masonry
+}
+
+@MainActor
+@Test func recursiveSearchChangesKeepMetadataWorkAndTagsSurviveDecodeFailure() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxSearchMetadata-\(UUID())")
+    let child = root.appendingPathComponent("child")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let image = child.appendingPathComponent("tagged.jpg")
+    try Data([1]).write(to: image)
+    #expect(FinderTagStore.setColorTags(["Red"], for: image))
+    let gate = DispatchSemaphore(value: 0)
+    defer { gate.signal() }
+    let state = makeTestAppState(searchDimensionProbe: { _ in
+        _ = gate.wait(timeout: .now() + 10)
+        return nil
+    })
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState {
+        state.activeAssets.count == 1 && state.searchStatus?.isLoadingMetadata == true
+    })
+    state.searchText = "missing"
+    #expect(state.activeAssets.isEmpty && state.searchStatus?.isSearching == false)
+    state.searchText = "tagged"
+    #expect(state.activeAssets.count == 1 && state.searchStatus?.isSearching == false)
+    gate.signal()
+    #expect(await waitForLightboxState { state.searchStatus?.metadataProcessed == 1 })
+    #expect(state.searchStatus?.isLoadingMetadata == false)
+    #expect(state.activeAssets.first?.tags == ["Red"])
+    #expect(state.activeAssets.first?.metadataLoaded == false)
+    state.selectedFilter = .tag("Red")
+    #expect(state.activeAssets.count == 1)
+    state.galleryLayoutMode = .masonry
 }

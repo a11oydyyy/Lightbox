@@ -414,6 +414,66 @@ enum LocalImageSource {
         )
     }
 
+    /// Traverse a large library with bounded directory I/O. Each child is a structured
+    /// task, so cancellation reaches its existing per-entry checks; no worker survives
+    /// the scan. Image decoding and Finder xattrs remain outside enumeration.
+    static func scanRecursiveAssets(
+        in folder: URL,
+        sourceID: LibrarySource.ID,
+        rootURL: URL,
+        showsHiddenItems: Bool = false,
+        concurrentDirectoryLimit: Int = 4,
+        onProgress: (@Sendable (LightboxSearchScanResult) -> Void)? = nil
+    ) async -> LightboxSearchScanResult {
+        let startedAt = Date()
+        var result = LightboxSearchScanResult(assets: [], folders: [], visitedCount: 0, limitReached: false)
+        let progress = onProgress.map { RecursiveScanProgress(onProgress: $0) }
+        let concurrency = min(4, max(1, concurrentDirectoryLimit))
+
+        await withTaskGroup(of: LightboxSearchScanResult.self) { group in
+            var pending = [folder.standardizedFileURL]
+            var running = 0
+
+            func enqueue(_ directory: URL) {
+                group.addTask(priority: .utility) {
+                    let child = searchAssets(
+                        in: directory, sourceID: sourceID, rootURL: rootURL,
+                        query: .parse(""), recursive: false, showsHiddenItems: showsHiddenItems,
+                        skipsPackages: true, maxResults: .max, maxFolderResults: .max, maxVisited: .max,
+                        loadsFinderTags: false,
+                        onProgress: { progress?.update(directory: directory, snapshot: $0) }
+                    )
+                    progress?.update(directory: directory, snapshot: child)
+                    return child
+                }
+            }
+
+            while !Task.isCancelled {
+                while running < concurrency, let directory = pending.popLast() {
+                    enqueue(directory)
+                    running += 1
+                }
+                guard running > 0, let child = await group.next() else { break }
+                running -= 1
+                guard !Task.isCancelled else { break }
+                result.assets.append(contentsOf: child.assets)
+                result.folders.append(contentsOf: child.folders)
+                result.visitedCount += child.visitedCount
+                result.limitReached = result.limitReached || child.limitReached
+                // Descend promptly instead of visiting every top-level folder before
+                // reaching images in a deep tree. Keep the pending queue small too.
+                pending.append(contentsOf: child.folders.reversed().map(\.url))
+            }
+            group.cancelAll()
+        }
+
+        guard !Task.isCancelled else {
+            return LightboxSearchScanResult(assets: [], visitedCount: result.visitedCount, limitReached: true)
+        }
+        logger.info("recursive scan complete directories=\(result.folders.count) images=\(result.assets.count) visited=\(result.visitedCount) workers=\(concurrency) incomplete=\(result.limitReached) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+        return result
+    }
+
     static func searchAssets(
         in folder: URL,
         sourceID: LibrarySource.ID,
@@ -428,7 +488,9 @@ enum LocalImageSource {
         maxFolderResults: Int = 300,
         maxVisited: Int = 20_000,
         dimensionCache: RecursiveImageDimensionCache = .shared,
-        dimensionResolver: (URL) -> CGSize? = { ImageProbe.dimensions(for: $0) }
+        dimensionResolver: (URL) -> CGSize? = { ImageProbe.dimensions(for: $0) },
+        loadsFinderTags: Bool = true,
+        onProgress: ((LightboxSearchScanResult) -> Void)? = nil
     ) -> LightboxSearchScanResult {
         let startedAt = Date()
 
@@ -439,6 +501,22 @@ enum LocalImageSource {
         var visitedCount = 0
         var traversalLimitReached = false
         var resultLimitReached = false
+        var lastProgressAt: Date?
+        var publishedVisitedCount = 0
+
+        func publishProgressIfNeeded() {
+            guard let onProgress, !Task.isCancelled,
+                  visitedCount > publishedVisitedCount else { return }
+            let now = Date()
+            if let lastProgressAt, now.timeIntervalSince(lastProgressAt) < 0.5 { return }
+            if lastProgressAt == nil, assets.isEmpty, now.timeIntervalSince(startedAt) < 0.5 { return }
+            lastProgressAt = now
+            publishedVisitedCount = visitedCount
+            onProgress(LightboxSearchScanResult(
+                assets: assets, folders: folders,
+                visitedCount: visitedCount, limitReached: resultLimitReached
+            ))
+        }
 
         func directoryEntries(in folder: URL) -> [POSIXDirectoryEntry] {
             let result = searchDirectoryEntries(in: folder, showsHiddenItems: showsHiddenItems)
@@ -463,6 +541,7 @@ enum LocalImageSource {
             guard !Task.isCancelled else { return true }
             let url = entry.url
             visitedCount += 1
+            defer { publishProgressIfNeeded() }
             if visitedCount > maxVisited {
                 traversalLimitReached = true
                 resultLimitReached = true
@@ -478,6 +557,8 @@ enum LocalImageSource {
             let entryIsDirectory = knownIsDirectory ?? isDirectory(entry)
             if entryIsDirectory {
                 guard mayMatchFolder else { return false }
+                if !recursive, skipsPackages,
+                   (try? url.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true { return false }
                 let folder = LibraryFolderEntry(
                     sourceID: sourceID,
                     url: url.standardizedFileURL,
@@ -500,7 +581,9 @@ enum LocalImageSource {
                 guard kind?.isSymbolicLink != true, kind?.isRegularFile == true else { return false }
             }
 
-            let fallbackSize = MockLibrary.importFallbackSizes[assets.count % MockLibrary.importFallbackSizes.count]
+            let fallbackSize = (recursive || !loadsFinderTags) && !probeDimensions
+                ? pendingMetadataSize
+                : MockLibrary.importFallbackSizes[assets.count % MockLibrary.importFallbackSizes.count]
             let dimensions = probeDimensions ? autoreleasepool {
                 recursive
                     ? dimensionCache.dimensions(for: url, resolver: dimensionResolver)
@@ -514,7 +597,9 @@ enum LocalImageSource {
                 .fileSizeKey
             ])
             guard !Task.isCancelled else { return true }
-            let tags = FinderTagStore.colorTags(for: url)
+            // Extended attributes cost a separate SMB round trip per image. Recursive
+            // browsing can load them with dimensions after the list is available.
+            let tags = loadsFinderTags ? FinderTagStore.colorTags(for: url) : []
             guard !Task.isCancelled else { return true }
             let asset = LightboxAsset(
                 originalName: url.lastPathComponent,
@@ -530,6 +615,7 @@ enum LocalImageSource {
             )
 
             assets.append(asset)
+            publishProgressIfNeeded()
             if assets.count >= maxResults {
                 traversalLimitReached = true
                 resultLimitReached = true

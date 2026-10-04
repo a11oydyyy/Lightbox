@@ -9,7 +9,10 @@ enum LightboxLibraryStore {
     static var cacheFolder: URL {
         FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Lightbox", isDirectory: true)
+            .appendingPathComponent(
+                Bundle.main.bundleIdentifier == "io.github.a11oydyyy.Lightbox.local" ? "LightboxLocal" : "Lightbox",
+                isDirectory: true
+            )
     }
 
     static var primarySystemTrashFolder: URL {

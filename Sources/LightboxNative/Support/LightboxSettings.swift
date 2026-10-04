@@ -333,6 +333,27 @@ enum LightboxSettingsStore {
 }
 
 enum LightboxLocalization {
+    static func searchProgress(_ status: LightboxSearchStatus, recursive: Bool, language: LightboxLanguage) -> String {
+        let found = status.discoveredCount.formatted(.number.locale(language.locale))
+        let visited = status.visitedCount.formatted(.number.locale(language.locale))
+        let progress = "\(status.metadataProcessed.formatted(.number.locale(language.locale))) / \(status.metadataTotal.formatted(.number.locale(language.locale)))"
+        if !status.isSearching {
+            switch language.resolved {
+            case .english: return "Loading image details… \(progress)"
+            case .simplifiedChinese: return "正在载入图片信息… \(progress)"
+            case .traditionalChinese: return "正在載入圖片資訊… \(progress)"
+            case .japanese: return "画像情報を読み込み中… \(progress)"
+            }
+        }
+        let title = text(recursive ? .scanningSubfolders : .searchingImages, language: language)
+        switch language.resolved {
+        case .english: return "\(title) \(found) images · \(visited) items scanned"
+        case .simplifiedChinese: return "\(title) 已找到 \(found) 张 · 已扫描 \(visited) 项"
+        case .traditionalChinese: return "\(title) 已找到 \(found) 張 · 已掃描 \(visited) 項"
+        case .japanese: return "\(title) \(found) 枚 · \(visited) 項目"
+        }
+    }
+
     static func text(_ key: LightboxTextKey, language: LightboxLanguage) -> String {
         switch language.resolved {
         case .english:

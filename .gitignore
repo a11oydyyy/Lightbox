@@ -23,3 +23,7 @@ DerivedData/
 /README-CLEAN.md
 /Sources/LightboxClean/
 /script/build_clean_and_run.sh
+
+# Local NAS validation may contain private paths and gallery screenshots.
+/validation/
+/LOCAL_BUILD.md

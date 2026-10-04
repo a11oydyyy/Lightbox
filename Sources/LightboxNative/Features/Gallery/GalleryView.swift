@@ -365,6 +365,7 @@ struct GalleryView: View {
         !appState.isViewingTrash
             && appState.libraryLoadingStatus == nil
             && appState.searchStatus?.isSearching != true
+            && !(appState.searchStatus?.isLoadingMetadata == true && appState.selectedFilter != .all)
             && appState.activeAssets.isEmpty
             && visibleFolderEntries.isEmpty
     }
@@ -621,7 +622,7 @@ struct GalleryView: View {
                         .allowsHitTesting(false)
                 }
 
-                if let status = appState.libraryLoadingStatus {
+                if let status = appState.libraryLoadingStatus, !appState.includesSubfolders {
                     GalleryLoadingIndicator(label: appState.loadingStatusText(status))
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                         .padding(.top, 58)
@@ -653,12 +654,20 @@ struct GalleryView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
                 }
 
-                if appState.searchStatus?.isSearching == true {
-                    ProgressView(appState.localized(appState.includesSubfolders ? .scanningSubfolders : .searchingImages))
+                if let status = appState.searchStatus, status.isSearching || status.isLoadingMetadata {
+                    ProgressView(LightboxLocalization.searchProgress(
+                        status, recursive: appState.includesSubfolders, language: appState.appLanguage
+                    ))
                         .progressViewStyle(.circular)
-                        .controlSize(.regular)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                        .controlSize(.small)
+                        .font(.caption)
+                        .monospacedDigit()
+                        .padding(10)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity,
+                               alignment: activeAssets.isEmpty ? .center : .topTrailing)
                         .padding(.top, 58)
+                        .padding(.trailing, activeAssets.isEmpty ? 0 : 20)
                         .transition(.opacity)
                         .allowsHitTesting(false)
                 }
