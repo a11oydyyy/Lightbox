@@ -1,6 +1,6 @@
 # NAS 大图库浏览优化
 
-基于 Lightbox 2.0.6，提供独立的 `2.0.6-local.2` 试用应用。
+随 Lightbox 2.0.7 发布，更新现有 Lightbox 应用。
 
 ## 浏览体验
 
@@ -16,10 +16,11 @@
 ## 本地构建
 
 ```sh
-./script/build_local.sh
+./script/build_and_run.sh package
+./script/build_and_run.sh package13
 ```
 
-产物为 `dist/Lightbox Local.app`，使用独立的应用标识、设置和缓存。脚本不替换已安装的正式版。可用 `LIGHTBOX_BUILD_SDK` 指定 SDK；本机没有脚本优先选择的 macOS 26.5 SDK 时使用当前 Xcode/命令行工具 SDK。
+产物为 `dist/Lightbox-v2.0.7.zip` 和 `dist/Lightbox-Intel-x86-v2.0.7.zip`。打包命令不替换已安装的应用；安装时覆盖原有 Lightbox，保留原有应用标识、设置和缓存。可用 `LIGHTBOX_BUILD_SDK` 指定 SDK，未指定时使用当前 Xcode/命令行工具 SDK。
 
 本地构建为 ad-hoc 签名，未经过 Apple 公证。
 
