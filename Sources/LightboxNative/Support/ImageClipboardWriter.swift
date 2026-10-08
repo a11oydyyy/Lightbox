@@ -8,17 +8,18 @@ enum ImageClipboardWriter {
     }
 
     static func copyImages(at urls: [URL]) {
-        let existingURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
-        guard !existingURLs.isEmpty else { return }
+        // The menu action validates URLs off the main actor. Writing file
+        // references must not repeat synchronous disk checks on the UI thread.
+        guard !urls.isEmpty else { return }
 
-        if existingURLs.count == 1,
-           let url = existingURLs.first {
+        if urls.count == 1,
+           let url = urls.first {
             copyImage(at: url)
             return
         }
 
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.writeObjects(existingURLs.map { $0 as NSURL })
+        pasteboard.writeObjects(urls.map { $0 as NSURL })
     }
 }

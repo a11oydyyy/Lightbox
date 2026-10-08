@@ -15,6 +15,16 @@ private struct RecursiveSearchScope: Equatable {
     var showsHiddenItems: Bool
 }
 
+private struct SourceStorageClassification: Equatable {
+    var source: LibrarySource
+    var conservative: Bool
+}
+
+private struct LibraryMonitorContext: Equatable {
+    var folderURL: URL
+    var recursive: Bool
+}
+
 private struct TabContentSnapshot {
     var tab: LightboxTab
     var showsHiddenItems: Bool
@@ -62,6 +72,7 @@ struct AssetMetadataRefreshPolicy: Equatable {
 
     var usesConservativeExternalLoading: Bool
     var requiresCompleteAssetTags = false
+    var isLocalVolume = false
 
     func dimensionLimit(assetCount: Int) -> Int {
         assetCount
@@ -75,7 +86,8 @@ struct AssetMetadataRefreshPolicy: Equatable {
     }
 
     var startDelayMilliseconds: Int {
-        usesConservativeExternalLoading ? Self.externalStartDelayMilliseconds : Self.localStartDelayMilliseconds
+        if isLocalVolume { return 100 }
+        return usesConservativeExternalLoading ? Self.externalStartDelayMilliseconds : Self.localStartDelayMilliseconds
     }
 }
 
@@ -121,6 +133,7 @@ final class AppState: ObservableObject {
         }
     }
     @Published private(set) var sidebarLocations: [SidebarLocationID] = []
+    @Published private(set) var sidebarLocationDirectories: [SidebarLocationID: SidebarDirectoryIdentity] = [:]
     @Published private(set) var sidebarVolumes: [SidebarVolume] = []
     @Published var showFolderCards = LightboxSettingsStore.defaultShowFolderCards {
         didSet {
@@ -173,9 +186,10 @@ final class AppState: ObservableObject {
             captureActiveTabState()
         }
     }
+    @Published var isScalingThumbnails = false
     @Published var assets: [LightboxAsset] = [] {
         didSet {
-            guard !isApplyingTabState else { return }
+            guard !isApplyingTabState, !isApplyingSearchMetadata else { return }
             rebuildLibraryColorTags()
             rebuildActiveAssets()
         }
@@ -190,6 +204,7 @@ final class AppState: ObservableObject {
         didSet {
             guard currentFolderURL.standardizedFileURL != oldValue.standardizedFileURL,
                   !isApplyingTabState else { return }
+            cancelPendingFolderPath()
             restoreFolderSort()
         }
     }
@@ -272,7 +287,9 @@ final class AppState: ObservableObject {
     private var previewSourceRevealTask: Task<Void, Never>?
     private var previewDimensionTask: Task<Void, Never>?
     private var previewDimensionRequestID: UUID?
+    private var previewKeyboardFocusSessionID: UUID?
     private var trashMoveTask: Task<Void, Never>?
+    private var trashMovingAssetIDs: Set<LightboxAsset.ID> = []
     private var queuedTrashAssets: [LightboxAsset] = []
     private var tagMutationTask: Task<Void, Never>?
     private var queuedTagMutations: [TagMutationRequest] = []
@@ -282,23 +299,41 @@ final class AppState: ObservableObject {
     private var indexWriteTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var searchGeneration = 0
+    private var isApplyingSearchMetadata = false
     private var recursiveSearchScope: RecursiveSearchScope?
     private var tabPersistenceTask: Task<Void, Never>?
     private var fileTransferTask: Task<Void, Never>?
     private var fileTransferDismissTask: Task<Void, Never>?
     private var tabDragHoverTask: Task<Void, Never>?
     private var sharingPicker: NSSharingServicePicker?
+    private var fileActionTask: Task<Void, Never>?
+    private var folderPathTask: Task<FolderPathOpenResult, Never>?
+    private var folderPathRequestID: UUID?
+    private var pendingPinTasks: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+    private var sidebarDestinationTask: Task<Void, Never>?
     private var refreshSerial = 0
     private var libraryDirectoryMonitor: DirectoryChangeMonitor?
+    private var libraryMonitorContext: LibraryMonitorContext?
+    @Published private var sourceStorageClassification: SourceStorageClassification?
     private let trashDirectoryMonitor: DirectoryChangeMonitor
     private let indexDatabaseURL: URL
-    private let indexStore: LightboxIndexStore
+    private let sourceIndexWriter: SourceIndexWriter
+    let sidebarNavigation: SidebarNavigationState
     private let libraryDefaults: UserDefaults
     private var selectionAnchorID: LightboxAsset.ID?
     @Published private var cachedActiveAssets: [LightboxAsset] = []
     private var cachedActiveAssetIDs: Set<LightboxAsset.ID> = []
     private var cachedActiveAssetIDList: [LightboxAsset.ID] = []
     private var cachedSearchAssetGroups: [SearchAssetGroup] = []
+    private var groupFolderIdentities: [URL: (path: String, title: String)] = [:]
+    private var groupFolderSources: [LibrarySource] = []
+    private var groupFolderScope: URL?
+    private var sortedUnfilteredSnapshot: (
+        source: [LightboxAsset], field: GallerySortField, direction: GallerySortDirection,
+        locale: String, assets: [LightboxAsset]
+    )?
+
+
     private(set) var activeAssetsRevision = 0
     @Published private var cachedActiveFolderEntries: [LibraryFolderEntry] = []
     @Published private var cachedLibraryColorTags: [MacColorTag] = []
@@ -327,6 +362,10 @@ final class AppState: ObservableObject {
     private var sidebarVolumeObserverTokens: [SidebarVolumeObserverToken] = []
     private let previewDimensionProbe: @Sendable (URL) -> CGSize?
     private let searchDimensionProbe: @Sendable (URL) -> CGSize?
+    private let directoryProbe: @Sendable (URL) -> Bool
+    private let storageClassifier: @Sendable (LibrarySource) -> Bool
+    private let directoryMonitorFactory: @Sendable (URL, Bool) -> DirectoryChangeMonitor
+    private let sidebarDestinationLoader: @Sendable (Set<SidebarLocationID>) -> SidebarDestinationSnapshot
     private let systemTrashMover: @Sendable (URL) -> Bool
     private let finderTagWriter: @Sendable ([String], URL) -> Bool
     private let compareTrayAssetLoader: @Sendable (URL, CGSize, MockPalette) -> LightboxAsset
@@ -343,6 +382,14 @@ final class AppState: ObservableObject {
         },
         searchDimensionProbe: @escaping @Sendable (URL) -> CGSize? = {
             ImageProbe.dimensions(for: $0)
+        },
+        directoryProbe: @escaping @Sendable (URL) -> Bool = DirectoryAccessResolver.isDirectory,
+        storageClassifier: @escaping @Sendable (LibrarySource) -> Bool = { $0.usesConservativeExternalLoading },
+        directoryMonitorFactory: @escaping @Sendable (URL, Bool) -> DirectoryChangeMonitor = {
+            DirectoryChangeMonitor(url: $0, recursive: $1)
+        },
+        sidebarDestinationLoader: @escaping @Sendable (Set<SidebarLocationID>) -> SidebarDestinationSnapshot = {
+            SidebarDestinationSnapshot.load(visibleLocationIDs: $0)
         },
         systemTrashMover: @escaping @Sendable (URL) -> Bool = {
             LightboxLibraryStore.moveToSystemTrash($0)
@@ -373,10 +420,15 @@ final class AppState: ObservableObject {
         }
     ) {
         self.indexDatabaseURL = indexDatabaseURL
-        indexStore = LightboxIndexStore(databaseURL: indexDatabaseURL)
+        sourceIndexWriter = SourceIndexWriter(databaseURL: indexDatabaseURL)
         self.libraryDefaults = libraryDefaults
+        self.sidebarNavigation = SidebarNavigationState(defaults: libraryDefaults)
         self.previewDimensionProbe = previewDimensionProbe
         self.searchDimensionProbe = searchDimensionProbe
+        self.directoryProbe = directoryProbe
+        self.storageClassifier = storageClassifier
+        self.directoryMonitorFactory = directoryMonitorFactory
+        self.sidebarDestinationLoader = sidebarDestinationLoader
         self.systemTrashMover = systemTrashMover
         self.finderTagWriter = finderTagWriter
         self.compareTrayAssetLoader = compareTrayAssetLoader
@@ -445,6 +497,8 @@ final class AppState: ObservableObject {
         }
 
         let activeInitialTab = initialTabs.first(where: { $0.id == initialActiveTabID }) ?? initialTabs[0]
+        // Restore the whole tab before observers start searches or monitors.
+        isApplyingTabState = true
         recentFolderURLs = (libraryDefaults.stringArray(forKey: "Lightbox.recentFolders") ?? []).map { URL(fileURLWithPath: $0, isDirectory: true) }
         sources = loadedSources
         if loadedSources.contains(where: { sourceMatches($0, resolvedSource) }) {
@@ -466,6 +520,7 @@ final class AppState: ObservableObject {
         currentScrollAnchorAssetID = activeInitialTab.scrollAnchorAssetID
         preservesUnavailableCurrentFolder = activeInitialTab.preservesUnavailableFolder
         scrollRestoreGeneration = 1
+        isApplyingTabState = false
         LibrarySourceStore.saveSelectedSourceID(resolvedSource.id, defaults: libraryDefaults)
         saveCurrentFolderSession()
         persistTabsImmediately()
@@ -494,6 +549,10 @@ final class AppState: ObservableObject {
         searchTask?.cancel()
         tabPersistenceTask?.cancel()
         fileTransferTask?.cancel()
+        fileActionTask?.cancel()
+        folderPathTask?.cancel()
+        sidebarDestinationTask?.cancel()
+        for pending in pendingPinTasks.values { pending.task.cancel() }
         fileTransferDismissTask?.cancel()
         tabDragHoverTask?.cancel()
         compareTrayPulseTask?.cancel()
@@ -681,6 +740,24 @@ final class AppState: ObservableObject {
         } else {
             persistTabsImmediately()
         }
+    }
+
+    func reorderTabs(_ ids: [UUID], before target: UUID?) {
+        let next = SidebarOrder.moving(ids, before: target, in: tabs)
+        // Pinned tabs remain a leading group, including when dropped at the end.
+        let grouped = next.filter(\.isPinned) + next.filter { !$0.isPinned }
+        guard grouped.map(\.id) != tabs.map(\.id) else { return }
+        tabs = grouped
+        persistTabsImmediately()
+    }
+
+    var isRefreshingGallery: Bool {
+        libraryLoadingStatus != nil || searchStatus?.isSearching == true
+    }
+
+    func refreshGalleryFromGesture() {
+        guard !isShowingStartPage, !hasActiveOverlay, !isRefreshingGallery else { return }
+        refreshLibrary(preservingVisibleSnapshot: true)
     }
 
     func beginTabDrag(_ tabID: UUID) {
@@ -1007,8 +1084,8 @@ final class AppState: ObservableObject {
     }
 
     func openFolderInNewTab(_ folder: LibraryFolderEntry) {
+        cancelPendingFolderPath()
         let standardizedURL = folder.url.standardizedFileURL
-        guard isExistingDirectory(standardizedURL) else { return }
         let source = sources.first { $0.id == folder.sourceID }
             ?? (selectedSource?.id == folder.sourceID ? selectedSource : nil)
             ?? bestSource(containing: standardizedURL)
@@ -1017,11 +1094,11 @@ final class AppState: ObservableObject {
     }
 
     func openSidebarFolderInNewTab(_ url: URL) {
+        cancelPendingFolderPath()
         let standardizedURL = url.standardizedFileURL
-        guard isExistingDirectory(standardizedURL) else { return }
         let source = bestSource(containing: standardizedURL)
             ?? LibrarySourceStore.makeExternalSource(rootURL: standardizedURL)
-        indexStore.upsertSource(source)
+        sourceIndexWriter.upsertSource(source)
         insertAndActivateTab(source: source, folderURL: standardizedURL, filter: .all)
     }
 
@@ -1060,6 +1137,7 @@ final class AppState: ObservableObject {
 
     private func applyTab(at index: Int) {
         guard tabs.indices.contains(index) else { return }
+        cancelPendingFolderPath()
         let startedAt = Date()
         let tab = tabs[index]
         let resolvedSource = sources.first { sourceMatches($0, tab.source) } ?? tab.source
@@ -1186,19 +1264,22 @@ final class AppState: ObservableObject {
             return
         }
 
-        tabs[index].source = source
-        tabs[index].folderURL = currentFolderURL.standardizedFileURL
-        tabs[index].searchText = searchText
-        tabs[index].filter = selectedFilter
-        tabs[index].sortField = sortField
-        tabs[index].sortDirection = sortDirection
-        tabs[index].layoutMode = galleryLayoutMode
-        tabs[index].thumbnailWidth = thumbnailWidth
-        tabs[index].selectedAssetIDs = selectedAssetIDs
-        tabs[index].selectedAssetID = selectedAssetID
-        tabs[index].scrollAnchorAssetID = currentScrollAnchorAssetID
-        tabs[index].trashAccessDenied = trashAccessDenied
-        tabs[index].preservesUnavailableFolder = preservesUnavailableCurrentFolder
+        var snapshot = tabs[index]
+        snapshot.source = source
+        snapshot.folderURL = currentFolderURL.standardizedFileURL
+        snapshot.searchText = searchText
+        snapshot.filter = selectedFilter
+        snapshot.sortField = sortField
+        snapshot.sortDirection = sortDirection
+        snapshot.layoutMode = galleryLayoutMode
+        snapshot.thumbnailWidth = thumbnailWidth
+        snapshot.selectedAssetIDs = selectedAssetIDs
+        snapshot.selectedAssetID = selectedAssetID
+        snapshot.scrollAnchorAssetID = currentScrollAnchorAssetID
+        snapshot.trashAccessDenied = trashAccessDenied
+        snapshot.preservesUnavailableFolder = preservesUnavailableCurrentFolder
+        guard snapshot != tabs[index] else { return }
+        tabs[index] = snapshot
         scheduleTabPersistence()
     }
 
@@ -1230,9 +1311,11 @@ final class AppState: ObservableObject {
     }
 
     private func performHistoryNavigation(to destination: LightboxTabLocation) {
+        cancelPendingFolderPath()
         closeOverlaysForTabSwitch()
         isPerformingHistoryNavigation = true
         isApplyingTabState = true
+        clearContentForFolderNavigation()
 
         if let index = activeTabIndex { tabs[index].isStartPage = destination.isStartPage }
         selectedGalleryFolderID = nil
@@ -1253,6 +1336,7 @@ final class AppState: ObservableObject {
         currentScrollAnchorAssetID = nil
         preservesUnavailableCurrentFolder = true
         isApplyingTabState = false
+        rebuildLibraryColorTags()
         rebuildActiveAssets()
         rebuildActiveFolderEntries()
         scrollRestoreGeneration += 1
@@ -1349,12 +1433,6 @@ final class AppState: ObservableObject {
         LightboxTabStore.save(tabs: snapshot, activeTabID: activeTabID, defaults: libraryDefaults)
     }
 
-    private func isExistingDirectory(_ url: URL) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.standardizedFileURL.path, isDirectory: &isDirectory)
-            && isDirectory.boolValue
-    }
-
     var activeAssets: [LightboxAsset] {
         cachedActiveAssets
     }
@@ -1384,20 +1462,42 @@ final class AppState: ObservableObject {
     private func makeSearchAssetGroups(for activeAssets: [LightboxAsset]) -> [SearchAssetGroup] {
         var grouped: [(path: String, title: String, assets: [LightboxAsset])] = []
         var indexByPath: [String: Int] = [:]
+        let fallbackFolder = currentFolderURL
+        let sourceContext = sources + [temporarySource].compactMap { $0 }
+        if groupFolderSources != sourceContext || groupFolderScope != fallbackFolder {
+            groupFolderIdentities.removeAll(keepingCapacity: true)
+            groupFolderSources = sourceContext
+            groupFolderScope = fallbackFolder
+        }
+        let sourceRoots = sourceContext.map { (source: $0, path: $0.rootURL.standardizedFileURL.path) }
+        var lastParent: URL?
+        var lastIdentity: (path: String, title: String)?
         for asset in activeAssets {
-            let folderURL = asset.sourceURL?.deletingLastPathComponent().standardizedFileURL ?? currentFolderURL
-            let path = folderURL.path
-            if let index = indexByPath[path] {
+            let parent = asset.sourceURL?.deletingLastPathComponent() ?? fallbackFolder
+            let identity: (path: String, title: String)
+            if parent == lastParent, let lastIdentity {
+                identity = lastIdentity
+            } else if let cached = groupFolderIdentities[parent] {
+                identity = cached
+            } else {
+                let folder = parent.standardizedFileURL
+                let path = folder.path
+                identity = (path, searchGroupTitle(for: folder, path: path, sourceRoots: sourceRoots))
+                // Keep identity metadata through empty filters, but do not retain
+                // every directory ever visited in a long-lived application.
+                if groupFolderIdentities.count >= 8_192 { groupFolderIdentities.removeAll(keepingCapacity: true) }
+                groupFolderIdentities[parent] = identity
+            }
+            lastParent = parent
+            lastIdentity = identity
+            if let index = indexByPath[identity.path] {
                 grouped[index].assets.append(asset)
             } else {
-                indexByPath[path] = grouped.count
-                grouped.append((path, searchGroupTitle(for: folderURL), [asset]))
+                indexByPath[identity.path] = grouped.count
+                grouped.append((identity.path, identity.title, [asset]))
             }
         }
-
-        return grouped.map {
-            SearchAssetGroup(id: $0.path, title: $0.title, assets: $0.assets)
-        }
+        return grouped.map { SearchAssetGroup(id: $0.path, title: $0.title, assets: $0.assets) }
     }
 
     func focusSearch() {
@@ -1411,7 +1511,11 @@ final class AppState: ObservableObject {
         goToFolderFocusGeneration += 1
     }
 
-    nonisolated static func resolvedFolderURL(from rawPath: String, relativeTo baseURL: URL) -> URL? {
+    nonisolated static func resolvedFolderURL(
+        from rawPath: String,
+        relativeTo baseURL: URL,
+        directoryProbe: @escaping @Sendable (URL) -> Bool = DirectoryAccessResolver.isDirectory
+    ) async -> URL? {
         let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPath.isEmpty else { return nil }
 
@@ -1430,38 +1534,53 @@ final class AppState: ObservableObject {
         }
 
         let standardizedURL = candidateURL.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
+        guard (try? await DirectoryAccessResolver.existingDirectory(standardizedURL, probe: directoryProbe)) == true else {
             return nil
         }
         return standardizedURL
     }
 
     @discardableResult
-    func openFolderPath(_ rawPath: String) -> Bool {
-        guard let folderURL = Self.resolvedFolderURL(from: rawPath, relativeTo: currentFolderURL) else {
-            return false
+    func openFolderPath(_ rawPath: String) async -> FolderPathOpenResult {
+        cancelPendingFolderPath()
+        let requestID = UUID()
+        folderPathRequestID = requestID
+        let tabID = activeTabID
+        let baseURL = currentFolderURL
+        let sourceID = selectedSourceID
+        let probe = directoryProbe
+        let task = Task<FolderPathOpenResult, Never> { @MainActor [weak self] in
+            let folderURL = await Self.resolvedFolderURL(from: rawPath, relativeTo: baseURL, directoryProbe: probe)
+            guard let self, !Task.isCancelled, self.folderPathRequestID == requestID,
+                  self.activeTabID == tabID, self.currentFolderURL == baseURL,
+                  self.selectedSourceID == sourceID else { return .cancelled }
+            self.folderPathRequestID = nil
+            self.folderPathTask = nil
+            guard let folderURL else { return .unavailable }
+            let source = self.bestSource(containing: folderURL)
+                ?? LibrarySourceStore.makeExternalSource(rootURL: folderURL)
+            self.sourceIndexWriter.upsertSource(source)
+            self.activateSource(source, initialFolderURL: folderURL)
+            return .opened
         }
-
-        let source = bestSource(containing: folderURL)
-            ?? LibrarySourceStore.makeExternalSource(rootURL: folderURL)
-        indexStore.upsertSource(source)
-        activateSource(source, initialFolderURL: folderURL)
-        return true
+        folderPathTask = task
+        return await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
     }
 
-    private func searchGroupTitle(for folderURL: URL) -> String {
-        if let source = bestSource(containing: folderURL) {
-            let relativePath = folderURL.relativePath(from: source.rootURL)
-            if relativePath.isEmpty {
-                return source.displayName
-            }
-            return relativePath
-        }
+    func cancelPendingFolderPath() {
+        folderPathRequestID = nil
+        folderPathTask?.cancel()
+        folderPathTask = nil
+    }
 
-        return folderURL.lastPathComponent.isEmpty ? folderURL.path : folderURL.lastPathComponent
+    private func searchGroupTitle(
+        for folderURL: URL, path: String, sourceRoots: [(source: LibrarySource, path: String)]
+    ) -> String {
+        if let root = sourceRoots.filter({ path == $0.path || path.hasPrefix($0.path + "/") })
+            .max(by: { $0.path.count < $1.path.count }) {
+            return path == root.path ? root.source.displayName : String(path.dropFirst(root.path.count + 1))
+        }
+        return folderURL.lastPathComponent.isEmpty ? path : folderURL.lastPathComponent
     }
 
     var selectedSource: LibrarySource? {
@@ -1470,6 +1589,12 @@ final class AppState: ObservableObject {
         }
 
         return sources.first { $0.id == selectedSourceID }
+    }
+
+    var selectedSourceUsesConservativeExternalLoading: Bool {
+        guard let source = selectedSource, !source.isLocalLibrary else { return false }
+        guard sourceStorageClassification?.source == source else { return true }
+        return sourceStorageClassification?.conservative ?? true
     }
 
     var sourceMenuSources: [LibrarySource] {
@@ -1487,8 +1612,17 @@ final class AppState: ObservableObject {
     }
 
     private func refreshSidebarDestinations() {
-        sidebarLocations = Self.makeSidebarLocations(visibleLocationIDs: sidebarVisibleLocationIDs)
-        sidebarVolumes = Self.makeSidebarVolumes(visibleLocationIDs: sidebarVisibleLocationIDs)
+        sidebarDestinationTask?.cancel()
+        let visibleIDs = sidebarVisibleLocationIDs
+        let loader = sidebarDestinationLoader
+        let worker = Task.detached(priority: .utility) { loader(visibleIDs) }
+        sidebarDestinationTask = Task { @MainActor [weak self] in
+            let snapshot = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            guard let self, !Task.isCancelled, self.sidebarVisibleLocationIDs == visibleIDs else { return }
+            self.sidebarLocationDirectories = snapshot.locationDirectories
+            self.sidebarLocations = snapshot.locations
+            self.sidebarVolumes = snapshot.volumes
+        }
     }
 
     private func startSidebarVolumeMonitoring() {
@@ -1500,33 +1634,6 @@ final class AppState: ObservableObject {
                 }
             }
             sidebarVolumeObserverTokens.append(SidebarVolumeObserverToken(value: token))
-        }
-    }
-
-    private static func makeSidebarLocations(visibleLocationIDs: Set<SidebarLocationID>) -> [SidebarLocationID] {
-        SidebarLocationID.allCases.filter { location in
-            visibleLocationIDs.contains(location) && location.defaultURL.map { FileManager.default.fileExists(atPath: $0.path) } == true
-        }
-    }
-
-    private static func makeSidebarVolumes(visibleLocationIDs: Set<SidebarLocationID>) -> [SidebarVolume] {
-        guard visibleLocationIDs.contains(.volumes) else { return [] }
-        let keys: [URLResourceKey] = [.volumeNameKey, .isVolumeKey]
-        let urls = FileManager.default.mountedVolumeURLs(
-            includingResourceValuesForKeys: keys,
-            options: [.skipHiddenVolumes]
-        ) ?? []
-
-        return urls.compactMap { url in
-            let standardizedURL = url.standardizedFileURL
-            guard standardizedURL.path != "/" else { return nil }
-            let name = (try? standardizedURL.resourceValues(forKeys: [.volumeNameKey]).volumeName)
-                ?? standardizedURL.lastPathComponent
-            guard !name.isEmpty else { return nil }
-            return SidebarVolume(url: standardizedURL, displayName: name)
-        }
-        .sorted { lhs, rhs in
-            lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
         }
     }
 
@@ -1542,6 +1649,17 @@ final class AppState: ObservableObject {
         }
 
         return currentFolderFilterTitle
+    }
+
+    var navigationActivityText: String? {
+        guard !isShowingStartPage else { return nil }
+        if let status = searchStatus, status.isSearching || status.isLoadingMetadata {
+            return LightboxLocalization.searchProgress(status, recursive: includesSubfolders, language: appLanguage)
+        }
+        if let status = libraryLoadingStatus {
+            return loadingStatusText(status)
+        }
+        return nil
     }
 
     var currentFolderFilterTitle: String {
@@ -1605,13 +1723,6 @@ final class AppState: ObservableObject {
         guard !isShowingStartPage else { return false }
         guard !isViewingTrash else { return false }
         let currentPath = currentFolderURL.standardizedFileURL.path
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: currentPath, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            return false
-        }
-
         return !sources.contains {
             $0.rootURL.standardizedFileURL.path == currentPath
         }
@@ -1623,7 +1734,8 @@ final class AppState: ObservableObject {
     }
 
     private func volumeTitle() -> String {
-        let volumeName = (try? currentFolderURL.resourceValues(forKeys: [.volumeNameKey]).volumeName) ?? ""
+        let root = URL(fileURLWithPath: "/", isDirectory: true)
+        let volumeName = (try? root.resourceValues(forKeys: [.volumeNameKey]).volumeName) ?? ""
         if !volumeName.isEmpty {
             return volumeName
         }
@@ -1684,6 +1796,11 @@ final class AppState: ObservableObject {
 
     var isPreviewClosing: Bool {
         previewPhase == .closing
+    }
+
+    var isOverlayChromeVisible: Bool {
+        // Return chrome with the gallery veil, independently of image landing.
+        !isComparing && (previewAssetID == nil || isPreviewClosing)
     }
 
     var needsPreviewRootClickCatcher: Bool {
@@ -1926,6 +2043,24 @@ final class AppState: ObservableObject {
         _ = beginInteractivePreviewClose(after: .milliseconds(60), revealSourceAfter: .milliseconds(0))
     }
 
+    func markPreviewKeyboardFocusAcquired(sessionID: UUID) {
+        guard sessionID == previewSessionID,
+              previewPhase == .opening || previewPhase == .open else { return }
+        previewKeyboardFocusSessionID = sessionID
+    }
+
+    func handlePreviewArrowDuringKeyboardHandoff(_ key: UInt16) -> Bool {
+        guard previewKeyboardFocusSessionID != previewSessionID,
+              previewAssetID != nil, !isComparing,
+              previewPhase == .opening || previewPhase == .open else { return false }
+        switch key {
+        case 123: stepPreview(.previous)
+        case 124: stepPreview(.next)
+        default: return false
+        }
+        return true
+    }
+
     func handleGalleryKey(_ key: UInt16, modifiers: NSEvent.ModifierFlags, from id: LightboxAsset.ID) {
         guard !hasActiveOverlay, let current = activeAssets.firstIndex(where: { $0.id == id }) else { return }
         if key == 53 { clearSelection(); return }
@@ -1984,14 +2119,8 @@ final class AppState: ObservableObject {
     }
 
     func openSidebarFolder(_ url: URL) {
+        cancelPendingFolderPath()
         let standardizedURL = url.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            Self.logger.error("sidebar folder open rejected missing-or-not-directory path=\(standardizedURL.path, privacy: .public)")
-            return
-        }
 
         if let source = bestSource(containing: standardizedURL) {
             let pinnedSource = sources.first { sourceMatches($0, source) }
@@ -2007,6 +2136,7 @@ final class AppState: ObservableObject {
     }
 
     func openTrashFromSidebar() {
+        cancelPendingFolderPath()
         if let source = selectedSource {
             recordNavigation(to: source, folderURL: currentFolderURL, filter: .trash)
         }
@@ -2019,14 +2149,17 @@ final class AppState: ObservableObject {
     }
 
     private func chooseTemporarySource(_ source: LibrarySource) {
-        indexStore.upsertSource(source)
+        sourceIndexWriter.upsertSource(source)
         activateSource(source)
     }
 
     private func activateSource(_ source: LibrarySource, initialFolderURL: URL? = nil) {
+        cancelPendingFolderPath()
         cancelPreviewDimensionResolution(clearPendingStep: true)
         let destinationFolderURL = initialFolderURL?.standardizedFileURL ?? source.rootURL
         recordNavigation(to: source, folderURL: destinationFolderURL, filter: .all)
+        isApplyingTabState = true
+        clearContentForFolderNavigation()
         if let index = activeTabIndex { tabs[index].isStartPage = false }
         temporarySource = sources.contains(where: { sourceMatches($0, source) }) ? nil : source
         let previousSourceID = selectedSourceID
@@ -2034,11 +2167,14 @@ final class AppState: ObservableObject {
         LibrarySourceStore.saveSelectedSourceID(source.id, defaults: libraryDefaults)
         selectedFilter = .all
         currentFolderURL = destinationFolderURL
+        restoreFolderSort()
         preservesUnavailableCurrentFolder = false
         resetScrollForNavigation()
+        isApplyingTabState = false
+        rebuildLibraryColorTags()
+        rebuildActiveAssets()
+        rebuildActiveFolderEntries()
         saveCurrentFolderSession()
-        searchText = ""
-        clearSelection()
         if previousSourceID != source.id {
             SidebarFolderTagCache.shared.clear()
         }
@@ -2083,6 +2219,7 @@ final class AppState: ObservableObject {
         else {
             return
         }
+        pendingPinTasks.removeValue(forKey: source.rootURL.standardizedFileURL.path)?.task.cancel()
 
         let wasSelected = selectedSourceID == sourceID
         sources.removeAll { $0.id == sourceID }
@@ -2106,7 +2243,7 @@ final class AppState: ObservableObject {
 
         sources.append(source)
         LibrarySourceStore.saveExternalSources(sources, defaults: libraryDefaults)
-        indexStore.upsertSource(source)
+        sourceIndexWriter.upsertSource(source)
         if temporarySource?.rootURL.standardizedFileURL.path == source.rootURL.standardizedFileURL.path {
             temporarySource = nil
         }
@@ -2120,30 +2257,20 @@ final class AppState: ObservableObject {
 
     private func pinFolder(_ url: URL, selectPinnedFolder: Bool) {
         let standardizedURL = url.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            return
-        }
-
-        if let existing = sources.first(where: { $0.rootURL.standardizedFileURL.path == standardizedURL.path }) {
-            if selectPinnedFolder {
-                chooseSource(existing.id)
+        let path = standardizedURL.path
+        guard pendingPinTasks[path] == nil else { return }
+        let probe = directoryProbe
+        let requestID = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer {
+                if self?.pendingPinTasks[path]?.id == requestID { self?.pendingPinTasks[path] = nil }
             }
-            return
+            guard (try? await DirectoryAccessResolver.existingDirectory(standardizedURL, probe: probe)) == true,
+                  !Task.isCancelled, let self else { return }
+            self.pinSource(LibrarySourceStore.makeExternalSource(rootURL: standardizedURL),
+                           selectPinnedFolder: selectPinnedFolder)
         }
-
-        let source = LibrarySourceStore.makeExternalSource(rootURL: standardizedURL)
-        sources.append(source)
-        LibrarySourceStore.saveExternalSources(sources, defaults: libraryDefaults)
-        indexStore.upsertSource(source)
-        if temporarySource?.rootURL.standardizedFileURL.path == standardizedURL.path {
-            temporarySource = nil
-        }
-        if selectPinnedFolder {
-            chooseSource(source.id)
-        }
+        pendingPinTasks[path] = (requestID, task)
     }
 
     private func sourceMatches(_ lhs: LibrarySource, _ rhs: LibrarySource) -> Bool {
@@ -2183,33 +2310,31 @@ final class AppState: ObservableObject {
     }
 
     func openFolder(_ folder: LibraryFolderEntry) {
+        cancelPendingFolderPath()
         Self.logger.info("folder open requested source=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
         let standardizedURL = folder.url.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            Self.logger.error("folder open rejected missing-or-not-directory path=\(standardizedURL.path, privacy: .public)")
-            return
-        }
-
         guard folder.sourceID == selectedSourceID else {
             guard let source = sources.first(where: { $0.id == folder.sourceID }) else {
                 Self.logger.error("folder open rejected source mismatch folderSource=\(folder.sourceID, privacy: .public) selectedSource=\(self.selectedSourceID, privacy: .public) path=\(folder.url.path, privacy: .public)")
                 return
             }
             recordNavigation(to: source, folderURL: standardizedURL, filter: .all)
+            isApplyingTabState = true
+            clearContentForFolderNavigation()
             temporarySource = nil
             cancelPreviewDimensionResolution(clearPendingStep: true)
             selectedSourceID = source.id
             LibrarySourceStore.saveSelectedSourceID(source.id, defaults: libraryDefaults)
             selectedFilter = .all
             currentFolderURL = standardizedURL
+            restoreFolderSort()
             preservesUnavailableCurrentFolder = false
             resetScrollForNavigation()
+            isApplyingTabState = false
+            rebuildLibraryColorTags()
+            rebuildActiveAssets()
+            rebuildActiveFolderEntries()
             saveCurrentFolderSession()
-            clearSearchForNavigation()
-            clearSelection()
             ImageCache.shared.removeThumbnailMemoryObjects(reason: "open-folder")
             restartLibraryMonitor()
             refreshLibrary()
@@ -2223,29 +2348,46 @@ final class AppState: ObservableObject {
     }
 
     private func openFolderURL(_ url: URL) {
+        cancelPendingFolderPath()
         let standardizedURL = url.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            Self.logger.error("folder open rejected missing-or-not-directory path=\(standardizedURL.path, privacy: .public)")
-            return
-        }
-
         cancelPreviewDimensionResolution(clearPendingStep: true)
         if let source = selectedSource {
             recordNavigation(to: source, folderURL: standardizedURL, filter: .all)
         }
+        // Commit a navigation snapshot before rebuilding derived presentation.
+        // Otherwise the new location/sort rebuilds the previous directory's
+        // cards, and its new scroll identity mounts them a second time.
+        isApplyingTabState = true
+        clearContentForFolderNavigation()
         selectedFilter = .all
         currentFolderURL = standardizedURL
+        restoreFolderSort()
         preservesUnavailableCurrentFolder = false
         resetScrollForNavigation()
+        isApplyingTabState = false
+        rebuildLibraryColorTags()
+        rebuildActiveAssets()
+        rebuildActiveFolderEntries()
         saveCurrentFolderSession()
-        clearSearchForNavigation()
-        clearSelection()
         ImageCache.shared.removeThumbnailMemoryObjects(reason: "open-folder")
         restartLibraryMonitor()
         refreshLibrary()
+    }
+
+    /// Called inside the existing state-application guard. Old asynchronous
+    /// results lose their generation before any destination fields change.
+    private func clearContentForFolderNavigation() {
+        searchTask?.cancel()
+        searchGeneration &+= 1
+        recursiveSearchScope = nil
+        searchText = ""
+        searchStatus = nil
+        searchResultAssets = nil
+        searchResultFolderEntries = nil
+        assets = []
+        folderEntries = []
+        clearSelection()
+        galleryKeyboardFocusID = nil
     }
 
     private func clearSearchForNavigation() {
@@ -2773,8 +2915,9 @@ final class AppState: ObservableObject {
         previewPhase = .closed
         previewStepDirection = nil
         if previousPhase != .closed {
+            // Returning from preview restores the responder without moving the
+            // viewport. Explicit gallery arrow navigation requests its own scroll.
             galleryKeyboardFocusID = returnID ?? activeAssets.first?.id
-            if galleryKeyboardFocusID != nil { galleryKeyboardScrollGeneration &+= 1 }
         }
         Self.previewLogger.info("preview close finish force=\(force, privacy: .public) phase=\(previousPhase.rawValue, privacy: .public)->closed session=\(self.previewSessionID.uuidString, privacy: .public)")
     }
@@ -2877,7 +3020,7 @@ final class AppState: ObservableObject {
     }
 
     private func moveAssetsToSystemTrash(_ targetAssets: [LightboxAsset]) {
-        let validAssets = targetAssets.filter { !$0.isDeleted && $0.sourceURL != nil }
+        let validAssets = targetAssets.filter { !$0.isDeleted && $0.sourceURL != nil && !trashMovingAssetIDs.contains($0.id) }
         guard !validAssets.isEmpty else { return }
 
         if trashMoveTask != nil {
@@ -2892,6 +3035,9 @@ final class AppState: ObservableObject {
             return (asset.id, sourceURL)
         }
 
+        trashMovingAssetIDs = Set(targets.map(\.id))
+        let previewOrder = activeAssets.map(\.id)
+        let previewSession = previewSessionID
         let trashMover = systemTrashMover
         trashMoveTask = Task.detached(priority: .userInitiated) { [weak self] in
             var removedIDs = Set<LightboxAsset.ID>()
@@ -2906,7 +3052,8 @@ final class AppState: ObservableObject {
 
             await MainActor.run {
                 guard let self else { return }
-                self.applySystemTrashSuccesses(removedIDs)
+                self.applySystemTrashSuccesses(removedIDs, previewOrder: previewOrder, previewSession: previewSession)
+                self.trashMovingAssetIDs = []
                 self.trashMoveTask = nil
                 self.queuedTrashAssets.removeAll { removedIDs.contains($0.id) }
                 let queuedAssets = self.queuedTrashAssets
@@ -2918,8 +3065,29 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func applySystemTrashSuccesses(_ removedIDs: Set<LightboxAsset.ID>) {
+    private func applySystemTrashSuccesses(_ removedIDs: Set<LightboxAsset.ID>, previewOrder: [LightboxAsset.ID], previewSession: UUID) {
         guard !removedIDs.isEmpty else { return }
+
+        var continuation: (asset: LightboxAsset, direction: PreviewDirection)?
+        if let currentID = previewAssetID, removedIDs.contains(currentID),
+           previewPhase == .opening || previewPhase == .open {
+            let order = previewSessionID == previewSession ? previewOrder : activeAssets.map(\.id)
+            let remainingIDs = Set(activeAssets.map(\.id)).subtracting(removedIDs)
+            if let index = order.firstIndex(of: currentID) {
+                let following = order.dropFirst(index + 1).first { remainingIDs.contains($0) }
+                let preceding = order.prefix(index).last { remainingIDs.contains($0) }
+                let pending = pendingPreviewStepAssetID.flatMap { remainingIDs.contains($0) ? $0 : nil }
+                if let nextID = pending ?? following ?? preceding,
+                   let next = activeAssets.first(where: { $0.id == nextID }) {
+                    let direction: PreviewDirection = (order.firstIndex(of: nextID) ?? index) < index ? .previous : .next
+                    continuation = (next, direction)
+                    cancelPreviewDimensionResolution(clearPendingStep: true)
+                    pendingPreviewStepAssetID = next.id
+                    // Keep the overlay in its current session before gallery observers run.
+                    presentPreviewStep(next, direction: direction)
+                }
+            }
+        }
 
         // Update both sources before the assets observer rebuilds the gallery and its ID caches.
         searchResultAssets?.removeAll { removedIDs.contains($0.id) }
@@ -2941,6 +3109,12 @@ final class AppState: ObservableObject {
             removeFromCompareTray(assetID)
         }
         rebuildActiveAssets()
+        if let continuation, previewAssetID == continuation.asset.id {
+            pendingPreviewStepAssetID = continuation.asset.id
+            resolvePreviewTarget(continuation.asset, sourceFrame: nil, requiresActiveAsset: true) { [weak self] resolved in
+                self?.presentPreviewStep(resolved, direction: continuation.direction)
+            }
+        }
     }
 
     func restore(_ asset: LightboxAsset) {
@@ -3094,11 +3268,11 @@ final class AppState: ObservableObject {
 
     func openWithApplication(_ asset: LightboxAsset, applicationURL: URL?) {
         let targets = operationTargetAssets(fallback: asset)
-        let urls = existingFileURLs(for: targets)
+        let urls = targets.compactMap(\.sourceURL)
         guard !urls.isEmpty else { return }
 
         if let applicationURL {
-            open(urls, with: applicationURL)
+            withExistingFileURLs(urls) { state, existing in state.open(existing, with: applicationURL) }
             return
         }
 
@@ -3119,7 +3293,7 @@ final class AppState: ObservableObject {
               let applicationURL = panel.url
         else { return }
 
-        open(urls, with: applicationURL)
+        withExistingFileURLs(urls) { state, existing in state.open(existing, with: applicationURL) }
     }
 
     private func operationTargetAssets(fallback asset: LightboxAsset) -> [LightboxAsset] {
@@ -3131,15 +3305,14 @@ final class AppState: ObservableObject {
         return [asset]
     }
 
-    private func existingFileURLs(for assets: [LightboxAsset]) -> [URL] {
-        assets.compactMap { asset in
-            guard let url = asset.sourceURL,
-                  FileManager.default.fileExists(atPath: url.path)
-            else {
-                return nil
-            }
-
-            return url
+    private func withExistingFileURLs(_ urls: [URL], action: @escaping @MainActor (AppState, [URL]) -> Void) {
+        fileActionTask?.cancel()
+        fileActionTask = Task { [weak self] in
+            guard let existing = try? await FileActionResolver.existingURLs(urls),
+                  !Task.isCancelled, let self else { return }
+            self.fileActionTask = nil
+            guard !existing.isEmpty else { return }
+            action(self, existing)
         }
     }
 
@@ -3168,8 +3341,11 @@ final class AppState: ObservableObject {
     }
 
     func isFolderPinned(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        return sources.contains { source in
+        isFolderPinned(path: url.standardizedFileURL.path)
+    }
+
+    func isFolderPinned(path: String) -> Bool {
+        sources.contains { source in
             !source.isLocalLibrary && source.rootURL.standardizedFileURL.path == path
         }
     }
@@ -3194,23 +3370,24 @@ final class AppState: ObservableObject {
     }
 
     private func revealURLInFinder(_ url: URL) {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        // Finder resolves missing or disconnected targets itself. A preflight
+        // stat on a removable/network volume could stall the main actor.
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     func copyToClipboard(_ asset: LightboxAsset) {
-        let urls = existingFileURLs(for: operationTargetAssets(fallback: asset))
-        guard !urls.isEmpty else { return }
-        ImageClipboardWriter.copyImages(at: urls)
+        let urls = operationTargetAssets(fallback: asset).compactMap(\.sourceURL)
+        withExistingFileURLs(urls) { _, existing in ImageClipboardWriter.copyImages(at: existing) }
     }
 
     func share(_ asset: LightboxAsset, from view: NSView) {
-        let urls = existingFileURLs(for: operationTargetAssets(fallback: asset))
-        guard !urls.isEmpty else { return }
-
-        let picker = NSSharingServicePicker(items: urls)
-        sharingPicker = picker
-        picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+        let urls = operationTargetAssets(fallback: asset).compactMap(\.sourceURL)
+        withExistingFileURLs(urls) { [weak view] state, existing in
+            guard let view, view.window != nil else { return }
+            let picker = NSSharingServicePicker(items: existing)
+            state.sharingPicker = picker
+            picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+        }
     }
 
     func refreshLibrary(preservingVisibleSnapshot: Bool = false) {
@@ -3269,7 +3446,7 @@ final class AppState: ObservableObject {
             return
         }
         let folderURL = currentFolderURL
-        let usesConservativeExternalLoading = source.usesConservativeExternalLoading
+        let storageClassifier = storageClassifier
         let indexDatabaseURL = indexDatabaseURL
         let showsHiddenItems = showsHiddenItems
         let tabID = activeTabID
@@ -3285,6 +3462,25 @@ final class AppState: ObservableObject {
                     cachedSnapshot, source: source, folderURL: folderURL, refreshID: refreshID
                 )
             }
+            guard !Task.isCancelled else { return }
+            // Symlink resolution can wait on a disconnected volume. Cached content
+            // is published first, and neither gallery bodies nor monitoring resolve it.
+            let usesConservativeExternalLoading = storageClassifier(source)
+            guard !Task.isCancelled else { return }
+            let acceptedClassification = await MainActor.run { () -> Bool in
+                guard let self, !Task.isCancelled, self.refreshSerial == refreshID,
+                      self.activeTabID == tabID, !self.isViewingTrash,
+                      self.selectedSource == source, self.currentFolderURL == folderURL else { return false }
+                let classification = SourceStorageClassification(
+                    source: source, conservative: usesConservativeExternalLoading
+                )
+                if self.sourceStorageClassification != classification {
+                    self.sourceStorageClassification = classification
+                }
+                self.restartLibraryMonitor()
+                return true
+            }
+            guard acceptedClassification else { return }
             let refreshPolicy = LibraryRefreshPolicy(
                 usesConservativeExternalLoading: usesConservativeExternalLoading,
                 hasCachedVisibleSnapshot: hasCachedVisibleSnapshot
@@ -3304,13 +3500,16 @@ final class AppState: ObservableObject {
                 sourceID: source.id,
                 parentPath: folderURL.path
             )
+            // Attached SSDs are local volumes too. Keep network-volume caution,
+            // without delaying dimension hydration for every /Volumes path.
+            let isLocalVolume = (try? folderURL.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == true
             let directorySnapshot = LocalImageSource.loadFolderSnapshot(
                 in: folderURL,
                 sourceID: source.id,
                 rootURL: source.rootURL,
                 probeMetadata: false,
                 probeFolderTags: !usesConservativeExternalLoading,
-                initialMetadataLimit: usesConservativeExternalLoading ? 0 : 120,
+                initialMetadataLimit: usesConservativeExternalLoading ? (isLocalVolume ? 48 : 0) : 120,
                 showsHiddenItems: showsHiddenItems,
                 cachedDimensions: cachedDimensions
             )
@@ -3379,7 +3578,8 @@ final class AppState: ObservableObject {
                 }
                 let metadataPolicy = AssetMetadataRefreshPolicy(
                     usesConservativeExternalLoading: usesConservativeExternalLoading,
-                    requiresCompleteAssetTags: requiresCompleteAssetTags
+                    requiresCompleteAssetTags: requiresCompleteAssetTags,
+                    isLocalVolume: isLocalVolume
                 )
                 self.startAssetMetadataRefresh(
                     snapshot,
@@ -3453,19 +3653,34 @@ final class AppState: ObservableObject {
     }
 
     private func restartLibraryMonitor() {
-        libraryDirectoryMonitor?.stop()
-        guard !isShowingStartPage else { libraryDirectoryMonitor = nil; return }
-        let monitoredURL = isViewingTrash ? LightboxLibraryStore.primarySystemTrashFolder : currentFolderURL
-        if !isViewingTrash, selectedSource?.usesConservativeExternalLoading == true {
+        guard !isShowingStartPage else {
+            libraryDirectoryMonitor?.stop()
             libraryDirectoryMonitor = nil
+            libraryMonitorContext = nil
+            return
+        }
+        let monitoredURL = isViewingTrash ? LightboxLibraryStore.primarySystemTrashFolder : currentFolderURL
+        if !isViewingTrash, selectedSourceUsesConservativeExternalLoading {
+            libraryDirectoryMonitor?.stop()
+            libraryDirectoryMonitor = nil
+            libraryMonitorContext = nil
             Self.logger.info("monitor skipped external source path=\(monitoredURL.path, privacy: .public)")
             return
         }
 
+        let context = LibraryMonitorContext(folderURL: monitoredURL, recursive: includesSubfolders)
+        guard libraryMonitorContext != context || libraryDirectoryMonitor == nil else { return }
+        libraryDirectoryMonitor?.stop()
+        libraryMonitorContext = context
+
         Self.logger.info("monitor restart path=\(monitoredURL.path, privacy: .public) trash=\(self.isViewingTrash)")
-        let monitor = DirectoryChangeMonitor(url: monitoredURL, recursive: includesSubfolders)
+        let monitor = directoryMonitorFactory(monitoredURL, includesSubfolders)
         libraryDirectoryMonitor = monitor
-        monitor.start { [weak self] in
+        monitor.start(onInvalidated: { [weak self, weak monitor] in
+            guard let self, let monitor, self.libraryDirectoryMonitor === monitor else { return }
+            self.libraryDirectoryMonitor = nil
+            self.libraryMonitorContext = nil
+        }) { [weak self] in
             self?.scheduleLibraryRefresh()
         }
     }
@@ -3796,16 +4011,31 @@ final class AppState: ObservableObject {
         }
 
         if assetsChanged {
-            // The assets observer rebuilds the derived gallery exactly once.
+            // Commit the direct-folder fields without rebuilding the recursive
+            // snapshot through assets.didSet as well as the metadata path below.
+            isApplyingSearchMetadata = true
             assets = nextAssets
-        } else if didChange {
+            isApplyingSearchMetadata = false
+        }
+        if assetsChanged || didChange {
             rebuildLibraryColorTags()
             if selectedFilter == .all, sortField != .tag {
-                // Dimensions and tags do not change this ordering or membership.
-                // Avoid sorting the entire recursive library on every metadata batch.
+                // Only dimensions/tags changed. Keep membership, navigation IDs,
+                // group titles and order; do not standardize every file URL again.
                 var visibleAssets = cachedActiveAssets
-                for index in visibleAssets.indices { _ = apply(&visibleAssets[index]) }
-                setCachedActiveAssets(visibleAssets)
+                var visibleChanged = false
+                for index in visibleAssets.indices {
+                    if apply(&visibleAssets[index]) { visibleChanged = true }
+                }
+                if visibleChanged {
+                    for groupIndex in cachedSearchAssetGroups.indices {
+                        for assetIndex in cachedSearchAssetGroups[groupIndex].assets.indices {
+                            _ = apply(&cachedSearchAssetGroups[groupIndex].assets[assetIndex])
+                        }
+                    }
+                    activeAssetsRevision &+= 1
+                    cachedActiveAssets = visibleAssets
+                }
             } else {
                 rebuildActiveAssets()
             }
@@ -3832,21 +4062,28 @@ final class AppState: ObservableObject {
     private func rebuildActiveAssets() {
         let query = LightboxSearchQuery.parse(searchText)
         let sourceAssets = searchResultAssetsForActiveQuery ?? assets
+        let locale = Locale.current.identifier
+        // Filtering preserves a sorted snapshot's order. Reuse only a complete
+        // non-trash result with identical source values and sort semantics.
+        let snapshot = sortedUnfilteredSnapshot
+        let reusesSort = selectedFilter != .trash && snapshot?.field == sortField
+            && snapshot?.direction == sortDirection && snapshot?.locale == locale
+            && snapshot?.source == sourceAssets
+        let candidates = reusesSort ? (snapshot?.assets ?? sourceAssets) : sourceAssets
         let filtered: [LightboxAsset] = switch selectedFilter {
         case .all:
-            sourceAssets.filter { !$0.isDeleted }
+            candidates.filter { !$0.isDeleted }
         case .tag(let tag):
-            sourceAssets.filter { !$0.isDeleted && $0.tags.contains(tag) }
+            candidates.filter { !$0.isDeleted && $0.tags.contains(tag) }
         case .trash:
-            sourceAssets.filter(\.isDeleted)
+            candidates.filter(\.isDeleted)
         }
-
-        guard !query.isEmpty else {
-            setCachedActiveAssets(sortedAssets(filtered))
-            return
+        let matches = query.isEmpty ? filtered : filtered.filter(query.matches)
+        let ordered = reusesSort ? matches : sortedAssets(matches)
+        if selectedFilter == .all, query.isEmpty {
+            sortedUnfilteredSnapshot = (sourceAssets, sortField, sortDirection, locale, ordered)
         }
-
-        setCachedActiveAssets(sortedAssets(filtered.filter(query.matches)))
+        setCachedActiveAssets(ordered)
     }
 
     private func setCachedActiveAssets(_ nextAssets: [LightboxAsset]) {
@@ -3918,6 +4155,9 @@ final class AppState: ObservableObject {
         searchGeneration &+= 1
         recursiveSearchScope = nil
         let generation = searchGeneration
+        let keepsVisibleSearchSnapshot = preservingResults && searchStatus?.isSearching == false
+            && searchResultAssets?.isEmpty == false
+        let knownSearchAssets = preservingResults ? (searchResultAssets ?? []) : []
         if !preservingResults { clearSearchResults() }
         searchStatus = nil
 
@@ -3948,8 +4188,14 @@ final class AppState: ObservableObject {
         searchTask = Task.detached(priority: .utility) { [weak self, scanQuery, searchFolder, sourceID, sourceRootURL, currentFolderPath, trimmedSearchText, showsHiddenItems, recursive, generation] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
+            let metadataSnapshot = SearchMetadataSnapshot(knownSearchAssets)
 
             let publishProgress: @Sendable (LightboxSearchScanResult) -> Void = { [weak self] partial in
+                var partial = partial
+                if !keepsVisibleSearchSnapshot {
+                    partial.assets = metadataSnapshot.mergingDimensions(into: partial.assets)
+                }
+                let progress = partial
                 Task { @MainActor [weak self] in
                     guard let self,
                           self.searchStatus?.isSearching == true,
@@ -3958,32 +4204,42 @@ final class AppState: ObservableObject {
                           !self.isViewingTrash,
                           self.currentFolderURL.standardizedFileURL.path == currentFolderPath,
                           recursive || self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedSearchText,
-                          partial.visitedCount > (self.searchStatus?.visitedCount ?? 0)
+                          progress.visitedCount > (self.searchStatus?.visitedCount ?? 0)
                     else { return }
-                    self.searchResultAssets = partial.assets
-                    self.searchResultFolderEntries = partial.folders
+                    // A refresh keeps the complete usable gallery until the new
+                    // scan completes. Partial snapshots would repeatedly remove
+                    // and recreate cards that have already been displayed.
+                    if !keepsVisibleSearchSnapshot {
+                        self.searchResultAssets = progress.assets
+                        self.searchResultFolderEntries = progress.folders
+                    }
                     self.searchStatus = LightboxSearchStatus(
-                        isSearching: true, limitReached: partial.limitReached,
-                        discoveredCount: partial.assets.count, visitedCount: partial.visitedCount
+                        isSearching: true, limitReached: progress.limitReached,
+                        discoveredCount: progress.assets.count, visitedCount: progress.visitedCount
                     )
-                    self.rebuildLibraryColorTags()
-                    self.rebuildActiveAssets()
-                    self.rebuildActiveFolderEntries()
+                    if !keepsVisibleSearchSnapshot {
+                        self.rebuildLibraryColorTags()
+                        self.rebuildActiveAssets()
+                        self.rebuildActiveFolderEntries()
+                    }
                 }
             }
-            let result: LightboxSearchScanResult
+            var scanned: LightboxSearchScanResult
             if recursive {
-                result = await LocalImageSource.scanRecursiveAssets(
+                scanned = await LocalImageSource.scanRecursiveAssets(
                     in: searchFolder, sourceID: sourceID, rootURL: sourceRootURL,
                     showsHiddenItems: showsHiddenItems, onProgress: publishProgress
                 )
             } else {
-                result = LocalImageSource.searchAssets(
+                scanned = LocalImageSource.searchAssets(
                     in: searchFolder, sourceID: sourceID, rootURL: sourceRootURL,
                     query: scanQuery, recursive: false, showsHiddenItems: showsHiddenItems,
                     skipsPackages: true, onProgress: publishProgress
                 )
             }
+            guard !Task.isCancelled else { return }
+            scanned.assets = metadataSnapshot.mergingDimensions(into: scanned.assets)
+            let result = scanned
 
             let didApplySearchResults = await MainActor.run { () -> Bool in
                 guard let self,
@@ -4012,7 +4268,14 @@ final class AppState: ObservableObject {
             guard didApplySearchResults else { return }
 
             // Match the gallery order so visible images receive dimensions first.
-            let orderedAssets = await MainActor.run { self?.sortedAssets(result.assets) ?? result.assets }
+            let metadataSort = await MainActor.run { () -> (GallerySortField, GallerySortDirection)? in
+                guard let self, self.searchGeneration == generation, !Task.isCancelled else { return nil }
+                return (self.sortField, self.sortDirection)
+            }
+            guard let metadataSort, !Task.isCancelled else { return }
+            let orderedAssets = GalleryAssetSorter.sorted(result.assets,
+                field: metadataSort.0, direction: metadataSort.1)
+            guard !Task.isCancelled else { return }
             let metadataTargets = orderedAssets
                 .prefix(recursive ? Int.max : Self.searchMetadataRefreshLimit)
                 .compactMap { asset -> AssetMetadataTarget? in
@@ -4051,7 +4314,12 @@ final class AppState: ObservableObject {
                     tags: tags
                 ))
 
-                if (recursive && processedCount == 1) || batch.count >= 48 || Date().timeIntervalSince(lastPublishAt) >= 0.5 {
+                // Fast local metadata can otherwise invalidate the entire shell
+                // dozens of times per second. Keep the first image immediate,
+                // then bound both batch memory and the time to the next update.
+                let batchLimit = recursive ? 256 : 48
+                let publishInterval = recursive ? 0.15 : 0.5
+                if (recursive && processedCount == 1) || batch.count >= batchLimit || Date().timeIntervalSince(lastPublishAt) >= publishInterval {
                     lastPublishAt = Date()
                     let updates = batch
                     batch.removeAll(keepingCapacity: true)
@@ -4172,7 +4440,7 @@ final class AppState: ObservableObject {
             self.selectionAnchorID = firstVisibleID(in: selectedAssetIDs)
         }
 
-        if let previewAssetID, !assetIDs.contains(previewAssetID) {
+        if let previewAssetID, !assetIDs.contains(previewAssetID), !trashMovingAssetIDs.contains(previewAssetID) {
             previewOpenTask?.cancel()
             previewCloseTask?.cancel()
             previewSourceRevealTask?.cancel()

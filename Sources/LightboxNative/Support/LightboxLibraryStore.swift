@@ -10,7 +10,7 @@ enum LightboxLibraryStore {
         FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(
-                Bundle.main.bundleIdentifier == "io.github.a11oydyyy.Lightbox.local" ? "LightboxLocal" : "Lightbox",
+                LightboxRuntime.cacheDirectoryName(for: Bundle.main.bundleIdentifier),
                 isDirectory: true
             )
     }

@@ -26,8 +26,8 @@ enum MotionTokens {
     // their final size instead of tracking the slider near-linearly.
     static let thumbnailScale = Animation.spring(response: 0.34, dampingFraction: 1.0)
     static let chromeHideDurationSeconds = 0.12
-    static let chromeRevealDurationSeconds = 0.28
-    static let chromeRevealDelaySeconds = 0.12
+    static let chromeRevealDurationSeconds = 0.20
+    static let chromeRevealDelaySeconds = 0.0
     static let chromeHide = Animation.easeOut(duration: chromeHideDurationSeconds)
     static let chromeReveal = Animation.easeOut(duration: chromeRevealDurationSeconds)
     static let preview = Animation.easeInOut(duration: 0.24)

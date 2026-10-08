@@ -8,20 +8,32 @@ struct Hover3DModifier: ViewModifier {
     var isSelected = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
-    @State private var isHovering = false
+    @LightboxViewState private var isHovering = false
+
+    private var showsOutline: Bool {
+        isEnabled && (isFocused || isSelected || isHovering)
+    }
+
+    private var outlineAnimation: Animation {
+        isFocused ? MotionTokens.chromeReveal : MotionTokens.feedback
+    }
 
     func body(content: Content) -> some View {
         content
             .overlay {
                 RoundedRectangle(cornerRadius: RadiusTokens.card + 2, style: .continuous)
-                    .stroke(isFocused && isSelected ? LightboxColorTokens.accent : LightboxColorTokens.secondaryText.opacity(isFocused ? 1 : (colorScheme == .light ? 0.85 : 0.35)), lineWidth: isFocused ? 2 : 1)
+                    .stroke(isSelected ? LightboxColorTokens.accent : LightboxColorTokens.secondaryText.opacity(isFocused ? 1 : (colorScheme == .light ? 0.85 : 0.35)), lineWidth: isFocused ? 2 : (isSelected ? LightboxControlMetrics.focusLineWidth : 1))
                     .padding(-2)
-                    .opacity(isEnabled && (isFocused || (isHovering && !isSelected)) ? 1 : 0)
+                    .opacity(showsOutline ? 1 : 0)
+                    // Keep one resident outline through selection and focus handoff.
+                    // Scope feedback to the outline so the returning image stays solid.
+                    .animation(MotionTokens.ifAllowed(outlineAnimation, reduceMotion: reduceMotion), value: showsOutline)
+                    .animation(MotionTokens.ifAllowed(outlineAnimation, reduceMotion: reduceMotion), value: isFocused)
+                    .animation(MotionTokens.ifAllowed(outlineAnimation, reduceMotion: reduceMotion), value: isSelected)
                     .allowsHitTesting(false)
             }
             .onHover { isHovering = $0 }
             .onChange(of: isEnabled) { if !$0 { isHovering = false } }
-            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isHovering)
     }
 }
 

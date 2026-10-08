@@ -6,11 +6,12 @@ APP_NAME="LightboxNative"
 APP_BUNDLE_NAME="Lightbox"
 BUNDLE_ID="io.github.a11oydyyy.Lightbox"
 MIN_SYSTEM_VERSION="15.0"
-VERSION="2.0.7"
-BUILD_NUMBER="121"
+VERSION="2.0.8"
+BUILD_NUMBER="122"
 BUILD_ARCH_ARGS=()
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/build_toolchain.sh"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_BUNDLE_NAME.app"
 INSTALL_APP_BUNDLE="/Applications/$APP_BUNDLE_NAME.app"
@@ -51,21 +52,17 @@ build_bundle() {
     build_args+=("${BUILD_ARCH_ARGS[@]}")
   fi
 
-  if [ -n "${LIGHTBOX_BUILD_SDK:-}" ]; then
-    build_args+=(--sdk "$LIGHTBOX_BUILD_SDK")
-  fi
+  lightbox_configure_toolchain "$ROOT_DIR"
+  build_args+=("${LIGHTBOX_SWIFT_BUILD_ARGS[@]}")
 
   if [ "$stop_running" = "true" ]; then
     pkill -x "$APP_NAME" >/dev/null 2>&1 || true
   fi
 
-  if [ "${#build_args[@]}" -gt 0 ]; then
-    swift build "${build_args[@]}"
-    BUILD_BINARY="$(swift build "${build_args[@]}" --show-bin-path)/$APP_NAME"
-  else
-    swift build
-    BUILD_BINARY="$(swift build --show-bin-path)/$APP_NAME"
-  fi
+  swift build --product LightboxNative "${build_args[@]}"
+  BUILD_BINARY="$(swift build --product LightboxNative "${build_args[@]}" --show-bin-path)/$APP_NAME"
+
+  lightbox_verify_build_version "$BUILD_BINARY"
 
   rm -rf "$APP_BUNDLE"
   mkdir -p "$APP_MACOS"
@@ -75,6 +72,11 @@ build_bundle() {
 
   if [ -f "$APP_ICON" ]; then
     cp "$APP_ICON" "$APP_RESOURCES/AppIcon.icns"
+  fi
+
+  local resource_bundle="$(dirname "$BUILD_BINARY")/LightboxNative_LightboxNative.bundle"
+  if [ -d "$resource_bundle" ]; then
+    /usr/bin/ditto "$resource_bundle" "$APP_RESOURCES/LightboxNative_LightboxNative.bundle"
   fi
 
   cat >"$INFO_PLIST" <<PLIST
@@ -107,6 +109,16 @@ build_bundle() {
   <key>UTExportedTypeDeclarations</key>
   <array>
     <dict>
+      <key>UTTypeIdentifier</key>
+      <string>io.github.a11oydyyy.lightbox.plugin-package</string>
+      <key>UTTypeDescription</key>
+      <string>Lightbox Plugin</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>com.apple.package</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict><key>public.filename-extension</key><array><string>lightboxplugin</string></array></dict>
+    </dict>
+    <dict>
       <key>UTTypeConformsTo</key>
       <array>
         <string>public.data</string>
@@ -136,10 +148,19 @@ sign_app_bundle() {
     signing_arguments+=(--requirements "=designated => identifier \"$BUNDLE_ID\"")
   fi
 
-  /usr/bin/xattr -cr "$bundle" >/dev/null 2>&1 || true
-  /usr/bin/codesign --remove-signature "$bundle" >/dev/null 2>&1 || true
-  /usr/bin/codesign "${signing_arguments[@]}" "$bundle"
-  /usr/bin/xattr -cr "$bundle" >/dev/null 2>&1 || true
+  # iCloud may add Finder display metadata during packaging. Keep other attributes.
+  local attempt
+  for attempt in 1 2 3; do
+    if /usr/bin/xattr -p com.apple.FinderInfo "$bundle" >/dev/null 2>&1; then
+      /usr/bin/xattr -d com.apple.FinderInfo "$bundle"
+    fi
+    if /usr/bin/codesign "${signing_arguments[@]}" "$bundle" && /usr/bin/codesign --verify --deep --strict "$bundle"; then
+      return 0
+    fi
+    if [ "$attempt" = 3 ] || ! /usr/bin/xattr -p com.apple.FinderInfo "$bundle" >/dev/null 2>&1; then
+      return 1
+    fi
+  done
 }
 
 install_app_bundle() {

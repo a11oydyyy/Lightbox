@@ -4,7 +4,8 @@ import SwiftUI
 struct NewTabView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
-    @State private var unavailablePath: String?
+    @LightboxViewState private var unavailablePath: String?
+    @LightboxViewState private var folderRequestID: UUID?
 
     private var pinned: [LibrarySource] {
         Array(appState.pinnedSidebarSources.sorted {
@@ -73,6 +74,10 @@ struct NewTabView: View {
         } message: {
             Text(unavailablePath ?? "")
         }
+        .onDisappear {
+            folderRequestID = nil
+            appState.cancelPendingFolderPath()
+        }
     }
 
     private var pinnedSection: some View {
@@ -115,12 +120,16 @@ struct NewTabView: View {
 
     private func folderRow(_ url: URL, title: String) -> some View {
         Button {
-            var directory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &directory), directory.boolValue else {
-                unavailablePath = url.path
-                return
+            let tabID = appState.activeTabID
+            let requestID = UUID()
+            folderRequestID = requestID
+            Task { @MainActor in
+                guard folderRequestID == requestID, !Task.isCancelled else { return }
+                let opened = await appState.openFolderPath(url.path)
+                guard folderRequestID == requestID, !Task.isCancelled,
+                      appState.activeTabID == tabID, appState.isShowingStartPage else { return }
+                if opened == .unavailable { unavailablePath = url.path }
             }
-            appState.openSidebarFolder(url)
         } label: {
             HStack(spacing: 12) {
                 SidebarSymbolIcon(symbol: "folder", url: url)

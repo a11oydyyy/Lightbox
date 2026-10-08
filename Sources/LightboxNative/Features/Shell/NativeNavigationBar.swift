@@ -4,7 +4,7 @@ import SwiftUI
 
 /// All primary header hit targets live in the same AppKit titlebar accessory view.
 @MainActor
-final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValidation {
+final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValidation, NSGestureRecognizerDelegate {
     private let appState: AppState
     private let back = KeyboardAwareHeaderButton()
     private let forward = KeyboardAwareHeaderButton()
@@ -12,7 +12,13 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     private let search = KeyboardAwareHeaderButton()
     private let sort = KeyboardAwareHeaderButton()
     private let titleButton = KeyboardAwareHeaderButton()
-    private let ancestors = NSPathControl()
+    private lazy var locationDoubleClick = NSClickGestureRecognizer(target: self, action: #selector(zoomLocation))
+    private let activity = NSView()
+    private let activityLabel = NativeProgressLabel()
+    private var lastActivityVisible: Bool?
+    private var isFadingActivity = false
+    private var activityTransitionGeneration = 0
+    private let ancestors = BreadcrumbPathControl()
     private let editor = NSTextField()
     private let searchField = NSSearchField()
     private let selectionHost: NSHostingView<NativeHeaderPanel>
@@ -20,7 +26,16 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     private var popover: NSPopover?
     // Mutated only on the main actor; deinit only releases the opaque event token.
     nonisolated(unsafe) private var outsideClickMonitor: Any?
-    private var editingPath = false
+    private var pathSubmissionTask: Task<Void, Never>?
+    private var pathEditingSession = UUID()
+    private var editingPath = false {
+        didSet {
+            if oldValue && !editingPath {
+                pathSubmissionTask?.cancel()
+                appState.cancelPendingFolderPath()
+            }
+        }
+    }
     private var searching = false
     private var lastSearchGeneration: Int
     private var lastPathGeneration: Int
@@ -28,6 +43,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     private var lastViewingTrash = false
     private var lastChromeVisible: Bool?
     private var lastSidebarCollapsed: Bool?
+    private var lastActiveTabID: UUID?
     private var layoutTargets: [ObjectIdentifier: NSRect] = [:]
 
     init(appState: AppState) {
@@ -38,6 +54,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         selectionHost = NSHostingView(rootView: NativeHeaderPanel(appState: appState, kind: .selection))
         transferHost = NSHostingView(rootView: NativeHeaderPanel(appState: appState, kind: .transfer))
         super.init(frame: .zero)
+        activityLabel.presentationSizeChanged = { [weak self] in self?.needsLayout = true }
         for (button, symbol, action) in [
             (back, "chevron.left", #selector(goBack)),
             (forward, "chevron.right", #selector(goForward)),
@@ -62,6 +79,14 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         titleButton.target = self
         titleButton.action = #selector(beginPathEditing)
         addSubview(titleButton)
+        activity.wantsLayer = true
+        activityLabel.font = titleButton.font
+        activityLabel.textColor = .labelColor
+        activityLabel.alignment = .center
+        activityLabel.lineBreakMode = .byClipping
+        activityLabel.maximumNumberOfLines = 1
+        activity.addSubview(activityLabel)
+        addSubview(activity)
         ancestors.focusRingType = .none
         ancestors.pathStyle = .standard
         ancestors.backgroundColor = .clear
@@ -84,6 +109,10 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         transferHost.sizingOptions = []
         addSubview(selectionHost)
         addSubview(transferHost)
+        locationDoubleClick.numberOfClicksRequired = 2
+        locationDoubleClick.delaysPrimaryMouseButtonEvents = true
+        locationDoubleClick.delegate = self
+        addGestureRecognizer(locationDoubleClick)
         refresh()
     }
 
@@ -125,6 +154,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     }
 
     deinit {
+        pathSubmissionTask?.cancel()
         if let monitor = outsideClickMonitor { NSEvent.removeMonitor(monitor) }
         NotificationCenter.default.removeObserver(self)
     }
@@ -162,8 +192,39 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard lastChromeVisible != false else { return nil }
+        guard lastChromeVisible != false, !appState.hasActiveOverlay else { return nil }
         return super.hitTest(point)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // The titlebar gesture has already handled a double-click. Forwarding
+        // its delayed mouse-up invokes the titlebar's fallback zoom a second time.
+        guard event.clickCount < 2 else { return }
+        super.mouseUp(with: event)
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldAttemptToRecognizeWith event: NSEvent) -> Bool {
+        guard gestureRecognizer === locationDoubleClick, event.window === window,
+              lastChromeVisible != false, !appState.hasActiveOverlay, appState.selectedAssetCount <= 1,
+              !editingPath, !searching, !event.modifierFlags.contains(.control),
+              event.type == .leftMouseDown || event.type == .leftMouseUp else { return false }
+        let point = convert(event.locationInWindow, from: nil)
+        let titleFrame = titleButton.isHidden ? NSRect.zero : titleButton.frame
+        let pathFrame = ancestors.isHidden ? NSRect.zero : ancestors.frame
+        let activityFrame = activity.isHidden ? NSRect.zero : activity.frame
+        return [titleFrame, pathFrame, activityFrame].contains { !$0.isEmpty && $0.contains(point) }
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldBeRequiredToFailBy otherGestureRecognizer: NSGestureRecognizer) -> Bool {
+        guard gestureRecognizer === locationDoubleClick, let otherView = otherGestureRecognizer.view else { return false }
+        // Delay the ancestor titlebar gesture as well as the control's own gesture.
+        // One recognized double-click must produce exactly one window action.
+        return isDescendant(of: otherView) || otherView.isDescendant(of: self)
+    }
+
+    @objc private func zoomLocation() {
+        guard let window, !window.styleMask.contains(.fullScreen) else { return }
+        window.performZoom(nil)
     }
 
     private func updateChromeVisibility(_ visible: Bool) {
@@ -174,7 +235,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
 
     func refresh() {
         let enabled = appState.previewAssetID == nil && !appState.isComparing
-        updateChromeVisibility(enabled)
+        updateChromeVisibility(appState.isOverlayChromeVisible)
         label(back, appState.localized(.goBack))
         label(forward, appState.localized(.goForward))
         label(up, appState.localized(.goToParentFolder))
@@ -184,28 +245,49 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         forward.isEnabled = appState.canGoForward
         up.isEnabled = appState.canOpenParentFolder
         let startPage = appState.isShowingStartPage
+        if lastActiveTabID != appState.activeTabID {
+            lastActiveTabID = appState.activeTabID
+            cancelPathEditing()
+        }
         let path = startPage ? "" : appState.currentFolderURL.path
         let pathChanged = path != lastPath
         if pathChanged {
             lastPath = path
             editingPath = false
         }
-        titleButton.title = startPage ? appState.localized(.newTab) : appState.isViewingTrash ? appState.localized(.trash) : (appState.breadcrumbs.last?.title ?? appState.currentPathTitle)
+        let breadcrumbsChanged = pathChanged || lastViewingTrash != appState.isViewingTrash
+        // Building breadcrumbs resolves the volume name. Reuse that navigation
+        // snapshot during scan progress, selection and every thumbnail-size tick.
+        let crumbs = breadcrumbsChanged && !startPage && !appState.isViewingTrash ? appState.breadcrumbs : []
+        let folderTitle = path == "/"
+            ? (crumbs.last?.title ?? ancestors.pathItems.last?.title ?? appState.currentPathTitle)
+            : appState.currentFolderSegmentTitle
+        titleButton.title = startPage ? appState.localized(.newTab) : appState.isViewingTrash ? appState.localized(.trash) : folderTitle
         titleButton.contentTintColor = .labelColor
+        activityLabel.font = titleButton.font
+        activityLabel.textColor = titleButton.contentTintColor
         titleButton.toolTip = path
         titleButton.setAccessibilityLabel(titleButton.title)
-        if pathChanged || lastViewingTrash != appState.isViewingTrash {
+        updateActivity(appState.navigationActivityText)
+        if breadcrumbsChanged {
             lastViewingTrash = appState.isViewingTrash
-            ancestors.pathItems = (startPage || appState.isViewingTrash) ? [] : appState.breadcrumbs.dropLast().compactMap { crumb in
-                let pathControl = NSPathControl()
-                pathControl.url = crumb.url
-                guard let item = pathControl.pathItems.last else { return nil }
-                item.attributedTitle = NSAttributedString(string: crumb.title, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
-                item.image = nil
-                return item
+            // NSPathControl.url derives names/icons with synchronous volume
+            // queries (statfs can stall removable/network storage). We already
+            // have each segment's title and URL. Bridge explicit component cells
+            // to path items, whose URL is read-only, without auto-resolving paths.
+            let pathControl = NSPathControl()
+            if let pathCell = pathControl.cell as? NSPathCell {
+                pathCell.pathComponentCells = crumbs.map { crumb in
+                    let component = NSPathComponentCell(textCell: crumb.title)
+                    component.url = crumb.url
+                    component.attributedStringValue = NSAttributedString(string: crumb.title, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+                    component.image = nil
+                    return component
+                }
             }
+            ancestors.setPathItems(pathControl.pathItems)
             let menu = NSMenu()
-            for crumb in (appState.isViewingTrash ? [] : Array(appState.breadcrumbs.dropLast())) {
+            for crumb in crumbs {
                 let item = NSMenuItem(title: crumb.title, action: #selector(openPathMenuItem(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = crumb.url
@@ -224,7 +306,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
             closeSearch()
             popover?.close()
         }
-        titleButton.isEnabled = !startPage
+        titleButton.isEnabled = !startPage && appState.navigationActivityText == nil
         ancestors.toolTip = path
         ancestors.setAccessibilityLabel(appState.localized(.path))
         editor.placeholderString = appState.localized(.folderPathPlaceholder)
@@ -244,6 +326,37 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         }
         if !enabled { popover?.close() }
         needsLayout = true
+    }
+
+    private func updateActivity(_ text: String?) {
+        let visible = text != nil
+        if let text {
+            activityLabel.setText(text, animated: lastActivityVisible == true && !isFadingActivity)
+        } else {
+            activityLabel.cancelPendingUpdates()
+        }
+        guard lastActivityVisible != visible else { return }
+        let animated = lastActivityVisible != nil && window != nil
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        lastActivityVisible = visible
+        isFadingActivity = animated
+        activityTransitionGeneration &+= 1
+        let generation = activityTransitionGeneration
+        titleButton.isHidden = editingPath || appState.selectedAssetCount > 1
+        activity.isHidden = titleButton.isHidden
+        titleButton.setAccessibilityHidden(visible)
+        activity.setAccessibilityHidden(!visible)
+        activityLabel.setAccessibilityHidden(!visible)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = animated ? 0.20 : 0
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            titleButton.animator().alphaValue = visible ? 0 : 1
+            activity.animator().alphaValue = visible ? 1 : 0
+        } completionHandler: { [weak self] in
+            guard let self, self.activityTransitionGeneration == generation else { return }
+            self.isFadingActivity = false
+            self.needsLayout = true
+        }
     }
 
     override func layout() {
@@ -298,12 +411,19 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
             .font: titleButton.font ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
         ]).width) + 20)
         place(titleButton, at: NSRect(x: center - titleWidth / 2, y: ancestors.pathItems.isEmpty ? 10 : 0, width: titleWidth, height: 23), animated: animated)
+        // Give progress its full text width instead of the symmetric title limit.
+        let activityWidth = ceil(activityLabel.intrinsicContentSize.width)
+        let activityX = min(max(leftEdge, center - activityWidth / 2), max(0, rightEdge - activityWidth))
+        place(activity, at: NSRect(x: activityX, y: ancestors.pathItems.isEmpty ? 10 : 0, width: activityWidth, height: 23), animated: animated)
+        let labelFrame = activity.bounds.insetBy(dx: 0, dy: 2)
+        if activityLabel.frame != labelFrame { activityLabel.frame = labelFrame }
         let ancestorWidth = min(location.width, ancestors.pathItems.reduce(CGFloat(0)) { width, item in
             width + (item.title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width + 20
         })
         place(ancestors, at: NSRect(x: center - ancestorWidth / 2, y: 23, width: ancestorWidth, height: 19), animated: animated)
         place(editor, at: NSRect(x: location.minX, y: 8, width: location.width, height: 28), animated: animated)
-        titleButton.isHidden = selecting || editingPath
+        titleButton.isHidden = selecting || editingPath || (lastActivityVisible == true && !isFadingActivity)
+        activity.isHidden = selecting || editingPath || (lastActivityVisible != true && !isFadingActivity)
         ancestors.isHidden = selecting || editingPath || ancestors.pathItems.isEmpty
         editor.isHidden = selecting || !editingPath
         selectionHost.isHidden = !selecting
@@ -327,6 +447,9 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         appState.openSidebarFolder(url)
     }
     @objc private func beginPathEditing() {
+        pathSubmissionTask?.cancel()
+        appState.cancelPendingFolderPath()
+        pathEditingSession = UUID()
         appState.galleryKeyboardFocusID = nil
         if appState.selectedAssetCount > 1 { appState.clearSelection() }
         editingPath = true
@@ -386,6 +509,12 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
 
     func controlTextDidChange(_ notification: Notification) {
         if notification.object as? NSTextField === searchField { appState.searchText = searchField.stringValue }
+        if notification.object as? NSTextField === editor {
+            pathSubmissionTask?.cancel()
+            appState.cancelPendingFolderPath()
+            editor.textColor = .labelColor
+            editor.toolTip = nil
+        }
     }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
@@ -400,18 +529,112 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
             return true
         }
         if control === editor && commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            if appState.openFolderPath(editor.stringValue) {
-                editingPath = false
-                window?.makeFirstResponder(nil)
-            } else {
-                editor.textColor = .systemRed
-                editor.toolTip = appState.localized(.folderUnavailable)
-                NSSound.beep()
+            pathSubmissionTask?.cancel()
+            let submittedPath = editor.stringValue
+            let session = pathEditingSession
+            let state = appState
+            pathSubmissionTask = Task { @MainActor [weak self] in
+                guard !Task.isCancelled else { return }
+                let opened = await state.openFolderPath(submittedPath)
+                guard let self, !Task.isCancelled, self.editingPath,
+                      self.pathEditingSession == session, self.editor.stringValue == submittedPath else { return }
+                if opened == .opened {
+                    self.editingPath = false
+                    self.window?.makeFirstResponder(nil)
+                } else if opened == .unavailable {
+                    self.editor.textColor = .systemRed
+                    self.editor.toolTip = state.localized(.folderUnavailable)
+                    NSSound.beep()
+                }
+                self.needsLayout = true
             }
-            needsLayout = true
             return true
         }
         return false
+    }
+}
+
+/// Keep AppKit's path navigation while adding feedback only to ancestor text.
+@MainActor
+final class BreadcrumbPathControl: NSPathControl {
+    private var hoverTracking: NSTrackingArea?
+    private var hoveredIndex: Int?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func setPathItems(_ items: [NSPathControlItem]) {
+        updateHover(at: nil, animated: false)
+        pathItems = items
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let tracking = NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .cursorUpdate, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(tracking)
+        hoverTracking = tracking
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if event.trackingArea === hoverTracking || !bounds.contains(convert(event.locationInWindow, from: nil)) {
+            updateHover(at: nil)
+        }
+    }
+    override func cursorUpdate(with event: NSEvent) {
+        if ancestorIndex(at: convert(event.locationInWindow, from: nil)) != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            super.cursorUpdate(with: event)
+        }
+    }
+    override var isHidden: Bool {
+        didSet { if isHidden { updateHover(at: nil, animated: false) } }
+    }
+
+    private func ancestorIndex(at point: NSPoint) -> Int? {
+        guard isEnabled, bounds.contains(point), let pathCell = cell as? NSPathCell,
+              let component = pathCell.pathComponentCell(at: point, withFrame: bounds, in: self),
+              let index = pathCell.pathComponentCells.firstIndex(where: { $0 === component }),
+              index < pathItems.count - 1 else { return nil }
+        let frame = pathCell.rect(of: component, withFrame: bounds, in: self)
+        return component.titleRect(forBounds: frame).contains(point) ? index : nil
+    }
+
+    private func updateHover(at point: NSPoint?, animated: Bool = true) {
+        let index = point.flatMap { ancestorIndex(at: $0) }
+        guard index != hoveredIndex else { return }
+        for itemIndex in [hoveredIndex, index].compactMap({ $0 }) where pathItems.indices.contains(itemIndex) {
+            let item = pathItems[itemIndex]
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font ?? NSFont.systemFont(ofSize: 11),
+                .foregroundColor: itemIndex == index ? NSColor.labelColor : NSColor.secondaryLabelColor
+            ]
+            item.attributedTitle = NSAttributedString(string: item.title, attributes: attributes)
+        }
+        hoveredIndex = index
+        layer?.removeAnimation(forKey: "breadcrumbHover")
+        if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let fade = CATransition()
+            fade.type = .fade
+            fade.duration = 0.12
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer?.add(fade, forKey: "breadcrumbHover")
+        }
+        needsDisplay = true
     }
 }
 

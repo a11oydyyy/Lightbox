@@ -49,7 +49,7 @@ import Testing
 
     view.isInteractionEnabled = false
     view.configureAccessibility(selected: true)
-    #expect(view.isHidden)
+    #expect(view.hitTest(.zero) == nil)
     #expect(!view.isAccessibilityEnabled())
     #expect(!view.isAccessibilityElement())
     let disabled = try #require(view.accessibilityCustomActions())

@@ -12,6 +12,7 @@ final class ImageCache: @unchecked Sendable {
     private let previewCache = NSCache<NSString, CachedImageEntry>()
     private let comparisonCache = NSCache<NSString, CachedImageEntry>()
     private var decodeQueue: OperationQueue
+    private let previewDecodeQueue: OperationQueue
     private let memoryProfile: ImageCacheMemoryProfile
     private let generationLock = NSLock()
     private let requestLock = NSLock()
@@ -43,6 +44,10 @@ final class ImageCache: @unchecked Sendable {
         self.fileSignature = fileSignature
         self.memoryProfile = memoryProfile
         decodeQueue = Self.makeDecodeQueue(memoryProfile: memoryProfile)
+        previewDecodeQueue = OperationQueue()
+        previewDecodeQueue.name = "Lightbox.PreviewDecode"
+        previewDecodeQueue.qualityOfService = .userInitiated
+        previewDecodeQueue.maxConcurrentOperationCount = memoryProfile.previewDecodeConcurrency
         cache.countLimit = memoryProfile.thumbnailCountLimit
         cache.totalCostLimit = memoryProfile.thumbnailTotalCostLimit
         previewCache.countLimit = memoryProfile.previewCountLimit
@@ -104,8 +109,9 @@ final class ImageCache: @unchecked Sendable {
         let pendingSubscriberCount = pendingDecodes.values.reduce(0) { $0 + $1.completions.count }
         pendingDecodes.removeAll()
         requestLock.unlock()
-        let pending = max(decodeQueue.operationCount, pendingSubscriberCount)
+        let pending = max(decodeQueue.operationCount + previewDecodeQueue.operationCount, pendingSubscriberCount)
         decodeQueue.cancelAllOperations()
+        previewDecodeQueue.cancelAllOperations()
         return (nextGeneration, pending)
     }
 
@@ -113,7 +119,10 @@ final class ImageCache: @unchecked Sendable {
         let queue = OperationQueue()
         queue.name = "Lightbox.ImageDecode"
         queue.qualityOfService = .default
-        queue.maxConcurrentOperationCount = memoryProfile.decodeConcurrency
+        // Reserve two bounded slots for preview I/O, including rapid switches.
+        // Cancelling a thumbnail cannot interrupt an ImageIO call already
+        // blocked on a slow volume. Total decode concurrency stays unchanged.
+        queue.maxConcurrentOperationCount = memoryProfile.thumbnailDecodeConcurrency
         return queue
     }
 
@@ -333,7 +342,7 @@ final class ImageCache: @unchecked Sendable {
         for operationToCancel in operationsToCancel {
             operationToCancel.cancel()
         }
-        decodeQueue.addOperation(operation)
+        (quality == .preview ? previewDecodeQueue : decodeQueue).addOperation(operation)
         return requestHandle(for: subscriberID)
     }
 
@@ -625,6 +634,9 @@ struct ImageCacheMemoryProfile: Equatable {
     var decodeConcurrency: Int {
         isCompatibilityMode ? 3 : 4
     }
+
+    var previewDecodeConcurrency: Int { 2 }
+    var thumbnailDecodeConcurrency: Int { decodeConcurrency - previewDecodeConcurrency }
 }
 
 enum ImageCacheTelemetrySource {

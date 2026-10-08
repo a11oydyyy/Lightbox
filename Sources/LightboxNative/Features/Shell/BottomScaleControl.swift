@@ -19,8 +19,12 @@ struct BottomScaleControl: View {
                 min(range.upperBound, max(range.lowerBound, appState.thumbnailWidth))
             },
             set: { value in
-                withAnimation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion)) {
-                    appState.thumbnailWidth = GalleryThumbnailSizing.clampedStoredWidth(value)
+                let width = GalleryThumbnailSizing.clampedStoredWidth(value.rounded())
+                guard appState.thumbnailWidth != width else { return }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    appState.thumbnailWidth = width
                 }
             }
         )
@@ -59,7 +63,9 @@ struct BottomScaleControl: View {
                 .frame(width: 5, height: 5)
                 .frame(width: 12)
 
-            ThumbnailScaleSlider(value: thumbnailWidthBinding, range: thumbnailScaleRange)
+            ThumbnailScaleSlider(value: thumbnailWidthBinding, range: thumbnailScaleRange) { editing in
+                appState.isScalingThumbnails = editing
+            }
                 .accessibilityLabel(appState.localized(.imageSize))
                 .accessibilityValue("\(Int(appState.thumbnailWidth)) pt")
 
@@ -207,6 +213,10 @@ private struct BottomTagFilterButton: View {
 private struct ThumbnailScaleSlider: View {
     @Binding var value: CGFloat
     var range: ClosedRange<CGFloat>
+    var onEditingChanged: (Bool) -> Void
+    @LightboxViewState private var draftValue: CGFloat = 206
+    @LightboxViewState private var isEditing = false
+    @LightboxViewState private var updates = ThumbnailScaleUpdates()
 
     private let width: CGFloat = 86
 
@@ -215,14 +225,59 @@ private struct ThumbnailScaleSlider: View {
     var body: some View {
         Slider(
             value: Binding(
-                get: { Double(value) },
-                set: { value = CGFloat($0) }
+                get: { Double(isEditing ? draftValue : value) },
+                set: { next in
+                    draftValue = CGFloat(next)
+                    updates.submit(draftValue) { value = $0 }
+                }
             ),
-            in: Double(range.lowerBound)...Double(range.upperBound)
+            in: Double(range.lowerBound)...Double(range.upperBound),
+            onEditingChanged: { editing in
+                if editing { draftValue = value }
+                else { updates.flush { value = $0 } }
+                isEditing = editing
+                onEditingChanged(editing)
+            }
         )
         .controlSize(.small)
         .labelsHidden()
         .frame(width: width)
+        .onDisappear {
+            updates.cancel()
+            onEditingChanged(false)
+        }
+    }
+}
+
+/// Keep the native slider tracking every input while the gallery receives only
+/// the latest size in each 16 ms interval. Release always commits immediately.
+@MainActor
+final class ThumbnailScaleUpdates {
+    private var pending: CGFloat?
+    private var task: Task<Void, Never>?
+
+    func submit(_ width: CGFloat, apply: @escaping @MainActor (CGFloat) -> Void) {
+        pending = width
+        guard task == nil else { return }
+        task = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled else { return }
+            self?.flush(apply: apply)
+        }
+    }
+
+    func flush(apply: @MainActor (CGFloat) -> Void) {
+        task?.cancel()
+        task = nil
+        guard let width = pending else { return }
+        pending = nil
+        apply(width)
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+        pending = nil
     }
 }
 
@@ -269,8 +324,8 @@ private struct BottomControlGlassModifier<S: Shape>: ViewModifier {
 private struct CompareTrayControl: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isDropTargeted = false
-    @State private var rejectFlash = false
+    @LightboxViewState private var isDropTargeted = false
+    @LightboxViewState private var rejectFlash = false
 
     private var trayShadowOpacity: Double {
         GlassTokens.floatingCapsuleShadowOpacity(appState.glassOpacity)

@@ -4,14 +4,12 @@ import SwiftUI
 struct RootShellView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var overlayChromeVisible = true
-    @State private var overlayChromeRevealTask: Task<Void, Never>?
-    @State private var isResizingSidebar = false
-    @State private var isTogglingSidebar = false
-    @State private var sidebarToggleTask: Task<Void, Never>?
-    @State private var sidebarSlotExpanded: Bool
-    @State private var sidebarContentVisible: Bool
-    @State private var sidebarVisibilityTask: Task<Void, Never>?
+    @LightboxViewState private var isResizingSidebar = false
+    @LightboxViewState private var isTogglingSidebar = false
+    @LightboxViewState private var sidebarToggleTask: Task<Void, Never>?
+    @LightboxViewState private var sidebarSlotExpanded: Bool
+    @LightboxViewState private var sidebarContentVisible: Bool
+    @LightboxViewState private var sidebarVisibilityTask: Task<Void, Never>?
 
     init() {
         let isExpanded = !LightboxSettingsStore.loadSidebarCollapsed()
@@ -28,6 +26,11 @@ struct RootShellView: View {
 
     private var overlayIsPresented: Bool {
         appState.previewAssetID != nil || appState.isComparing
+    }
+
+    // Native controls mirror the veil as soon as preview closing begins.
+    private var overlayChromeVisible: Bool {
+        appState.isOverlayChromeVisible
     }
 
     private var previewIsPresented: Bool {
@@ -67,14 +70,19 @@ struct RootShellView: View {
                 // slot edges (the visible seam), and the window edge already masks
                 // the slide, so clipping bought nothing but the artifact.
                 HStack(spacing: 0) {
-                    GlassSidebar()
+                    ResidentSidebarHost(appState: appState)
+                        .frame(width: appState.sidebarWidth + 10)
+                        .frame(maxHeight: .infinity)
                         .accessibilityHidden(appState.hasActiveOverlay || appState.sidebarCollapsed)
                     SidebarResizeHandle(isResizing: $isResizingSidebar)
                 }
                 .frame(width: effectiveSidebarSlotExpanded ? sidebarSlotWidth : 0, alignment: .trailing)
                 .offset(x: usesCompatibilitySidebarMotion && !effectiveSidebarContentVisible ? -sidebarSlotWidth : 0)
                 .opacity(effectiveSidebarContentVisible ? 1 : 0)
-                .allowsHitTesting(effectiveSidebarContentVisible)
+                // The preview's opaque veil reveals the sidebar together with
+                // folder cards and directory headings, without a second fade.
+                .previewChromePresentation(isVisible: !appState.isComparing, reduceMotion: reduceMotion)
+                .allowsHitTesting(effectiveSidebarContentVisible && overlayChromeVisible && !overlayIsPresented)
                 .animation(
                     usesCompatibilitySidebarMotion
                         ? MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)
@@ -143,10 +151,12 @@ struct RootShellView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.leading, chromeLeadingInset)
                     .opacity(appState.isComparing ? 0.42 : 1)
-                    .bottomPreviewChromePresentation(isVisible: overlayChromeVisible, reduceMotion: reduceMotion)
+                    .bottomPreviewChromePresentation(isVisible: !appState.isComparing, reduceMotion: reduceMotion)
                     .allowsHitTesting(overlayChromeVisible && !previewIsPresented && !appState.isComparing)
                     .accessibilityHidden(appState.hasActiveOverlay)
-                    .disabled(appState.hasActiveOverlay)
+                    // During close the veil restores the normal appearance;
+                    // hit testing and accessibility remain blocked above.
+                    .disabled(appState.hasActiveOverlay && !appState.isPreviewClosing)
                     .padding(.bottom, 18)
             }
             .zIndex(3)
@@ -173,50 +183,15 @@ struct RootShellView: View {
         )
         .animation(MotionTokens.ifAllowed(MotionTokens.preview, reduceMotion: reduceMotion), value: appState.isComparing)
         .onAppear {
-            overlayChromeVisible = !overlayIsPresented
             synchronizeCompatibilitySidebarMotion(animated: false)
-        }
-        .onChange(of: overlayIsPresented) { isPresented in
-            updateOverlayChromeVisibility(isOverlayPresented: isPresented)
         }
         .onChange(of: appState.sidebarCollapsed) { _ in
             beginSidebarToggleFreeze()
             synchronizeCompatibilitySidebarMotion(animated: true)
         }
         .onDisappear {
-            overlayChromeRevealTask?.cancel()
             sidebarToggleTask?.cancel()
             sidebarVisibilityTask?.cancel()
-        }
-    }
-
-    // The chrome bars (top path bar + bottom scale control) stay hidden for the
-    // entire preview close and only fade back in *after* the overlay is removed
-    // (previewAssetID cleared → overlayIsPresented false). Revealing them mid-close
-    // made the floating pill fight the image as it zoomed back to a card sitting
-    // under the pill — no z-order looked right, and a tail dissolve of the image
-    // killed the satisfying "snap back home". Hiding chrome through the whole close
-    // lets the image land solidly with nothing overlapping it; the pill then settles
-    // back over the static grid. A short delay gives a clean "land, then chrome
-    // returns" beat.
-    private func updateOverlayChromeVisibility(isOverlayPresented: Bool) {
-        overlayChromeRevealTask?.cancel()
-
-        if isOverlayPresented {
-            // All controls use the same short opacity fade on entry.
-            overlayChromeVisible = false
-            return
-        }
-
-        guard !reduceMotion else {
-            overlayChromeVisible = true
-            return
-        }
-
-        overlayChromeRevealTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled else { return }
-            overlayChromeVisible = true
         }
     }
 
@@ -339,7 +314,7 @@ private struct SidebarResizeHandle: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var isResizing: Bool
     @GestureState private var isDragging = false
-    @State private var dragStartWidth: CGFloat?
+    @LightboxViewState private var dragStartWidth: CGFloat?
 
     var body: some View {
         // Invisible hit area — the resize cursor on hover is the only affordance

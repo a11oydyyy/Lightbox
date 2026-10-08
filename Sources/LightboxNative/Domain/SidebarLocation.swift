@@ -1,6 +1,6 @@
 import Foundation
 
-enum SidebarLocationID: String, CaseIterable, Codable, Hashable, Identifiable {
+enum SidebarLocationID: String, CaseIterable, Codable, Hashable, Identifiable, Sendable {
     case applications
     case desktop
     case documents
@@ -63,10 +63,14 @@ enum SidebarLocationID: String, CaseIterable, Codable, Hashable, Identifiable {
 }
 
 struct SidebarVolume: Identifiable, Hashable, Sendable {
-    var url: URL
+    let url: URL
     var displayName: String
+    let id: String
 
-    var id: String {
-        url.standardizedFileURL.path
+    init(url: URL, displayName: String) {
+        let normalized = url.standardizedFileURL
+        self.url = normalized
+        self.displayName = displayName
+        self.id = normalized.path
     }
 }

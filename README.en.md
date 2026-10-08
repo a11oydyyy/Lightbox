@@ -16,6 +16,7 @@ Pin frequently used locations and move quickly between project assets, Downloads
 - Light and dark appearances, mouse and keyboard controls, and accessibility support
 - English, Simplified Chinese, Traditional Chinese, and Japanese
 - Automatic update checks, with installation confirmed by the user
+- Optional [image analysis plugin](PLUGINS.md) for text recognition, descriptions, and tag suggestions (macOS 27)
 
 ## Download
 

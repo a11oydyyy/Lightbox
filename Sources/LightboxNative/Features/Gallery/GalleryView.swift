@@ -15,10 +15,17 @@ struct GalleryImagePriorityPlanner {
         isPrioritized: Bool,
         prefersFastRawThumbnails: Bool = false,
         permitsFullThumbnailPromotion: Bool = true,
-        isSettledVisible: Bool = false
+        isSettledVisible: Bool = false,
+        requiredPixelSize: CGFloat = .infinity
     ) -> ImageCacheQuality {
         // Storage and library size limit work while moving, not final on-screen quality.
-        if isSettledVisible { return .thumbnail }
+        // Keep sufficient decoded pixels while moving and at rest. Small cards
+        // must not repeatedly alternate between 480- and 1024-pixel requests.
+        if requiredPixelSize <= CGFloat(baseQuality.maxPixelSize) { return baseQuality }
+        if isSettledVisible {
+            return requiredPixelSize <= CGFloat(ImageCacheQuality.thumbnailBalanced.maxPixelSize)
+                ? .thumbnailBalanced : .thumbnail
+        }
         guard isPrioritized else { return baseQuality }
         guard permitsFullThumbnailPromotion else {
             switch baseQuality {
@@ -224,17 +231,38 @@ final class GalleryMasonryColumnCache {
         assets: [LightboxAsset],
         columnCount: Int,
         itemWidth: CGFloat,
+        preservesColumnAssignment: Bool = false,
         compute: () -> [[LightboxAsset]]
     ) -> [[LightboxAsset]] {
         let key = Key(
             columnCount: columnCount,
             itemWidthTenths: Int((itemWidth * 10).rounded())
         )
+        if preservesColumnAssignment, var cached = columnsByIdentity[identity],
+           cached.revision == revision, cached.key.columnCount == columnCount {
+            // A continuous zoom resizes the same cards until the column count
+            // changes. Re-packing them at each pointer sample creates needless
+            // identity moves and lazy-stack layout work.
+            cached.key = key
+            columnsByIdentity[identity] = cached
+            return cached.columns
+        }
         if var cached = columnsByIdentity[identity], cached.key == key {
             if cached.revision == revision { return cached.columns }
             // A metadata update in one recursive folder must not reflow every folder.
             // Compare full assets once per revision so cached card metadata stays current.
             if cached.assets == assets {
+                cached.revision = revision
+                columnsByIdentity[identity] = cached
+                return cached.columns
+            }
+            // Tag/name/file-signature updates should refresh cards without re-packing
+            // every masonry column. Only order and aspect ratio determine geometry.
+            if cached.assets.count == assets.count,
+               zip(cached.assets, assets).allSatisfy({ $0.id == $1.id && $0.aspectRatio == $1.aspectRatio }) {
+                let updated = Dictionary(assets.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+                cached.columns = cached.columns.map { $0.map { updated[$0.id] ?? $0 } }
+                cached.assets = assets
                 cached.revision = revision
                 columnsByIdentity[identity] = cached
                 return cached.columns
@@ -313,25 +341,33 @@ struct GalleryPerformanceProfile: Equatable {
     }
 }
 
+private struct GalleryPendingGroupScroll {
+    let token = UUID()
+    var assetID: LightboxAsset.ID
+    var groupID: String
+    var anchor: UnitPoint
+    var navigationToken: String
+}
+
 struct GalleryView: View {
     var isResizingSidebar = false
 
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var frozenColumns: Int?
-    @State private var lastViewportWidth: CGFloat = 0
-    @State private var lastViewportHeight: CGFloat = 0
-    @State private var scrollGeometry = GalleryScrollGeometry()
-    @State private var renderPlan: GalleryRenderPlan?
-    @State private var selectionRect: CGRect?
-    @State private var scrollDirection: GalleryScrollDirection = .stationary
-    @State private var isScrolling = false
-    @State private var contentVisible = true
-    @State private var restoredScrollGeneration = -1
-    @State private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
-    @State private var masonryColumnCache = GalleryMasonryColumnCache()
-    @State private var storagePerformanceCache = GalleryStoragePerformanceCache()
-    @State private var collapsedSearchGroupIDs: Set<String> = []
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+    @LightboxViewState private var frozenColumns: Int?
+    @LightboxViewState private var lastViewportWidth: CGFloat = 0
+    @LightboxViewState private var lastViewportHeight: CGFloat = 0
+    @LightboxViewState private var scrollGeometry = GalleryScrollGeometry()
+    @LightboxViewState private var selectionRect: CGRect?
+    @LightboxViewState private var contentVisible = true
+    @LightboxViewState private var restoredScrollGeneration = -1
+    @LightboxViewState private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
+    @LightboxViewState private var masonryColumnCache = GalleryMasonryColumnCache()
+    @LightboxViewState private var masonryPlacementCache = GalleryMasonryPlacementCache()
+    @LightboxViewState private var storagePerformanceCache = GalleryStoragePerformanceCache()
+    @LightboxViewState private var collapsedSearchGroupIDs: Set<String> = []
+    @LightboxViewState private var pendingGroupScroll: GalleryPendingGroupScroll?
 
     private let horizontalPadding = GalleryThumbnailSizing.horizontalPadding
 
@@ -390,12 +426,15 @@ struct GalleryView: View {
     var body: some View {
         GeometryReader { viewport in
             let geometryNavigationToken = navigationToken
+            // Reset before constructing cells so the first geometry callback
+            // cannot discard their freshly registered image-loading states.
+            let _ = prepareGeometry(for: geometryNavigationToken)
             let folderHorizontalPadding = horizontalPadding + imageColumnInset(viewportWidth: viewport.size.width)
             let activeAssets = appState.activeAssets
             let activeAssetIDs = appState.activeAssetIDs
             let performanceProfile = GalleryPerformanceProfile.current
             let prefersFastRawThumbnails = prefersFastRawThumbnails(activeAssets: activeAssets)
-            let plan = renderPlan ?? makeRenderPlan(viewportHeight: viewport.size.height)
+            let plan = scrollGeometry.renderPlan ?? makeRenderPlan(viewportHeight: viewport.size.height)
             let loadableAssetIDs = plan.loadableAssetIDs
             let prioritizedAssetIDs = plan.prioritizedAssetIDs
             let settledVisibleAssetIDs = plan.settledVisibleAssetIDs
@@ -403,7 +442,7 @@ struct GalleryView: View {
             let permitsFullThumbnailPromotion = galleryPermitsFullThumbnailPromotion(
                 assetCount: activeAssets.count,
                 performanceProfile: performanceProfile
-            ) && !isScrolling
+            ) && !scrollGeometry.isScrolling && !appState.isScalingThumbnails
             let usesReducedHover = appState.libraryLoadingStatus != nil || performanceProfile.reducesHoverEffects
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
@@ -421,9 +460,14 @@ struct GalleryView: View {
                         if !visibleFolders.isEmpty {
                             FolderRowView(
                                 folders: visibleFolders,
+                                availableWidth: max(0, viewport.size.width - 2 * folderHorizontalPadding),
                                 title: appState.localized(.folders),
                                 showInFinderTitle: appState.localized(.showInFinder),
                                 openInNewTabTitle: appState.localized(.openInNewTab),
+                                expandedTitle: appState.localized(.expandedState),
+                                collapsedTitle: appState.localized(.collapsedState),
+                                selectedFolderID: appState.selectedGalleryFolderID,
+                                clearSelection: { appState.clearSelection() },
                                 showsRelativePath: appState.hasSearchQuery
                             ) { folder in
                                 if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
@@ -436,6 +480,7 @@ struct GalleryView: View {
                             } reveal: { folder in
                                 appState.revealFolderInFinder(folder)
                             }
+                            .equatable()
                             .padding(.top, 58)
                             .padding(.horizontal, folderHorizontalPadding)
                             .padding(.bottom, 16)
@@ -498,6 +543,7 @@ struct GalleryView: View {
                                                 .padding(.horizontal, horizontalPadding)
                                             }
                                         }
+                                        .id(group.id)
                                     }
                                 }
                             } else {
@@ -523,7 +569,6 @@ struct GalleryView: View {
                         .padding(.bottom, 92)
                         .opacity(contentVisible ? 1 : 0)
                         .offset(y: contentVisible ? 0 : 8)
-                        .animation(MotionTokens.ifAllowed(MotionTokens.thumbnailScale, reduceMotion: reduceMotion), value: appState.thumbnailWidth)
                         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.galleryLayoutMode)
                     }
                     .coordinateSpace(name: "GalleryContent")
@@ -534,6 +579,11 @@ struct GalleryView: View {
                         }
                     }
                     .background(GalleryScrollBarConfigurator())
+                    .background(GalleryRefreshControl(
+                        isRefreshing: appState.isRefreshingGallery,
+                        isEnabled: !appState.hasActiveOverlay,
+                        refresh: appState.refreshGalleryFromGesture
+                    ))
                     }
                     .scrollIndicators(.automatic)
                     .id(navigationToken)
@@ -548,6 +598,7 @@ struct GalleryView: View {
                     .onPreferenceChange(SearchGroupHeaderFramePreferenceKey.self) { frames in
                         guard prepareGeometry(for: geometryNavigationToken) else { return }
                         scrollGeometry.groupHeaderFrames = frames
+                        finishPendingGroupScroll(using: scrollProxy)
                     }
                     .onAppear {
                         guard prepareGeometry(for: geometryNavigationToken) else { return }
@@ -559,6 +610,7 @@ struct GalleryView: View {
                     }
                     .onChange(of: navigationToken) { _ in
                         collapsedSearchGroupIDs.removeAll()
+                        pendingGroupScroll = nil
                         _ = prepareGeometry(for: navigationToken)
                         selectionRect = nil
                         playContentEntrance()
@@ -566,6 +618,7 @@ struct GalleryView: View {
                     }
                     .onChange(of: appState.activeAssetsRevision) { _ in
                         masonryColumnCache.retain(identities: Set(appState.searchAssetGroups.map(\.id)).union(["active"]))
+                        masonryPlacementCache.retain(identities: Set(appState.searchAssetGroups.map(\.id)).union(["active"]))
                         scrollGeometry.retain(activeAssetIDs: appState.activeAssetIDs)
                         refreshRenderPlan(viewportHeight: viewport.size.height)
                     }
@@ -577,13 +630,16 @@ struct GalleryView: View {
                         guard !appState.hasActiveOverlay, let id = appState.galleryKeyboardFocusID else { return }
                         if let frame = appState.previewSpaceFrame(for: id),
                            frame.minY >= 52, frame.maxY <= viewport.size.height - 55 { return }
-                        scrollProxy.scrollTo(id, anchor: .center)
+                        requestScroll(to: id, anchor: .center, using: scrollProxy)
                     }
                     .onChange(of: scrollRestoreAvailabilityToken) { _ in
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
                     .onChange(of: viewport.size.width) { width in
                         lastViewportWidth = width
+                    }
+                    .onChange(of: appState.isScalingThumbnails) { _ in
+                        refreshRenderPlan(viewportHeight: viewport.size.height)
                     }
                     .onChange(of: isResizingSidebar) { resizing in
                         if resizing {
@@ -622,13 +678,6 @@ struct GalleryView: View {
                         .allowsHitTesting(false)
                 }
 
-                if let status = appState.libraryLoadingStatus, !appState.includesSubfolders {
-                    GalleryLoadingIndicator(label: appState.loadingStatusText(status))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                        .padding(.top, 58)
-                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                }
-
                 if appState.isViewingTrash,
                    appState.trashAccessDenied,
                    activeAssets.isEmpty,
@@ -654,26 +703,8 @@ struct GalleryView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
                 }
 
-                if let status = appState.searchStatus, status.isSearching || status.isLoadingMetadata {
-                    ProgressView(LightboxLocalization.searchProgress(
-                        status, recursive: appState.includesSubfolders, language: appState.appLanguage
-                    ))
-                        .progressViewStyle(.circular)
-                        .controlSize(.small)
-                        .font(.caption)
-                        .monospacedDigit()
-                        .padding(10)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity,
-                               alignment: activeAssets.isEmpty ? .center : .topTrailing)
-                        .padding(.top, 58)
-                        .padding(.trailing, activeAssets.isEmpty ? 0 : 20)
-                        .transition(.opacity)
-                        .allowsHitTesting(false)
-                }
             }
             .coordinateSpace(name: "GallerySelectionSpace")
-            .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.libraryLoadingStatus)
             .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: showsEmptyState)
         }
         .onAppear {
@@ -682,8 +713,8 @@ struct GalleryView: View {
         .onDisappear {
             frameUpdateCoordinator.cancel()
             masonryColumnCache.removeAll()
+            masonryPlacementCache.removeAll()
             scrollGeometry.clear()
-            renderPlan = nil
             appState.setPreviewSpaceAssetFrameProvider(nil)
         }
     }
@@ -720,9 +751,7 @@ struct GalleryView: View {
         if scrollGeometry.resetIfNeeded(navigationToken: token) {
             frameUpdateCoordinator.cancel()
             masonryColumnCache.removeAll()
-            renderPlan = nil
-            isScrolling = false
-            scrollDirection = .stationary
+            masonryPlacementCache.removeAll()
         }
         return true
     }
@@ -732,11 +761,11 @@ struct GalleryView: View {
         scrollGeometry.updateOrigin(origin)
         if origin.scrollOffset != previousOffset, !isResizingSidebar {
             let direction: GalleryScrollDirection = origin.scrollOffset > previousOffset ? .down : .up
-            if scrollDirection != direction { scrollDirection = direction }
-            if !isScrolling { isScrolling = true }
+            scrollGeometry.scrollDirection = direction
+            scrollGeometry.isScrolling = true
             scrollGeometry.scheduleScrollSettled {
-                isScrolling = false
-                scrollDirection = .stationary
+                scrollGeometry.isScrolling = false
+                scrollGeometry.scrollDirection = .stationary
                 refreshRenderPlan(viewportHeight: viewportHeight)
             }
         }
@@ -768,9 +797,9 @@ struct GalleryView: View {
             ),
             prioritizedAssetIDs: GalleryImagePriorityPlanner.prioritizedAssetIDs(
                 activeAssets: assets, assetFrames: frames, viewportHeight: viewportHeight,
-                scrollDirection: scrollDirection, maxPrioritizedAssetCount: profile.maxPrioritizedAssetCount
+                scrollDirection: scrollGeometry.scrollDirection, maxPrioritizedAssetCount: profile.maxPrioritizedAssetCount
             ),
-            settledVisibleAssetIDs: isScrolling ? [] : Set(frames.compactMap { id, frame in
+            settledVisibleAssetIDs: scrollGeometry.isScrolling ? [] : Set(frames.compactMap { id, frame in
                 GalleryImagePriorityPlanner.isVisible(frame, viewportHeight: viewportHeight) ? id : nil
             })
         )
@@ -781,7 +810,16 @@ struct GalleryView: View {
         assetFrames: [LightboxAsset.ID: CGRect]? = nil
     ) {
         let plan = makeRenderPlan(viewportHeight: viewportHeight, assetFrames: assetFrames)
-        if scrollGeometry.replaceRenderPlan(plan) { renderPlan = plan }
+        scrollGeometry.replaceRenderPlan(plan)
+        let profile = GalleryPerformanceProfile.current
+        scrollGeometry.imageLoading.update(
+            plan: plan,
+            baseQuality: galleryThumbnailQuality(assetCount: appState.activeAssets.count, performanceProfile: profile),
+            prefersFastRawThumbnails: prefersFastRawThumbnails(activeAssets: appState.activeAssets),
+            permitsFullThumbnailPromotion: galleryPermitsFullThumbnailPromotion(
+                assetCount: appState.activeAssets.count, performanceProfile: profile
+            ) && !scrollGeometry.isScrolling && !appState.isScalingThumbnails
+        )
     }
 
     private func updateScrollAnchor(using frames: [LightboxAsset.ID: CGRect]) {
@@ -807,8 +845,45 @@ struct GalleryView: View {
         guard appState.activeAssetIDs.contains(anchorID) else { return }
 
         restoredScrollGeneration = generation
+        requestScroll(to: anchorID, anchor: .top, using: proxy)
+    }
+
+    private func requestScroll(to id: LightboxAsset.ID, anchor: UnitPoint, using proxy: ScrollViewProxy) {
+        pendingGroupScroll = nil
+        guard appState.usesRecursiveResults,
+              let group = appState.searchAssetGroups.first(where: { $0.assets.contains { $0.id == id } }),
+              appState.includesSubfolders || appState.searchAssetGroups.count > 1 else {
+            DispatchQueue.main.async { proxy.scrollTo(id, anchor: anchor) }
+            return
+        }
+        collapsedSearchGroupIDs.remove(group.id)
+        let request = GalleryPendingGroupScroll(assetID: id, groupID: group.id,
+            anchor: anchor, navigationToken: navigationToken)
+        pendingGroupScroll = request
+        if scrollGeometry.groupHeaderFrames[group.id] != nil {
+            finishPendingGroupScroll(using: proxy)
+        } else {
+            // An unmounted LazyVStack group has no inner asset marker yet.
+            // Reveal its known root first; the header preference confirms the
+            // group's children exist before resolving the requested asset.
+            DispatchQueue.main.async {
+                guard pendingGroupScroll?.token == request.token,
+                      navigationToken == request.navigationToken else { return }
+                proxy.scrollTo(group.id, anchor: .top)
+            }
+        }
+    }
+
+    private func finishPendingGroupScroll(using proxy: ScrollViewProxy) {
+        guard let request = pendingGroupScroll,
+              request.navigationToken == navigationToken,
+              scrollGeometry.groupHeaderFrames[request.groupID] != nil else { return }
         DispatchQueue.main.async {
-            proxy.scrollTo(anchorID, anchor: .top)
+            guard pendingGroupScroll?.token == request.token,
+                  navigationToken == request.navigationToken,
+                  appState.activeAssetIDs.contains(request.assetID) else { return }
+            pendingGroupScroll = nil
+            proxy.scrollTo(request.assetID, anchor: request.anchor)
         }
     }
 
@@ -831,6 +906,7 @@ struct GalleryView: View {
     private func storagePerformance(activeAssets: [LightboxAsset]) -> GalleryStoragePerformance {
         storagePerformanceCache.configuration(
             source: appState.selectedSource,
+            usesConservativeExternalLoading: appState.selectedSourceUsesConservativeExternalLoading,
             activeAssets: activeAssets,
             revision: appState.activeAssetsRevision
         )
@@ -856,6 +932,7 @@ struct GalleryView: View {
         performanceProfile: GalleryPerformanceProfile,
         menuTitles: AssetContextMenuTitles
     ) -> some View {
+        let geometryNavigationToken = navigationToken
         let minimumColumns = min(
             GalleryThumbnailSizing.maximumZoomColumnCount,
             max(1, activeAssets.count)
@@ -870,10 +947,38 @@ struct GalleryView: View {
             revision: appState.activeAssetsRevision,
             assets: activeAssets,
             columnCount: metrics.columns,
-            itemWidth: metrics.itemWidth
+            itemWidth: metrics.itemWidth,
+            preservesColumnAssignment: appState.isScalingThumbnails || isResizingSidebar
         ) {
             masonryColumns(for: activeAssets, columnCount: metrics.columns, itemWidth: metrics.itemWidth)
         }
+        if !voiceOverEnabled {
+            let placement = masonryPlacementCache.placement(identity: cacheIdentity,
+                revision: appState.activeAssetsRevision, columns: columns, itemWidth: metrics.itemWidth, assets: activeAssets)
+            GalleryVirtualMasonryGrid(placement: placement, width: metrics.usedWidth,
+                viewportHeight: lastViewportHeight, isScaling: appState.isScalingThumbnails,
+                revealAssetIDs: Set([appState.galleryKeyboardFocusID, appState.activeTabScrollAnchorAssetID].compactMap { $0 }),
+                framesChanged: { frames, removed, added, owner in
+                    guard prepareGeometry(for: geometryNavigationToken) else { return }
+                    for id in removed { _ = scrollGeometry.remove(id, owner: owner) }
+                    for (id, frame) in frames where appState.activeAssetIDs.contains(id) {
+                        _ = scrollGeometry.updateContentFrame(frame, for: id, owner: owner, registering: added.contains(id))
+                    }
+                    frameUpdateCoordinator.submit(.init(selectionFrames: frames), activeAssetIDs: activeAssetIDs) { _, _ in
+                        refreshRenderPlan(viewportHeight: lastViewportHeight)
+                    }
+                }) { asset in
+                assetCard(asset, itemWidth: metrics.itemWidth,
+                    itemHeight: metrics.itemWidth / max(0.35, asset.aspectRatio),
+                    activeAssetIDs: activeAssetIDs, loadableAssetIDs: loadableAssetIDs,
+                    prioritizedAssetIDs: prioritizedAssetIDs, settledVisibleAssetIDs: settledVisibleAssetIDs,
+                    thumbnailQuality: thumbnailQuality, permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
+                    prefersFastRawThumbnails: prefersFastRawThumbnails, usesReducedHover: usesReducedHover,
+                    performanceProfile: performanceProfile, menuTitles: menuTitles, reportsOwnFrame: false)
+            }
+            .frame(width: metrics.usedWidth)
+            .frame(maxWidth: .infinity, alignment: .center)
+        } else {
         HStack(alignment: .top, spacing: SpacingTokens.regular) {
             ForEach(Array(columns.enumerated()), id: \.offset) { _, columnAssets in
                 LazyVStack(spacing: SpacingTokens.regular) {
@@ -900,7 +1005,7 @@ struct GalleryView: View {
         }
         .frame(width: metrics.usedWidth)
         .frame(maxWidth: .infinity, alignment: .center)
-
+        }
     }
 
     private func assetCard(
@@ -916,9 +1021,17 @@ struct GalleryView: View {
         prefersFastRawThumbnails: Bool,
         usesReducedHover: Bool,
         performanceProfile: GalleryPerformanceProfile,
-        menuTitles: AssetContextMenuTitles
+        menuTitles: AssetContextMenuTitles,
+        reportsOwnFrame: Bool = true
     ) -> some View {
         let geometryNavigationToken = navigationToken
+        let requiredPixelSize = max(itemWidth, itemHeight) * (NSApp.mainWindow?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2)
+        let imageLoadingState = scrollGeometry.imageLoading.state(for: asset.id, requiredPixelSize: requiredPixelSize,
+            initial: GalleryImageLoadingConfiguration(
+                loadsImage: loadableAssetIDs.contains(asset.id),
+                priority: prioritizedAssetIDs.contains(asset.id) ? .high : .low,
+                quality: thumbnailQuality
+            ))
         return AssetCardView(
             asset: asset,
             keyboardFocusRequested: appState.galleryKeyboardFocusID == asset.id,
@@ -926,6 +1039,7 @@ struct GalleryView: View {
                 flushPendingFrames()
                 appState.handleGalleryKey(key, modifiers: modifiers, from: asset.id)
             },
+            onPreviewArrow: { appState.handlePreviewArrowDuringKeyboardHandoff($0) },
             onActivate: {
                 flushPendingFrames()
                 appState.showPreview(for: asset, sourceFrame: appState.previewSpaceFrame(for: asset.id))
@@ -947,6 +1061,7 @@ struct GalleryView: View {
                 isSettledVisible: settledVisibleAssetIDs.contains(asset.id)
             ),
             loadsImage: loadableAssetIDs.contains(asset.id),
+            imageLoadingState: imageLoadingState,
             compareTrayLabel: appState.compareTrayLabel(for: asset.id),
             isPreviewSourceHidden: appState.previewSourceHiddenAssetID == asset.id,
             isInteractionEnabled: !appState.hasActiveOverlay,
@@ -994,19 +1109,22 @@ struct GalleryView: View {
         .id(asset.id)
         .frame(width: itemWidth, height: itemHeight)
         .background {
-            AssetFrameProbe(id: asset.id) { frame in
+            if reportsOwnFrame {
+            AssetFrameProbe(id: asset.id) { frame, owner, isInitial in
                 guard prepareGeometry(for: geometryNavigationToken) else { return }
-                scrollGeometry.updateContentFrame(frame, for: asset.id)
+                guard scrollGeometry.updateContentFrame(frame, for: asset.id, owner: owner,
+                    registering: isInitial) else { return }
                 frameUpdateCoordinator.submit(.init(selectionFrames: [asset.id: frame]), activeAssetIDs: activeAssetIDs) { _, _ in
                     refreshRenderPlan(viewportHeight: lastViewportHeight)
                 }
-            } onDisappear: {
+            } onDisappear: { owner in
                 guard geometryNavigationToken == navigationToken,
                       geometryNavigationToken == scrollGeometry.navigationToken else { return }
-                scrollGeometry.remove(asset.id)
+                guard scrollGeometry.remove(asset.id, owner: owner) else { return }
                 frameUpdateCoordinator.remove(asset.id, activeAssetIDs: activeAssetIDs) { _, _ in
                     refreshRenderPlan(viewportHeight: lastViewportHeight)
                 }
+            }
             }
         }
     }
@@ -1228,85 +1346,29 @@ private struct SearchLimitHint: View {
     }
 }
 
-private struct GalleryLoadingIndicator: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.lightboxGlassOpacity) private var glassOpacity
-
-    var label: String
-
-    var body: some View {
-        let materialOpacity = GlassTokens.floatingCapsuleMaterialOpacity(glassOpacity)
-        let fillOpacity = GlassTokens.floatingCapsuleFillOpacity(glassOpacity, colorScheme: colorScheme)
-        let strokeOpacity = GlassTokens.floatingCapsuleStrokeOpacity(glassOpacity)
-        let shadowOpacity = GlassTokens.floatingCapsuleShadowOpacity(glassOpacity)
-
-        HStack(spacing: 9) {
-            LightboxLoadingSpinner()
-
-            Text(label)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(LightboxColorTokens.secondaryText)
-                .monospacedDigit()
-        }
-        .padding(.horizontal, 13)
-        .frame(height: 34)
-        .background(.ultraThinMaterial.opacity(materialOpacity), in: Capsule())
-        .background {
-            Capsule()
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(fillOpacity))
-        }
-        .overlay {
-            Capsule()
-                .stroke(Color.primary.opacity(strokeOpacity), lineWidth: 0.7)
-        }
-        .shadow(color: .black.opacity(shadowOpacity), radius: 8, y: 3)
-            .allowsHitTesting(false)
-    }
-}
-
-private struct LightboxLoadingSpinner: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isRotating = false
-
-    var body: some View {
-        Circle()
-            .trim(from: 0.18, to: 0.82)
-            .stroke(
-                Color.primary.opacity(0.62),
-                style: StrokeStyle(lineWidth: 1.7, lineCap: .round)
-            )
-            .frame(width: 13, height: 13)
-            .rotationEffect(.degrees(isRotating ? 360 : 0))
-            .animation(
-                reduceMotion ? nil : .linear(duration: 0.82).repeatForever(autoreverses: false),
-                value: isRotating
-            )
-            .onAppear {
-                isRotating = true
-            }
-            .onDisappear {
-                isRotating = false
-            }
-            .accessibilityHidden(true)
-    }
-}
-
-private struct FolderRowView: View {
-    @EnvironmentObject private var appState: AppState
-    private let folderTileWidth: CGFloat = 180
-    @State private var isExpanded = true
+private struct FolderRowView: View, Equatable {
+    @LightboxViewState private var isExpanded = true
 
     var folders: [LibraryFolderEntry]
+    var availableWidth: CGFloat
     var title: String
     var showInFinderTitle: String
     var openInNewTabTitle: String
+    var expandedTitle: String
+    var collapsedTitle: String
+    var selectedFolderID: LibraryFolderEntry.ID?
+    var clearSelection: () -> Void
     var showsRelativePath = false
     var open: (LibraryFolderEntry) -> Void
     var openInNewTab: (LibraryFolderEntry) -> Void
     var reveal: (LibraryFolderEntry) -> Void
 
-    private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: max(160, CGFloat(folderTileWidth))), spacing: 16, alignment: .leading)]
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.folders == rhs.folders && lhs.title == rhs.title && lhs.availableWidth == rhs.availableWidth
+            && lhs.showInFinderTitle == rhs.showInFinderTitle
+            && lhs.openInNewTabTitle == rhs.openInNewTabTitle
+            && lhs.expandedTitle == rhs.expandedTitle && lhs.collapsedTitle == rhs.collapsedTitle
+            && lhs.selectedFolderID == rhs.selectedFolderID && lhs.showsRelativePath == rhs.showsRelativePath
     }
 
     var body: some View {
@@ -1324,272 +1386,36 @@ private struct FolderRowView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityValue(appState.localized(isExpanded ? .expandedState : .collapsedState))
+            .accessibilityValue(isExpanded ? expandedTitle : collapsedTitle)
 
             if isExpanded {
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 2) {
-                    ForEach(folders) { folder in
-                        FolderCardView(
-                            folder: folder,
-                            showInFinderTitle: showInFinderTitle,
-                            openInNewTabTitle: openInNewTabTitle,
-                            showsRelativePath: showsRelativePath,
-                            isSelected: appState.selectedGalleryFolderID == folder.id,
-                            clearSelection: { appState.clearSelection() },
-                            open: open,
-                            openInNewTab: openInNewTab,
-                            reveal: reveal
-                        )
-                    }
-                }
+                NativeFolderGrid(
+                    folders: folders, availableWidth: availableWidth,
+                    showsRelativePath: showsRelativePath,
+                    selectedFolderID: selectedFolderID,
+                    showInFinderTitle: showInFinderTitle, openInNewTabTitle: openInNewTabTitle,
+                    clearSelection: clearSelection, open: open, openInNewTab: openInNewTab, reveal: reveal
+                )
+                .frame(height: FolderGridPlacement(count: folders.count, width: availableWidth,
+                                                  showsRelativePath: showsRelativePath).height)
             }
         }
-    }
-}
-
-private struct FolderCardView: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    var folder: LibraryFolderEntry
-    var showInFinderTitle: String
-    var openInNewTabTitle: String
-    var showsRelativePath: Bool
-    var isSelected: Bool
-    var clearSelection: () -> Void
-    @FocusState private var hasFocus: Bool
-    @State private var isHovering = false
-    var open: (LibraryFolderEntry) -> Void
-    var openInNewTab: (LibraryFolderEntry) -> Void
-    var reveal: (LibraryFolderEntry) -> Void
-
-    @State private var loadedTags: [String]?
-
-    private var resolvedTags: [String] {
-        MacColorTag.sort((loadedTags ?? folder.tags).filter(MacColorTag.isColorTag))
-    }
-
-    private var tagLoadID: String {
-        "\(folder.url.standardizedFileURL.path):\(folder.tags.joined(separator: ","))"
-    }
-
-    var body: some View {
-        let tags = resolvedTags
-        let iconColor = LightboxColorTokens.folderColor(tags)
-
-        Button {
-            open(folder)
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 15, weight: .medium))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(iconColor)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(folder.name)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(LightboxColorTokens.primaryText)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    if showsRelativePath,
-                       !folder.relativePath.isEmpty,
-                       folder.relativePath != folder.name {
-                        Text(folder.relativePath)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(LightboxColorTokens.mutedText)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-
-                Spacer(minLength: 4)
-
-                FolderTagDots(tags: tags)
-            }
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity, minHeight: showsRelativePath ? 44 : 36, alignment: .leading)
-            .background {
-                RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)
-                    .fill(isSelected ? LightboxColorTokens.navigationSelection : (isHovering ? LightboxColorTokens.primaryText.opacity(LightboxControlMetrics.hoverOpacity) : Color.clear))
-                    .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isHovering)
-                    .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isSelected)
-            }
-            .overlay {
-                if hasFocus && !isSelected {
-                    RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)
-                        .strokeBorder(LightboxColorTokens.secondaryText, lineWidth: LightboxControlMetrics.focusLineWidth)
-                        .allowsHitTesting(false)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-        .onDrag { NSItemProvider(object: folder.url as NSURL) }
-        .contextMenu {
-            Button {
-                openInNewTab(folder)
-            } label: {
-                Text(openInNewTabTitle)
-            }
-
-            Button {
-                reveal(folder)
-            } label: {
-                Text(showInFinderTitle)
-            }
-        }
-        .help(folder.name)
-        .accessibilityElement(children: .ignore)
-        .focusable()
-        .modifier(FolderFocusEffect(open: { open(folder) }))
-        .focused($hasFocus)
-        .background(FolderFocusDismissal(isFocused: hasFocus) { hasFocus = false })
-        .onExitCommand(perform: clearSelection)
-        .onChange(of: isSelected) { selected in
-            if selected { hasFocus = true }
-        }
-        .accessibilityLabel(folderAccessibilityLabel(tags))
-        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
-        .accessibilityAction { open(folder) }
-        .task(id: tagLoadID) {
-            await loadTagsIfNeeded()
-        }
-    }
-
-    private func loadTagsIfNeeded() async {
-        let inlineTags = MacColorTag.sort(folder.tags.filter(MacColorTag.isColorTag))
-        if !inlineTags.isEmpty {
-            loadedTags = inlineTags
-            return
-        }
-
-        if let cached = SidebarFolderTagCache.shared.cachedTags(for: folder.url) {
-            loadedTags = cached
-            return
-        }
-
-        let tags = await SidebarFolderTagCache.shared.tags(for: folder.url)
-        guard !Task.isCancelled else { return }
-        loadedTags = tags
-    }
-
-    private func folderAccessibilityLabel(_ tags: [String]) -> String {
-        let sortedTags = MacColorTag.sort(tags.filter(MacColorTag.isColorTag))
-        guard !sortedTags.isEmpty else { return folder.name }
-        return ([folder.name] + sortedTags).joined(separator: ", ")
-    }
-
-
-}
-
-private struct FolderFocusDismissal: NSViewRepresentable {
-    var isFocused: Bool
-    var dismiss: () -> Void
-
-    func makeNSView(context: Context) -> FolderFocusDismissalView {
-        FolderFocusDismissalView()
-    }
-
-    func updateNSView(_ view: FolderFocusDismissalView, context: Context) {
-        view.dismiss = dismiss
-        view.setObserving(isFocused)
-    }
-
-    static func dismantleNSView(_ view: FolderFocusDismissalView, coordinator: ()) {
-        view.setObserving(false)
-    }
-}
-
-private final class FolderFocusDismissalView: NSView {
-    var dismiss: () -> Void = {}
-    nonisolated(unsafe) private var monitor: Any?
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    func setObserving(_ enabled: Bool) {
-        if !enabled {
-            if let monitor { NSEvent.removeMonitor(monitor) }
-            monitor = nil
-        } else if monitor == nil {
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-                MainActor.assumeIsolated {
-                    if let self, let window = self.window, event.window === window,
-                       !self.bounds.contains(self.convert(event.locationInWindow, from: nil)) {
-                        self.dismiss()
-                    }
-                }
-                return event
-            }
-        }
-    }
-
-    deinit {
-        if let monitor { NSEvent.removeMonitor(monitor) }
-    }
-}
-
-private struct FolderFocusEffect: ViewModifier {
-    var open: () -> Void
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if #available(macOS 14.0, *) {
-            content.focusEffectDisabled()
-                .onKeyPress(keys: [.space, .return]) { press in
-                    guard press.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
-                    guard press.phase == .down else { return .handled }
-                    open()
-                    return .handled
-                }
-        } else {
-            content
-        }
-    }
-}
-
-private struct FolderTagDots: View {
-    var tags: [String]
-
-    private var visibleTags: [MacColorTag] {
-        MacColorTag.all.filter { tags.contains($0.name) }
-    }
-
-    var body: some View {
-        HStack(spacing: MacTagDotMetrics.sidebarSpacing) {
-            ForEach(visibleTags.prefix(3)) { tag in
-                Circle()
-                    .fill(tag.color)
-                    .frame(
-                        width: MacTagDotMetrics.folderCardDotDiameter,
-                        height: MacTagDotMetrics.folderCardDotDiameter
-                    )
-                    .overlay {
-                        Circle()
-                            .stroke(.white.opacity(0.78), lineWidth: MacTagDotMetrics.folderCardStrokeWidth)
-                    }
-                    .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
-            }
-        }
-        .frame(minWidth: visibleTags.isEmpty ? 0 : 30, alignment: .trailing)
-        .allowsHitTesting(false)
     }
 }
 
 private struct AssetFrameProbe: View {
     var id: LightboxAsset.ID
-    var onUpdate: (CGRect) -> Void
-    var onDisappear: () -> Void
+    var onUpdate: (CGRect, UUID, Bool) -> Void
+    var onDisappear: (UUID) -> Void
+    @LightboxViewState private var owner = UUID()
 
     var body: some View {
         GeometryReader { proxy in
             let frame = proxy.frame(in: .named("GalleryContent"))
             Color.clear
-                .onAppear { onUpdate(frame) }
-                .onChange(of: frame) { onUpdate($0) }
-                .onDisappear { onDisappear() }
+                .onAppear { onUpdate(frame, owner, true) }
+                .onChange(of: frame) { onUpdate($0, owner, false) }
+                .onDisappear { onDisappear(owner) }
         }
     }
 }

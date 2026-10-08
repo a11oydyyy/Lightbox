@@ -95,7 +95,26 @@ private func makeTestAppState(
     )
 }
 
-@Test @MainActor func pinCurrentFolderPreservesBrowsingContext() throws {
+@Test @MainActor func thumbnailScalingPublishesOneCompleteTabSnapshot() throws {
+    let defaults = try #require(LightboxTestUserDefaults())
+    let state = makeTestAppState(libraryDefaults: defaults)
+    var snapshots: [LightboxTab] = []
+    let subscription = state.$tabs.dropFirst().sink { tabs in
+        if let tab = tabs.first(where: { $0.id == state.activeTabID }) { snapshots.append(tab) }
+    }
+    state.thumbnailWidth = 248
+    #expect(snapshots.count == 1)
+    #expect(snapshots.first?.thumbnailWidth == 248)
+    #expect(snapshots.first?.layoutMode == state.galleryLayoutMode)
+    state.thumbnailWidth = 248
+    #expect(snapshots.count == 1)
+    state.newTab() // Flush the final scale value before leaving the active tab.
+    let saved = try #require(LightboxTabStore.load(sources: state.sources, defaults: defaults))
+    #expect(saved.tabs.first?.thumbnailWidth == 248)
+    withExtendedLifetime(subscription) {}
+}
+
+@Test @MainActor func pinCurrentFolderPreservesBrowsingContext() async throws {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxPin-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -107,7 +126,7 @@ private func makeTestAppState(
     let source = state.selectedSourceID
     let scroll = state.scrollRestoreGeneration
     state.pinCurrentPath()
-    #expect(state.isFolderPinned(folder))
+    #expect(await waitForLightboxState { state.isFolderPinned(folder) })
     #expect(state.currentFolderURL == folder)
     #expect(state.selectedSourceID == source)
     #expect(state.searchText == "keep this search")
@@ -301,6 +320,53 @@ private func makeTestAppState(
 
 @Test func previewSourceRevealHappensJustBeforeCloseFinishes() async throws {
     #expect(MotionTokens.previewSourceRevealDelay < MotionTokens.previewGeometryDuration)
+}
+
+@Test @MainActor func previewChromeReturnsWithFolderRevealAndHidesAgainOnReopen() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LightboxChromeReturn-\(UUID().uuidString)", isDirectory: true)
+    let folder = root.appendingPathComponent("Photos", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let defaults = try #require(LightboxTestUserDefaults())
+    let source = LibrarySource(id: "chrome-return", name: "Photos", rootURL: folder, kind: .external)
+    let tab = LightboxTab(source: source, folderURL: folder)
+    LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
+    let state = makeTestAppState(indexDatabaseURL: root.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
+    try #require(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    defer { state.closePreview() }
+    let header = NativeNavigationBar(appState: state)
+    header.frame = NSRect(x: 0, y: 0, width: 600, height: 40)
+    header.refresh()
+    let point = NSPoint(x: 300, y: 15)
+    try #require(header.hitTest(point) != nil)
+    let asset = previewRouteAsset(id: "chrome-return", name: "return.jpg", addedAt: 0)
+    state.assets = [asset]
+    state.showPreview(for: asset)
+    state.hidePreviewSourceForCurrentPreview(asset.id)
+    #expect(!state.isOverlayChromeVisible)
+    try #require(state.beginPreviewClose(after: .milliseconds(300), revealSourceAfter: .milliseconds(50)))
+    // Chrome returns immediately while the source pixels are still hidden.
+    #expect(state.isOverlayChromeVisible)
+    #expect(state.previewSourceHiddenAssetID == asset.id)
+    try #require(state.isPreviewClosing)
+    #expect(state.previewAssetID == asset.id)
+    #expect(state.hasActiveOverlay)
+    header.refresh()
+    #expect(header.layer?.opacity == 1)
+    #expect(header.hitTest(point) == nil)
+    try #require(await waitForLightboxState { state.previewSourceHiddenAssetID == nil && state.isPreviewClosing })
+    try #require(state.reopenPreviewDuringClose(for: asset.id))
+    #expect(!state.isOverlayChromeVisible)
+    header.refresh()
+    #expect(header.layer?.opacity == 0)
+    try await Task.sleep(for: .milliseconds(320))
+    #expect(state.previewAssetID == asset.id)
+    #expect(!state.isOverlayChromeVisible)
+    state.closePreview()
+    #expect(state.isOverlayChromeVisible)
+    header.refresh()
+    #expect(header.hitTest(point) != nil)
 }
 
 @Test func previewHighResolutionUpgradeWaitsForGeometryToSettle() async throws {
@@ -1022,12 +1088,20 @@ private func makeTestAppState(
     let defaults = try #require(LightboxTestUserDefaults())
     let state = makeTestAppState(libraryDefaults: defaults)
     state.newTab()
+    state.galleryLayoutMode = .recursive
+    state.searchText = "saved query"
+    state.thumbnailWidth = 248
     let id = state.activeTabID
+    LightboxTabStore.save(tabs: state.tabs, activeTabID: id, defaults: defaults)
     let restored = makeTestAppState(libraryDefaults: defaults)
     #expect(restored.activeTabID == id)
     #expect(restored.isShowingStartPage)
     #expect(restored.assets.isEmpty)
     #expect(restored.libraryLoadingStatus == nil)
+    #expect(restored.galleryLayoutMode == .recursive)
+    #expect(restored.searchText == "saved query")
+    #expect(restored.thumbnailWidth == 248)
+    #expect(restored.tabs.first(where: { $0.id == id })?.thumbnailWidth == 248)
     #expect(!restored.canOpenParentFolder)
     #expect(!restored.canPinCurrentPath)
     #expect(!restored.canReceiveFileDrop(on: id))
@@ -1067,6 +1141,149 @@ private func makeTestAppState(
 }
 
 @MainActor
+private final class HeaderMouseUpReceiver: NSView {
+    var clickCounts: [Int] = []
+
+    override func mouseUp(with event: NSEvent) {
+        clickCounts.append(event.clickCount)
+    }
+}
+
+@MainActor
+@Test func nativeHeaderDoesNotForwardRecognizedDoubleClickToTitlebar() throws {
+    let parent = HeaderMouseUpReceiver()
+    let navigation = NativeNavigationBar(appState: makeTestAppState())
+    let dragArea = TitlebarInteractionView()
+    for view in [navigation, dragArea] {
+        parent.addSubview(view)
+        for count in [1, 2, 4] {
+            let event = try #require(NSEvent.mouseEvent(with: .leftMouseUp, location: .zero,
+                modifierFlags: [], timestamp: Double(count), windowNumber: 0,
+                context: nil, eventNumber: count, clickCount: count, pressure: 0))
+            view.mouseUp(with: event)
+        }
+        #expect(parent.clickCounts == [1])
+        parent.clickCounts.removeAll()
+        view.removeFromSuperview()
+    }
+}
+
+@MainActor
+@Test func nativeBreadcrumbHoverPreservesGeometryAndSkipsCurrentFolderAndSeparators() throws {
+    let path = BreadcrumbPathControl(frame: NSRect(x: 0, y: 0, width: 700, height: 19))
+    path.font = .systemFont(ofSize: 11)
+    path.backgroundColor = .clear
+    let source = NSPathControl()
+    source.url = URL(fileURLWithPath: "/Users/Shared")
+    let items = source.pathItems
+    for item in items {
+        item.image = nil
+        item.attributedTitle = NSAttributedString(string: item.title, attributes: [
+            .font: path.font!, .foregroundColor: NSColor.secondaryLabelColor
+        ])
+    }
+    path.setPathItems(items)
+    let cell = try #require(path.cell as? NSPathCell)
+    func frames() -> [NSRect] {
+        cell.pathComponentCells.map { cell.rect(of: $0, withFrame: path.bounds, in: path) }
+    }
+    let before = frames()
+    func move(to point: NSPoint) throws {
+        let event = try #require(NSEvent.mouseEvent(with: .mouseMoved, location: point,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+            eventNumber: 0, clickCount: 0, pressure: 0))
+        path.mouseMoved(with: event)
+    }
+    let ancestor = cell.pathComponentCells[1].titleRect(forBounds: before[1])
+    try move(to: NSPoint(x: ancestor.midX, y: ancestor.midY))
+    #expect(items[1].attributedTitle.attribute(.underlineStyle, at: 0, effectiveRange: nil) == nil)
+    #expect(items[1].attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .labelColor)
+    #expect(frames() == before)
+    #expect(items[1].attributedTitle.attribute(.font, at: 0, effectiveRange: nil) as? NSFont == path.font)
+
+    try move(to: NSPoint(x: before[1].maxX - 1, y: before[1].midY))
+    #expect(items.allSatisfy { $0.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .secondaryLabelColor })
+    try move(to: NSPoint(x: before.last!.midX, y: before.last!.midY))
+    #expect(items.allSatisfy { $0.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .secondaryLabelColor })
+    try move(to: NSPoint(x: ancestor.midX, y: ancestor.midY))
+    path.setPathItems([])
+    #expect(items[1].attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .secondaryLabelColor)
+}
+
+@MainActor
+@Test func nativeHeaderKeepsCurrentFolderInPathWhileShowingScanProgress() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxHeader-\(UUID())/Child")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder.deletingLastPathComponent()) }
+    let state = makeTestAppState()
+    state.currentFolderURL = folder
+    state.libraryLoadingStatus = nil
+    let header = NativeNavigationBar(appState: state)
+    let path = try #require(header.subviews.compactMap { $0 as? NSPathControl }.first)
+    let title = try #require(header.subviews.compactMap { $0 as? NSButton }.first { $0.title == "Child" })
+    #expect(path.pathItems.map { $0.url?.path } == state.breadcrumbs.map { Optional($0.url.path) })
+    #expect(path.pathItems.last?.title == "Child")
+
+    state.searchText = "scan"
+    #expect(state.searchStatus?.isSearching == true)
+    header.refresh()
+    header.layoutSubtreeIfNeeded()
+    #expect(title.alphaValue == 0)
+    #expect(title.isHidden)
+    #expect(!title.isEnabled)
+    #expect(path.pathItems.last?.url?.path == folder.standardizedFileURL.path)
+    let progress = try #require(header.subviews.flatMap(\.subviews).compactMap { $0 as? NSTextField }
+        .first { $0.stringValue == state.navigationActivityText })
+    #expect(progress.superview?.alphaValue == 1)
+
+    state.searchText = ""
+    state.libraryLoadingStatus = .init(phase: .preparingPreviews, processed: 4, total: 8)
+    header.refresh()
+    #expect(progress.stringValue == state.navigationActivityText)
+    state.libraryLoadingStatus = nil
+    header.refresh()
+    header.layoutSubtreeIfNeeded()
+    #expect(title.alphaValue == 1)
+    #expect(title.isEnabled)
+    #expect(progress.superview?.alphaValue == 0)
+    #expect(progress.superview?.isHidden == true)
+    #expect(path.pathItems.last?.title == "Child")
+}
+
+@MainActor
+@Test func nativeHeaderCounterKeepsLatestValueAndCancelsOldPhase() async throws {
+    let label = NativeProgressLabel()
+    label.frame = NSRect(x: 0, y: 0, width: 600, height: 23)
+    let window = NSWindow(contentRect: label.frame, styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = label
+    defer { window.close() }
+    label.setText("Scanning… 0 images · 0 items", animated: false)
+    for count in 1...50 {
+        label.setText("Scanning… \(count) images · \(count) items", animated: true)
+    }
+    #expect(label.stringValue == "Scanning… 50 images · 50 items")
+    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        #expect(label.displayedText == "Scanning… 1 images · 1 items")
+    }
+    #expect(await waitForLightboxState {
+        label.displayedText == "Scanning… 50 images · 50 items"
+    })
+    label.setText("Scanning… 51 images · 51 items", animated: true)
+    let newPhase = "Loading image details… 0 / 51"
+    label.setText(newPhase, animated: true)
+    #expect(label.displayedText == newPhase)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(label.displayedText == newPhase)
+    label.setText("Loading image details… 1 / 51", animated: true)
+    label.setText("Loading image details… 51 / 51", animated: true)
+    label.cancelPendingUpdates()
+    #expect(label.displayedText == label.stringValue)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(label.displayedText == "Loading image details… 51 / 51")
+}
+
+@MainActor
 @Test func nativeHeaderFadesBackWithoutRestartingOnRefresh() {
     let state = makeTestAppState()
     let header = NativeNavigationBar(appState: state)
@@ -1079,8 +1296,11 @@ private func makeTestAppState(
     header.refresh()
     #expect(!header.isHidden)
     if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-        let start = header.layer?.animation(forKey: "previewChromeReveal")?.beginTime
+        let reveal = header.layer?.animation(forKey: "previewChromeReveal")
+        let start = reveal?.beginTime
         #expect(start != nil)
+        #expect((start ?? .infinity) <= CACurrentMediaTime())
+        #expect(reveal?.duration == MotionTokens.chromeRevealDurationSeconds)
         header.refresh()
         #expect(header.layer?.animation(forKey: "previewChromeReveal")?.beginTime == start)
     }
@@ -1141,6 +1361,61 @@ private func makeTestAppState(
     restored.openSidebarFolderInNewTab(unconfigured)
     #expect(restored.sortField == .time)
     #expect(restored.sortDirection == .descending)
+}
+
+@Test(arguments: [GalleryLayoutMode.masonry, .recursive])
+@MainActor func folderAndHistoryNavigationClearOldSnapshotAndRestoreDestinationSort(mode: GalleryLayoutMode) async throws {
+    let work = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxNavigationSnapshot-\(UUID())")
+    let first = work.appendingPathComponent("A")
+    let second = work.appendingPathComponent("B")
+    let nested = first.appendingPathComponent("Child")
+    for folder in [first, second, nested] {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let image = folder.appendingPathComponent("needle.jpg")
+        try Data().write(to: image)
+        #expect(FinderTagStore.setColorTags(["Red"], for: image))
+    }
+    defer { try? FileManager.default.removeItem(at: work) }
+    let defaults = LightboxTestUserDefaults()!
+    let state = makeTestAppState(libraryDefaults: defaults, searchDimensionProbe: { _ in CGSize(width: 40, height: 60) })
+    let source = LibrarySource.favorites(rootURL: work)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil && state.folderEntries.count == 2 })
+    state.openSidebarFolder(first)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil && state.assets.count == 1 })
+    state.galleryLayoutMode = mode
+    state.searchText = "needle"
+    #expect(await waitForLightboxState { state.searchStatus?.isSearching == false
+        && state.searchStatus?.isLoadingMetadata == false && !state.activeAssets.isEmpty })
+    state.selectedFilter = .tag("Red")
+    #expect(!state.activeAssets.isEmpty)
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    state.replaceSelection(with: [try #require(state.activeAssets.first).id])
+    state.galleryKeyboardFocusID = state.activeAssets.first?.id
+    defaults.set(["field": GallerySortField.size.rawValue, "direction": GallerySortDirection.descending.rawValue],
+        forKey: "Lightbox.folderSort.v1.folder:" + second.standardizedFileURL.path)
+
+    state.openParentFolder()
+    #expect(state.currentFolderURL == work.standardizedFileURL)
+    #expect(state.assets.isEmpty && state.folderEntries.isEmpty && state.searchAssetGroups.isEmpty)
+    #expect(state.activeAssets.isEmpty && state.activeFolderEntries.isEmpty)
+    #expect(state.searchText.isEmpty && state.selectedFilter == .all && state.selectedAssetIDs.isEmpty)
+    #expect(state.galleryKeyboardFocusID == nil)
+    state.goBack()
+    #expect(state.currentFolderURL == first.standardizedFileURL)
+    #expect(state.assets.isEmpty && state.activeAssets.isEmpty && state.folderEntries.isEmpty)
+    #expect(state.sortField == .fileName && state.sortDirection == .ascending)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil && !state.activeAssets.isEmpty
+        && state.searchStatus?.isSearching != true && state.searchStatus?.isLoadingMetadata != true })
+    state.openSidebarFolder(second)
+    #expect(state.assets.isEmpty && state.activeAssets.isEmpty && state.folderEntries.isEmpty)
+    #expect(state.sortField == .size && state.sortDirection == .descending)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil && state.activeAssets.count == 1
+        && state.searchStatus?.isSearching != true && state.searchStatus?.isLoadingMetadata != true })
+    #expect(state.activeAssets.allSatisfy { $0.sourceURL?.deletingLastPathComponent().standardizedFileURL == second.standardizedFileURL })
+    state.newTab()
 }
 
 @MainActor
@@ -1495,6 +1770,196 @@ private func makeTestAppState(
     probeGate.signal()
     try? await Task.sleep(for: .milliseconds(100))
     #expect(appState.previewAssetID == nil)
+}
+
+@MainActor
+private func trashPreviewAsset(_ index: Int) -> LightboxAsset {
+    var asset = previewRouteAsset(id: "trash-preview-\(index)", name: "\(index).png",
+        addedAt: Double(index), sourceURL: URL(fileURLWithPath: "/tmp/lightbox-trash-preview/\(index).png"))
+    asset.metadataLoaded = true
+    return asset
+}
+
+@MainActor
+@Test(arguments: [(3, 0, 1), (3, 1, 2), (3, 2, 1), (1, 0, -1)])
+func previewTrashContinuesWithoutReopening(count: Int, index: Int, next: Int) async throws {
+    let state = makeTestAppState(systemTrashMover: { _ in true })
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    let assets = (0..<count).map(trashPreviewAsset)
+    state.assets = assets
+    state.showPreview(for: assets[index])
+    let session = state.previewSessionID
+    defer { state.closePreview() }
+
+    state.deleteSelectedAssets()
+    #expect(await waitForLightboxState { !state.assets.contains { $0.id == assets[index].id } })
+    if next < 0 {
+        #expect(state.previewAssetID == nil)
+        #expect(!state.isPreviewPresented)
+    } else {
+        #expect(state.previewAssetID == assets[next].id)
+        #expect(state.selectedAssetID == assets[next].id)
+        #expect(state.isPreviewPresented)
+        #expect(state.previewSessionID == session)
+        #expect(state.previewStepDirection == (next > index ? .next : .previous))
+    }
+}
+
+@MainActor
+@Test func previewTrashUsesVisibleSortAndFilter() async throws {
+    let state = makeTestAppState(systemTrashMover: { _ in true })
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    var first = trashPreviewAsset(0)
+    let hidden = trashPreviewAsset(1)
+    var middle = trashPreviewAsset(2)
+    var last = trashPreviewAsset(3)
+    first.tags = ["Red"]
+    middle.tags = ["Red"]
+    last.tags = ["Red"]
+    state.selectedFilter = .tag("Red")
+    state.sortField = .fileName
+    state.sortDirection = .descending
+    state.assets = [first, hidden, middle, last]
+    #expect(state.activeAssets.map(\.id) == [last.id, middle.id, first.id])
+    state.showPreview(for: middle)
+    defer { state.closePreview() }
+    state.markDeleted(middle)
+    #expect(await waitForLightboxState { !state.assets.contains { $0.id == middle.id } })
+    #expect(state.previewAssetID == first.id)
+    #expect(state.previewStepDirection == .next)
+    #expect(state.assets.contains { $0.id == hidden.id })
+}
+
+@MainActor
+@Test func previewTrashFailureKeepsCurrentImage() async throws {
+    let calls = LockedCounter()
+    let state = makeTestAppState(systemTrashMover: { _ in calls.increment(); return false })
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    let current = trashPreviewAsset(0)
+    state.assets = [current, trashPreviewAsset(1)]
+    state.showPreview(for: current)
+    defer { state.closePreview() }
+    state.deleteSelectedAssets()
+    #expect(await waitForLightboxState { calls.value == 1 })
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(state.previewAssetID == current.id)
+    #expect(state.assets.count == 2)
+    #expect(state.isPreviewPresented)
+}
+
+@MainActor
+@Test func previewTrashDoesNotReplaceImageUserAlreadyOpened() async throws {
+    let gate = DispatchSemaphore(value: 0)
+    let started = LockedCounter()
+    defer { gate.signal() }
+    let state = makeTestAppState(systemTrashMover: { _ in started.increment(); gate.wait(); return true })
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    let assets = (0..<3).map(trashPreviewAsset)
+    state.assets = assets
+    state.showPreview(for: assets[0])
+    state.deleteSelectedAssets()
+    #expect(await waitForLightboxState { started.value == 1 })
+    state.showPreview(for: assets[2])
+    let session = state.previewSessionID
+    defer { state.closePreview() }
+    gate.signal()
+    #expect(await waitForLightboxState { !state.assets.contains { $0.id == assets[0].id } })
+    #expect(state.previewAssetID == assets[2].id)
+    #expect(state.previewSessionID == session)
+}
+
+@MainActor
+@Test func previewTrashResolvesNextImageWithoutClosingOverlay() async throws {
+    let state = makeTestAppState(previewDimensionProbe: { _ in
+        Thread.sleep(forTimeInterval: 0.15)
+        return CGSize(width: 400, height: 300)
+    }, systemTrashMover: { _ in true })
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    let current = trashPreviewAsset(0)
+    var next = trashPreviewAsset(1)
+    next.width = 1
+    next.height = 1
+    next.metadataLoaded = false
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    state.assets = [current, next]
+    state.showPreview(for: current)
+    var closedDuringSwitch = false
+    let subscription = state.$previewAssetID.dropFirst().sink { if $0 == nil { closedDuringSwitch = true } }
+    defer { subscription.cancel(); state.closePreview() }
+    state.deleteSelectedAssets()
+    #expect(await waitForLightboxState { state.previewAssetID == next.id && state.previewAsset?.metadataLoaded == true })
+    #expect(state.previewAsset?.width == 400)
+    #expect(state.previewAsset?.height == 300)
+    #expect(!closedDuringSwitch)
+}
+
+@MainActor
+@Test func previewTrashSurvivesDirectoryRefreshBeforeMoveCompletion() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxTrashRefresh-\(UUID())")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    for name in ["0.jpg", "1.jpg"] { try Data([1]).write(to: root.appendingPathComponent(name)) }
+    let gate = DispatchSemaphore(value: 0)
+    let removed = LockedCounter()
+    defer { gate.signal(); try? FileManager.default.removeItem(at: root) }
+    let state = makeTestAppState(previewDimensionProbe: { _ in CGSize(width: 400, height: 300) },
+        systemTrashMover: { url in
+            do { try FileManager.default.removeItem(at: url) } catch { return false }
+            removed.increment()
+            gate.wait()
+            return true
+        })
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil && state.activeAssets.count == 2 })
+    let current = try #require(state.activeAssets.first)
+    let next = try #require(state.activeAssets.last)
+    state.showPreview(for: current)
+    #expect(await waitForLightboxState { state.previewAssetID == current.id })
+    let session = state.previewSessionID
+    defer { state.closePreview() }
+    state.deleteSelectedAssets()
+    #expect(await waitForLightboxState { removed.value == 1 })
+    state.refreshLibrary(preservingVisibleSnapshot: true)
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil && state.activeAssets.count == 1 })
+    #expect(state.previewAssetID == current.id)
+    gate.signal()
+    #expect(await waitForLightboxState { state.previewAssetID == next.id })
+    #expect(state.previewSessionID == session)
+    #expect(state.isPreviewPresented)
+}
+
+@MainActor
+@Test func previewTrashKeepsPendingPreviousNavigationDirection() async throws {
+    let gate = DispatchSemaphore(value: 0)
+    let started = LockedCounter()
+    defer { gate.signal() }
+    let state = makeTestAppState(previewDimensionProbe: { _ in
+        Thread.sleep(forTimeInterval: 0.15)
+        return CGSize(width: 400, height: 300)
+    }, systemTrashMover: { _ in started.increment(); gate.wait(); return true })
+    #expect(await waitForLightboxState { state.libraryLoadingStatus == nil })
+    var previous = trashPreviewAsset(0)
+    previous.metadataLoaded = false
+    previous.width = 1
+    previous.height = 1
+    let current = trashPreviewAsset(1)
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    state.assets = [previous, current, trashPreviewAsset(2)]
+    state.showPreview(for: current)
+    defer { state.closePreview() }
+    state.deleteSelectedAssets()
+    #expect(await waitForLightboxState { started.value == 1 })
+    state.stepPreview(.previous)
+    gate.signal()
+    #expect(await waitForLightboxState { state.previewAssetID == previous.id })
+    #expect(state.previewStepDirection == .previous)
 }
 
 @MainActor
@@ -2970,6 +3435,9 @@ private func previewRouteAsset(
     #expect(external.tagLimit(assetCount: 20) == 12)
     #expect(external.startDelayMilliseconds == 1_600)
     #expect(externalTagFilter.tagLimit(assetCount: 110) == 110)
+    let attachedSSD = AssetMetadataRefreshPolicy(usesConservativeExternalLoading: true, isLocalVolume: true)
+    #expect(attachedSSD.startDelayMilliseconds == 100)
+    #expect(attachedSSD.tagLimit(assetCount: 110) == 12)
 }
 
 @MainActor
@@ -3114,6 +3582,29 @@ private func previewRouteAsset(
     }
     #expect(GalleryAssetSorter.sorted(equalTimeAssets, field: .time, direction: .ascending).map(\.originalName) == ["a.jpg", "b.png", "c.raw"])
     #expect(GalleryAssetSorter.sorted(equalTimeAssets, field: .time, direction: .descending).map(\.originalName) == ["c.raw", "b.png", "a.jpg"])
+}
+
+@Test func galleryTypeSortPreservesURLPrecedenceFallbackAndNaturalTieBreaks() {
+    func asset(_ id: String, _ name: String, _ path: String? = nil) -> LightboxAsset {
+        LightboxAsset(id: id, originalName: name, width: 100, height: 100, tags: [],
+            sourceURL: path.map { URL(fileURLWithPath: $0) }, addedAt: .distantPast,
+            palette: MockPalette.imported[0])
+    }
+    let items = [
+        asset("png-url", "0.jpg", "/tmp/穿搭 素材/图片.png"),
+        asset("asset10", "img2.JPG"),
+        asset("name10", "img10.jpg", "/tmp/穿搭 素材/图片.JpG"),
+        asset("empty", "README"),
+        asset("jpeg-fallback", "backup.JPEG", "/tmp/no-extension"),
+        asset("asset2", "img2.JPG"),
+        asset("jpg-url", "z.png", "/tmp/穿搭 素材/图片.JPG")
+    ]
+    let ascending = ["empty", "jpeg-fallback", "asset2", "asset10", "name10", "jpg-url", "png-url"]
+    #expect(GalleryAssetSorter.sorted(items, field: .type, direction: .ascending).map(\.id) == ascending)
+    #expect(GalleryAssetSorter.sorted(items, field: .type, direction: .descending).map(\.id) == ascending.reversed())
+    var renamed = items[0]
+    renamed.sourceURL = URL(fileURLWithPath: "/tmp/图片.gif")
+    #expect(GalleryAssetSorter.sorted([items[1], renamed], field: .type, direction: .ascending).first?.id == "png-url")
 }
 
 @MainActor
@@ -3604,12 +4095,12 @@ private func previewRouteAsset(
         try? FileManager.default.removeItem(at: root)
     }
 
-    #expect(AppState.resolvedFolderURL(from: "Agent Files", relativeTo: root) == child.standardizedFileURL)
-    #expect(AppState.resolvedFolderURL(from: child.path, relativeTo: root) == child.standardizedFileURL)
-    #expect(AppState.resolvedFolderURL(from: child.absoluteString, relativeTo: root) == child.standardizedFileURL)
-    #expect(AppState.resolvedFolderURL(from: "~", relativeTo: root)?.path == FileManager.default.homeDirectoryForCurrentUser.path)
-    #expect(AppState.resolvedFolderURL(from: file.path, relativeTo: root) == nil)
-    #expect(AppState.resolvedFolderURL(from: "missing", relativeTo: root) == nil)
+    #expect(await AppState.resolvedFolderURL(from: "Agent Files", relativeTo: root) == child.standardizedFileURL)
+    #expect(await AppState.resolvedFolderURL(from: child.path, relativeTo: root) == child.standardizedFileURL)
+    #expect(await AppState.resolvedFolderURL(from: child.absoluteString, relativeTo: root) == child.standardizedFileURL)
+    #expect(await AppState.resolvedFolderURL(from: "~", relativeTo: root)?.path == FileManager.default.homeDirectoryForCurrentUser.path)
+    #expect(await AppState.resolvedFolderURL(from: file.path, relativeTo: root) == nil)
+    #expect(await AppState.resolvedFolderURL(from: "missing", relativeTo: root) == nil)
 }
 
 @Test func localImageSourceCancelledFolderSnapshotStopsBeforeClassification() async throws {
@@ -5092,10 +5583,12 @@ func fileTransferSkipsDanglingSymlinks(operation: FileTransferOperation) throws 
     #expect(state.selectedGalleryFolderID == nil)
 }
 
-@Test @MainActor func previewReturnsFocusToLastImageWithoutScrollingDuringOpen() async throws {
+@Test @MainActor func previewReturnsFocusToLastImageWithoutScrollingDuringOpenOrClose() async throws {
     let state = makeTestAppState()
     let a = previewRouteAsset(id: "return-a", name: "a.jpg", addedAt: 0)
     let b = previewRouteAsset(id: "return-b", name: "b.jpg", addedAt: 1)
+    state.sortField = .fileName
+    state.sortDirection = .ascending
     state.assets = [a, b]
     let initialGeneration = state.galleryKeyboardScrollGeneration
     let clippedFrame = CGRect(x: 120, y: 12, width: 180, height: 240)
@@ -5107,8 +5600,13 @@ func fileTransferSkipsDanglingSymlinks(operation: FileTransferOperation) throws 
     #expect(state.galleryKeyboardScrollGeneration == initialGeneration)
     state.closePreview()
     #expect(state.galleryKeyboardFocusID == b.id)
-    #expect(state.galleryKeyboardScrollGeneration == initialGeneration + 1)
+    #expect(state.galleryKeyboardScrollGeneration == initialGeneration)
     state.closePreview()
+    #expect(state.galleryKeyboardScrollGeneration == initialGeneration)
+    // Restoring focus preserves the viewport; an explicit arrow key still reveals
+    // its next target through the gallery scroll request.
+    state.handleGalleryKey(123, modifiers: [], from: b.id)
+    #expect(state.galleryKeyboardFocusID == a.id)
     #expect(state.galleryKeyboardScrollGeneration == initialGeneration + 1)
 }
 
@@ -5202,7 +5700,11 @@ private actor UpdateRequestCounter {
     state.sources = [source]
     state.chooseSource(source.id)
     #expect(await waitForLightboxState { state.assets.count == 96 && state.libraryLoadingStatus == nil })
-    #expect(state.assets.allSatisfy { !$0.metadataLoaded })
+    // Local volumes prefetch the first page's dimensions. Both that snapshot
+    // and later metadata batches must publish complete width/height pairs.
+    #expect(state.assets.allSatisfy {
+        $0.metadataLoaded ? ($0.width == 24 && $0.height == 24) : ($0.width == 1 && $0.height == 1)
+    })
 
     var publications = 0
     var partialMetadataWasPublished = false
@@ -5327,13 +5829,54 @@ private actor UpdateRequestCounter {
     state.chooseSource(source.id)
     state.galleryLayoutMode = .recursive
     #expect(await waitForLightboxState { readerStarted.wait(timeout: .now()) == .success })
-    #expect(state.openFolderPath(root.appendingPathComponent("second").path))
+    #expect(await state.openFolderPath(root.appendingPathComponent("second").path) == .opened)
     #expect(await waitForLightboxState { state.activeAssets.map(\.originalName) == ["new.jpg"] })
     readerGate.signal()
     try await Task.sleep(for: .milliseconds(400))
     #expect(state.activeAssets.map(\.originalName) == ["new.jpg"])
     #expect(state.searchStatus?.isSearching == false)
     state.galleryLayoutMode = .masonry
+}
+
+@MainActor
+@Test func recursiveMetadataKeepsGroupIdentityAndNavigationOrder() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxGroupMetadata-\(UUID())")
+    defer { try? FileManager.default.removeItem(at: root) }
+    for name in ["first", "second"] {
+        let folder = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for index in 0..<3 { try Data([1]).write(to: folder.appendingPathComponent("\(name)-\(index).jpg")) }
+    }
+    let readerGate = DispatchSemaphore(value: 0)
+    defer { readerGate.signal() }
+    let state = makeTestAppState(searchDimensionProbe: { _ in
+        _ = readerGate.wait(timeout: .now() + 5)
+        readerGate.signal()
+        return CGSize(width: 40, height: 60)
+    })
+    let source = LibrarySource.favorites(rootURL: root)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState { state.activeAssets.count == 6 && state.searchStatus?.metadataTotal == 6 })
+    let ids = state.activeAssetIDList
+    let groups = state.searchAssetGroups
+    let revision = state.activeAssetsRevision
+    #expect(groups.count == 2)
+    readerGate.signal()
+    #expect(await waitForLightboxState { state.searchStatus?.metadataProcessed == 6 })
+    #expect(state.activeAssetIDList == ids)
+    #expect(state.activeAssetIDs == Set(ids))
+    #expect(state.activeAssetsRevision > revision)
+    #expect(state.searchAssetGroups.map(\.id) == groups.map(\.id))
+    #expect(state.searchAssetGroups.map(\.title) == groups.map(\.title))
+    #expect(state.searchAssetGroups.map { $0.assets.map(\.id) } == groups.map { $0.assets.map(\.id) })
+    #expect(state.searchAssetGroups.flatMap(\.assets) == state.activeAssets)
+    #expect(state.activeAssets.allSatisfy { $0.metadataLoaded && $0.width == 40 && $0.height == 60 })
+    state.openParentFolder()
+    #expect(state.currentFolderURL == root.deletingLastPathComponent())
+    state.galleryLayoutMode = .masonry
+    state.newTab()
 }
 
 @MainActor
@@ -5375,6 +5918,51 @@ private actor UpdateRequestCounter {
 }
 
 @MainActor
+@Test func recursiveRefreshKeepsKnownDimensionsButReloadsChangedFilesAndFinderTags() async throws {
+    let work = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxRefreshDimensions-\(UUID())")
+    let child = work.appendingPathComponent("child")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: work) }
+    let unchanged = child.appendingPathComponent("unchanged.jpg")
+    let changed = child.appendingPathComponent("changed.jpg")
+    for url in [unchanged, changed] { try Data([1]).write(to: url) }
+    #expect(FinderTagStore.setColorTags(["Red"], for: unchanged))
+    let gate = DispatchSemaphore(value: 0)
+    defer { gate.signal() }
+    let state = makeTestAppState(searchDimensionProbe: { url in
+        if (try? Data(contentsOf: url).count) == 2 {
+            _ = gate.wait(timeout: .now() + 5)
+            return CGSize(width: 80, height: 90)
+        }
+        return CGSize(width: 40, height: 60)
+    })
+    let source = LibrarySource.favorites(rootURL: work)
+    state.sources = [source]
+    state.chooseSource(source.id)
+    state.galleryLayoutMode = .recursive
+    #expect(await waitForLightboxState { state.activeAssets.count == 2
+        && state.searchStatus?.isSearching == false && state.searchStatus?.isLoadingMetadata == false })
+    #expect(state.activeAssets.allSatisfy { $0.metadataLoaded && $0.width == 40 })
+    let unchangedID = LightboxAsset.stableID(originalName: "unchanged.jpg", sourceURL: unchanged)
+    state.replaceSelection(with: [unchangedID])
+    let groupIDs = state.searchAssetGroups.map(\.id)
+    #expect(FinderTagStore.setColorTags(["Blue"], for: unchanged))
+    try Data([1, 2]).write(to: changed)
+    state.refreshLibrary(preservingVisibleSnapshot: true)
+    #expect(await waitForLightboxState { state.searchStatus?.isSearching == false
+        && state.searchStatus?.metadataTotal == 2 && state.searchStatus?.isLoadingMetadata == true })
+    let known = try #require(state.activeAssets.first { $0.id == unchangedID })
+    #expect(known.metadataLoaded && known.width == 40 && known.height == 60)
+    #expect(state.activeAssets.first { $0.sourceURL == changed }?.metadataLoaded == false)
+    #expect(state.selectedAssetIDs.contains(unchangedID) && state.searchAssetGroups.map(\.id) == groupIDs)
+    gate.signal()
+    #expect(await waitForLightboxState { state.searchStatus?.isLoadingMetadata == false
+        && state.activeAssets.first { $0.sourceURL == changed }?.width == 80 })
+    #expect(state.activeAssets.first { $0.id == unchangedID }?.tags == ["Blue"])
+    state.newTab()
+}
+
+@MainActor
 @Test func recursiveSearchChangesKeepMetadataWorkAndTagsSurviveDecodeFailure() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxSearchMetadata-\(UUID())")
     let child = root.appendingPathComponent("child")
@@ -5408,4 +5996,91 @@ private actor UpdateRequestCounter {
     state.selectedFilter = .tag("Red")
     #expect(state.activeAssets.count == 1)
     state.galleryLayoutMode = .masonry
+}
+
+@Test @MainActor func nativeTabReorderKeepsPinnedGroupAndActiveSelection() {
+    let appState = makeTestAppState()
+    appState.newTab()
+    appState.newTab()
+    let initial = appState.tabs.map(\.id)
+    let active = appState.activeTabID
+    appState.reorderTabs([initial[0]], before: nil)
+    #expect(appState.tabs.map(\.id) == Array(initial.dropFirst()) + [initial[0]])
+    #expect(appState.activeTabID == active)
+    appState.toggleTabPinned(initial[0])
+    appState.reorderTabs([initial[0]], before: nil)
+    #expect(appState.tabs.first?.id == initial[0])
+    #expect(appState.activeTabID == active)
+}
+
+
+@MainActor
+@Test func recursiveGroupTitlesUseClosestCurrentSourceWithoutPrefixCollisions() {
+    let state = makeTestAppState()
+    let root = URL(fileURLWithPath: "/LightboxTitleFixture/图库")
+    let nested = root.appendingPathComponent("人物")
+    state.sources = [
+        LibrarySource(id: "outer", name: "外层", rootURL: root, kind: .external),
+        LibrarySource(id: "nested", name: "人物库", rootURL: nested, kind: .external)
+    ]
+    state.assets = [
+        previewRouteAsset(id: "a", name: "a.jpg", addedAt: 1, sourceURL: root.appendingPathComponent("a.jpg")),
+        previewRouteAsset(id: "b", name: "b.jpg", addedAt: 2, sourceURL: nested.appendingPathComponent("b.jpg")),
+        previewRouteAsset(id: "c", name: "c.jpg", addedAt: 3, sourceURL: nested.appendingPathComponent("子组/c.jpg")),
+        previewRouteAsset(id: "d", name: "d.jpg", addedAt: 4, sourceURL: root.appendingPathComponent("../图库备份/d.jpg"))
+    ]
+    let titles = Dictionary(uniqueKeysWithValues: state.searchAssetGroups.map { ($0.id, $0.title) })
+    #expect(titles[root.path] == "外层")
+    #expect(titles[nested.path] == "人物库")
+    #expect(titles[nested.appendingPathComponent("子组").path] == "子组")
+    #expect(titles[root.deletingLastPathComponent().appendingPathComponent("图库备份").path] == "图库备份")
+    state.sources[1].name = "重命名"
+    // Force a new ordering so the existing unchanged-assets fast path does not
+    // intentionally skip this rebuild.
+    state.toggleSortDirection()
+    #expect(state.searchAssetGroups.first(where: { $0.id == nested.path })?.title == "重命名")
+}
+
+
+@MainActor
+@Test func filteredSortSnapshotInvalidatesAfterFileTagAndOrderChanges() {
+    let state = makeTestAppState()
+    state.sortField = .fileName
+    state.sortDirection = .ascending
+    var a = previewRouteAsset(id: "a", name: "A.jpg", addedAt: 1)
+    var b = previewRouteAsset(id: "b", name: "B.jpg", addedAt: 2)
+    let c = previewRouteAsset(id: "c", name: "C.jpg", addedAt: 3)
+    a.tags = ["Red"]
+    state.assets = [c, b, a]
+    #expect(state.activeAssetIDList == ["a", "b", "c"])
+    state.selectedFilter = .tag("Red")
+    #expect(state.activeAssetIDList == ["a"])
+    state.selectedFilter = .all
+    #expect(state.activeAssetIDList == ["a", "b", "c"])
+    b.originalName = "0.jpg"
+    b.tags = ["Red"]
+    state.assets = [c, b, a]
+    #expect(state.activeAssetIDList == ["b", "a", "c"])
+    state.selectedFilter = .tag("Red")
+    #expect(state.activeAssetIDList == ["b", "a"])
+    state.sortDirection = .descending
+    #expect(state.activeAssetIDList == ["a", "b"])
+    state.selectedFilter = .all
+    #expect(state.activeAssetIDList == ["c", "a", "b"])
+}
+
+
+@MainActor
+@Test func nativeHeaderPreservesExplicitBreadcrumbsAcrossUnavailablePaths() throws {
+    let state = makeTestAppState()
+    let header = NativeNavigationBar(appState: state)
+    let control = try #require(header.subviews.compactMap { $0 as? NSPathControl }.first)
+    for path in ["/Volumes/Lightbox-Unmounted-Fixture/照片原图/S3",
+                 "/Volumes/Lightbox-Unmounted-Fixture/照片原图/子目录 #2", "/"] {
+        state.currentFolderURL = URL(fileURLWithPath: path, isDirectory: true)
+        header.refresh()
+        #expect(control.pathItems.map(\.url) == state.breadcrumbs.map { Optional($0.url) })
+        #expect(control.pathItems.map(\.title) == state.breadcrumbs.map(\.title))
+        #expect(control.pathItems.allSatisfy { $0.image == nil })
+    }
 }

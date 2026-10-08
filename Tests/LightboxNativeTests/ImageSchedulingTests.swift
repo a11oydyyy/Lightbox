@@ -13,8 +13,6 @@ enum ImageSchedulingPriorityRoute: CaseIterable, Equatable, Sendable {
 
 @Test(arguments: ImageSchedulingPriorityRoute.allCases)
 @MainActor func imageSchedulingRaisesQueuedPriorityWithoutRestarting(_ route: ImageSchedulingPriorityRoute) async throws {
-    let (cache, recorder) = try await schedulingBlockedCache()
-    defer { recorder.releaseAllBlockers() }
     var targetCompletions = 0
     var competitorCompleted = false
     let quality: ImageCacheQuality
@@ -23,12 +21,15 @@ enum ImageSchedulingPriorityRoute: CaseIterable, Equatable, Sendable {
     case .sharperAttachment: quality = .thumbnail
     case .migratedHandle, .inheritedPriority: quality = .thumbnailFast
     }
+    let queueQuality: ImageCacheQuality = quality == .preview ? .preview : .thumbnail
+    let (cache, recorder) = try await schedulingBlockedCache(quality: queueQuality)
+    defer { recorder.releaseAllBlockers() }
     let targetURL = schedulingURL("target")
     let handle = try #require(cache.image(
         for: targetURL, quality: quality,
         priority: route == .inheritedPriority ? .high : .low
     ) { _ in targetCompletions += 1 })
-    _ = cache.image(for: schedulingURL("competitor"), quality: .preview, priority: .normal) { _ in
+    _ = cache.image(for: schedulingURL("competitor"), quality: queueQuality, priority: .normal) { _ in
         competitorCompleted = true
     }
     switch route {
@@ -80,7 +81,7 @@ enum ImageSchedulingPriorityRoute: CaseIterable, Equatable, Sendable {
     first.cancel()
     attached.updatePriority(.high)
     var sentinelCompleted = false
-    _ = cache.image(for: schedulingURL("sentinel"), quality: .preview, priority: .normal) { _ in
+    _ = cache.image(for: schedulingURL("sentinel"), quality: .thumbnail, priority: .normal) { _ in
         sentinelCompleted = true
     }
     recorder.releaseOneBlocker()
@@ -111,21 +112,25 @@ enum ImageSchedulingPriorityRoute: CaseIterable, Equatable, Sendable {
 }
 
 @MainActor
-private func schedulingBlockedCache() async throws -> (ImageCache, ImageSchedulingRecorder) {
+private func schedulingBlockedCache(quality: ImageCacheQuality = .thumbnail) async throws -> (ImageCache, ImageSchedulingRecorder) {
     let recorder = ImageSchedulingRecorder()
+    let profile = ImageCacheMemoryProfile(isCompatibilityMode: true)
     let cache = ImageCache(
-        memoryProfile: ImageCacheMemoryProfile(isCompatibilityMode: true),
+        memoryProfile: profile,
         decodeImage: { url, quality in
             recorder.decode(url, quality: quality)
             return nil
         },
         fileSignature: { _ in nil }
     )
-    for index in 0..<3 {
-        _ = cache.image(for: schedulingURL("blocker-\(index)"), quality: .preview, priority: .normal) { _ in }
+    // Priority is ordered within each bounded queue. Preview no longer shares
+    // execution slots with thumbnails, so block the actual target queue.
+    let capacity = quality == .preview ? profile.previewDecodeConcurrency : profile.thumbnailDecodeConcurrency
+    for index in 0..<capacity {
+        _ = cache.image(for: schedulingURL("blocker-\(index)"), quality: quality, priority: .normal) { _ in }
     }
     do {
-        try await schedulingWaitUntil { recorder.startedBlockerCount == 3 }
+        try await schedulingWaitUntil { recorder.startedBlockerCount == capacity }
     } catch {
         recorder.releaseAllBlockers()
         throw error

@@ -65,7 +65,8 @@ struct WindowConfigurator: NSViewRepresentable {
             sidebarItem?.toolTip = title
             sidebarButton?.toolTip = title
             sidebarButton?.setAccessibilityLabel(title)
-            let visible = appState.previewAssetID == nil && !appState.isComparing
+            let visible = appState.isOverlayChromeVisible
+            // Restore appearance with the titlebar; toggleSidebar still guards the overlay.
             sidebarButton?.isEnabled = visible
             if let sidebarButton {
                 NativeChromeTransition.apply(to: sidebarButton, visible: visible, wasVisible: sidebarChromeVisible)
@@ -149,19 +150,25 @@ struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
-private final class TitlebarInteractionView: NSView {
+final class TitlebarInteractionView: NSView {
     override var mouseDownCanMoveWindow: Bool {
         true
     }
 
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            window?.performZoom(nil)
-        } else if let window {
+        if event.clickCount == 1, let window {
             window.performDrag(with: event)
         } else {
+            // Let AppKit complete its titlebar double-click gesture on mouse-up.
+            // An extra performZoom here can immediately undo that native zoom.
             super.mouseDown(with: event)
         }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // Keep the native gesture as the only double-click zoom handler.
+        guard event.clickCount < 2 else { return }
+        super.mouseUp(with: event)
     }
 }
 

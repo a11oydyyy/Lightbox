@@ -97,15 +97,15 @@ import Testing
     groups[42][0].fileSize = 5_678
     #expect(columns(42, revision: 3).first?.first?.tags == ["Metadata only"])
     #expect(columns(42, revision: 3).first?.first?.fileSize == 5_678)
-    #expect(computations == 102)
+    #expect(computations == 101)
     cache.retain(identities: ["group-42"])
     _ = columns(42, revision: 3)
-    #expect(computations == 102)
+    #expect(computations == 101)
     _ = columns(0, revision: 3)
-    #expect(computations == 103)
+    #expect(computations == 102)
     cache.removeAll()
     _ = columns(42, revision: 3)
-    #expect(computations == 104)
+    #expect(computations == 103)
 }
 
 @Test func galleryRubberBandTenThousandAssetComparison() {
@@ -150,4 +150,46 @@ import Testing
 
 private func galleryPerformanceAsset(id: String) -> LightboxAsset {
     LightboxAsset(id: id, originalName: "\(id).jpg", width: 100, height: 100, tags: [], addedAt: .distantPast, palette: MockPalette.imported[0])
+}
+
+@Test @MainActor func galleryContinuousZoomKeepsColumnsUntilColumnCountChanges() {
+    let cache = GalleryMasonryColumnCache()
+    let assets = (0..<100).map { galleryPerformanceAsset(id: "zoom-\($0)") }
+    var computations = 0
+    func columns(count: Int, width: CGFloat, revision: Int = 1) -> [[LightboxAsset]] {
+        cache.columns(identity: "active", revision: revision, assets: assets,
+            columnCount: count, itemWidth: width, preservesColumnAssignment: true) {
+            computations += 1
+            return [assets]
+        }
+    }
+    for width in 160..<190 { #expect(columns(count: 6, width: CGFloat(width)) == [assets]) }
+    #expect(computations == 1)
+    _ = columns(count: 5, width: 190)
+    #expect(computations == 2)
+    _ = columns(count: 5, width: 191, revision: 2)
+    #expect(computations == 3)
+}
+
+@Test @MainActor func thumbnailScaleInputsCoalesceAndReleaseCommitsLatestSize() async throws {
+    let updates = ThumbnailScaleUpdates()
+    var applied: [CGFloat] = []
+    for width in 160..<260 { updates.submit(CGFloat(width)) { applied.append($0) } }
+    #expect(applied.isEmpty)
+    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    while applied.isEmpty && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(applied == [259])
+    updates.submit(280) { applied.append($0) }
+    updates.submit(300) { applied.append($0) }
+    updates.flush { applied.append($0) }
+    #expect(applied == [259, 300])
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(applied == [259, 300])
+    updates.submit(340) { applied.append($0) }
+    updates.cancel()
+    updates.flush { applied.append($0) }
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(applied == [259, 300])
 }

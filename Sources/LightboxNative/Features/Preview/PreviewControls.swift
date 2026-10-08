@@ -2,9 +2,10 @@ import SwiftUI
 
 struct PreviewControls: View {
     @EnvironmentObject private var appState: AppState
+    @ObservedObject private var plugins = LightboxPluginHost.shared
     var asset: LightboxAsset
-    @State private var metadata: PreviewMetadata?
-    @State private var metadataID = ""
+    @LightboxViewState private var metadata: PreviewMetadata?
+    @LightboxViewState private var metadataID = ""
     @Binding var showsInfo: Bool
 
     private var loadID: String { "\(asset.id)|\(asset.contentModifiedAt?.timeIntervalSince1970 ?? 0)|\(asset.fileSize ?? 0)" }
@@ -33,6 +34,18 @@ struct PreviewControls: View {
                 .help(localized("Image information"))
                 .accessibilityLabel(localized("Image information"))
                 .popover(isPresented: $showsInfo, arrowEdge: .bottom) { informationPanel }
+                ForEach(plugins.plugins) { plugin in
+                    Button {
+                        plugins.open(plugin, images: [asset.sourceURL].compactMap { $0 })
+                    } label: {
+                        Image(systemName: plugin.manifest.symbol ?? "puzzlepiece.extension")
+                            .frame(width: LightboxControlMetrics.iconButtonSize, height: LightboxControlMetrics.iconButtonSize)
+                    }
+                    .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)))
+                    .help(plugin.manifest.name)
+                    .accessibilityLabel(plugin.manifest.name)
+                    .disabled(asset.sourceURL == nil)
+                }
             }
             if let camera = details?.capture.first(where: { $0.label == "Camera" })?.value {
                 Text(camera)

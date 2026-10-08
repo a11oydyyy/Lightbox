@@ -5,34 +5,25 @@ import UniformTypeIdentifiers
 struct GlassSidebar: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var expandedPaths: Set<String> = []
-    @State private var pendingReveal: SidebarTreeRowID?
-    @State private var availableRows: Set<SidebarTreeRowID> = []
-    @State private var recentlyUnpinnedSources: [LibrarySource] = []
+    @ObservedObject var navigation: SidebarNavigationState
 
     private var visiblePinnedSources: [LibrarySource] {
         var items = appState.pinnedSidebarSources
-        for source in recentlyUnpinnedSources where !items.contains(where: { $0.rootURL.standardizedFileURL.path == source.rootURL.standardizedFileURL.path }) {
+        for source in navigation.recentlyUnpinnedSources where !items.contains(where: { $0.rootURL.standardizedFileURL.path == source.rootURL.standardizedFileURL.path }) {
             items.append(source)
         }
-        return items.sorted { lhs, rhs in
-            lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
-        }
+        return navigation.ordered(items)
     }
 
     var body: some View {
         let selectedFolderPath = selectedFolderPath
 
         VStack(spacing: 0) {
-            Color.clear
-                .frame(height: 48)
-                .background(WindowHeaderDragArea())
-
             ScrollViewReader { scrollProxy in
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 24) {
                     SidebarSection(title: appState.localized(.tabs)) {
-                        ForEach(appState.tabs) { tab in
+                        ReorderableSidebarItems(items: appState.tabs, move: appState.reorderTabs) { tab in
                             SidebarTabRow(tab: tab)
                         }
                         Button { appState.newTab() } label: {
@@ -52,14 +43,16 @@ struct GlassSidebar: View {
 
                     if !visiblePinnedSources.isEmpty {
                         SidebarSection(title: appState.localized(.sidebarPinned)) {
-                            ForEach(visiblePinnedSources) { source in
+                            ReorderableSidebarItems(items: visiblePinnedSources, move: { ids, target in
+                                navigation.reorder(ids, before: target, sources: visiblePinnedSources)
+                            }) { source in
                                 SidebarPinnedFolderRow(
                                     title: source.displayName,
                                     url: source.rootURL,
                                     systemImage: "folder",
                                     selectedFolderPath: selectedFolderPath,
                                     isPinned: appState.isFolderPinned(source.rootURL),
-                                    isRecentlyUnpinned: recentlyUnpinnedSources.contains(where: { $0.id == source.id }),
+                                    isRecentlyUnpinned: navigation.recentlyUnpinnedSources.contains(where: { $0.id == source.id }),
                                     togglePin: {
                                         togglePin(source: source)
                                     },
@@ -81,17 +74,21 @@ struct GlassSidebar: View {
                     if !locations.isEmpty {
                         SidebarSection(title: appState.localized(.sidebarLocations)) {
                             ForEach(locations) { location in
-                                if let url = location.defaultURL {
+                                if let directory = appState.sidebarLocationDirectories[location] {
+                                    let url = directory.url
                                     SidebarFolderNode(
                                         title: title(for: location),
                                         url: url,
                                         rootURL: url,
+                                        path: directory.path,
+                                        rootPath: directory.path,
                                         sourceID: "location:\(location.rawValue)",
                                         systemImage: location.systemImage,
                                         depth: 0,
                                         selectedFolderPath: selectedFolderPath,
-                                        expandedPaths: $expandedPaths,
-                                        isPinned: appState.isFolderPinned(url),
+                                        expandedPaths: $navigation.expandedPaths,
+                                        navigation: navigation,
+                                        isPinned: appState.isFolderPinned(path: directory.path),
                                         isRecentlyUnpinned: false,
                                         togglePin: {
                                             appState.togglePinFolderURL(url)
@@ -109,12 +106,15 @@ struct GlassSidebar: View {
                                     title: volume.displayName,
                                     url: volume.url,
                                     rootURL: volume.url,
+                                    path: volume.id,
+                                    rootPath: volume.id,
                                     sourceID: "volume:\(volume.id)",
                                     systemImage: "externaldrive",
                                     depth: 0,
                                     selectedFolderPath: selectedFolderPath,
-                                    expandedPaths: $expandedPaths,
-                                    isPinned: appState.isFolderPinned(volume.url),
+                                    expandedPaths: $navigation.expandedPaths,
+                                    navigation: navigation,
+                                    isPinned: appState.isFolderPinned(path: volume.id),
                                     isRecentlyUnpinned: false,
                                     togglePin: {
                                         appState.togglePinFolderURL(volume.url)
@@ -125,15 +125,18 @@ struct GlassSidebar: View {
                     }
                 }
                 .padding(.horizontal, 12)
-                .padding(.top, 8)
+                .padding(.top, 22)
                 .padding(.bottom, 12)
             }
             .onPreferenceChange(SidebarTreeRowsKey.self) { rows in
-                availableRows = rows
+                navigation.availableRows = rows
                 revealPending(using: scrollProxy, available: rows)
             }
-            .onChange(of: pendingReveal) { _ in
-                revealPending(using: scrollProxy, available: availableRows)
+            .onChange(of: navigation.pendingReveal) { _ in
+                revealPending(using: scrollProxy, available: navigation.availableRows)
+            }
+            .onChange(of: navigation.childrenRevision) { _ in
+                revealPending(using: scrollProxy, available: navigation.availableRows)
             }
             }
 
@@ -146,7 +149,7 @@ struct GlassSidebar: View {
                 .padding(.vertical, 10)
         }
         .frame(width: appState.sidebarWidth)
-        .frame(maxHeight: .infinity)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(LightboxColorTokens.sidebar.opacity(appState.glassOpacity * 0.9))
@@ -165,10 +168,13 @@ struct GlassSidebar: View {
         .padding(.top, 8)
         .padding(.bottom, 10)
         .onChange(of: appState.currentFolderURL) { _ in
-            pendingReveal = nil
+            navigation.pendingReveal = nil
         }
-        .onChange(of: appState.activeTabID) { _ in pendingReveal = nil }
-        .onChange(of: appState.selectedFilter) { _ in pendingReveal = nil }
+        .onChange(of: appState.activeTabID) { _ in navigation.pendingReveal = nil }
+        .onChange(of: appState.selectedFilter) { _ in navigation.pendingReveal = nil }
+        .onChange(of: appState.showsHiddenItems) { _ in navigation.resetReveal() }
+        .onChange(of: appState.sidebarVolumes.map(\.id)) { _ in navigation.resetReveal() }
+        .onChange(of: appState.sidebarLocations) { _ in navigation.resetReveal() }
     }
 
     private var selectedFolderPath: String? {
@@ -203,12 +209,12 @@ struct GlassSidebar: View {
         let path = source.rootURL.standardizedFileURL.path
         if appState.isFolderPinned(source.rootURL) {
             appState.unpinSource(source.id)
-            if !recentlyUnpinnedSources.contains(where: { $0.rootURL.standardizedFileURL.path == path }) {
-                recentlyUnpinnedSources.append(source)
+            if !navigation.recentlyUnpinnedSources.contains(where: { $0.rootURL.standardizedFileURL.path == path }) {
+                navigation.recentlyUnpinnedSources.append(source)
             }
         } else {
             appState.pinSource(source, selectPinnedFolder: false)
-            recentlyUnpinnedSources.removeAll { $0.rootURL.standardizedFileURL.path == path }
+            navigation.recentlyUnpinnedSources.removeAll { $0.rootURL.standardizedFileURL.path == path }
         }
     }
 
@@ -220,18 +226,24 @@ struct GlassSidebar: View {
 
     private func locateFolder(_ url: URL) {
         guard let plan = revealPlan(for: url) else { return }
-        expandedPaths.formUnion(plan.ancestors)
-        pendingReveal = plan.row
+        navigation.expandedPaths.formUnion(plan.ancestors)
+        navigation.pendingReveal = plan.row
     }
 
     private func revealPending(using proxy: ScrollViewProxy, available: Set<SidebarTreeRowID>) {
-        guard let target = pendingReveal, available.contains(target) else { return }
-        // Child folders load asynchronously. Scroll only once their actual row
-        // has joined the layout, without guessing a loading delay.
+        guard let target = navigation.pendingReveal else { return }
+        let next = navigation.revealStep(for: target, available: available)
+        if next == .waitingForChildren { return }
         DispatchQueue.main.async {
-            guard pendingReveal == target else { return }
-            proxy.scrollTo(target, anchor: .center)
-            pendingReveal = nil
+            guard navigation.pendingReveal == target else { return }
+            switch navigation.revealStep(for: target, available: navigation.availableRows) {
+            case .waitingForChildren: break
+            case .missing: navigation.pendingReveal = nil
+            case .scrollTo(let step):
+                let reachedRow = step == target && navigation.availableRows.contains(target)
+                proxy.scrollTo(step, anchor: reachedRow ? .center : .top)
+                if reachedRow { navigation.pendingReveal = nil }
+            }
         }
     }
 }
@@ -304,9 +316,9 @@ private struct SidebarPinnedFolderRow: View {
     var canLocate: Bool
     var locate: () -> Void
 
-    @State private var isHovering = false
+    @LightboxViewState private var isHovering = false
     @FocusState private var focusedControl: SidebarRowControl?
-    @State private var colorTags: [String] = []
+    @LightboxViewState private var colorTags: [String] = []
 
     private var path: String {
         url.standardizedFileURL.path
@@ -431,29 +443,29 @@ private struct SidebarPinnedFolderRow: View {
 private struct SidebarFolderNode: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
 
     var title: String
     var url: URL
     var rootURL: URL
+    var path: String
+    var rootPath: String
     var sourceID: String
     var systemImage: String
     var depth: Int
     var selectedFolderPath: String?
     @Binding var expandedPaths: Set<String>
+    var navigation: SidebarNavigationState
     var isPinned: Bool
     var isRecentlyUnpinned: Bool
     var togglePin: () -> Void
 
-    @State private var children: [LibraryFolderEntry] = []
-    @State private var hasLoadedChildren = false
-    @State private var isLoadingChildren = false
-    @State private var isHovering = false
+    @LightboxViewState private var children: [SidebarTreeFolder] = []
+    @LightboxViewState private var hasLoadedChildren = false
+    @LightboxViewState private var isLoadingChildren = false
+    @LightboxViewState private var isHovering = false
     @FocusState private var focusedControl: SidebarRowControl?
-    @State private var colorTags: [String] = []
-
-    private var path: String {
-        url.standardizedFileURL.path
-    }
+    @LightboxViewState private var colorTags: [String] = []
 
     private var isExpanded: Bool {
         expandedPaths.contains(path)
@@ -470,35 +482,24 @@ private struct SidebarFolderNode: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             row
-                .id(SidebarTreeRowID(root: rootURL.standardizedFileURL.path, path: path))
+                .id(SidebarTreeRowID(root: rootPath, path: path))
                 .preference(key: SidebarTreeRowsKey.self,
-                    value: [SidebarTreeRowID(root: rootURL.standardizedFileURL.path, path: path)])
+                    value: [SidebarTreeRowID(root: rootPath, path: path)])
 
             // Keep descendants within their subtree while expanding. Collapse is immediate.
             VStack(alignment: .leading, spacing: 0) {
                 if isExpanded {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(children) { child in
-                            SidebarFolderNode(
-                                title: child.name,
-                                url: child.url,
-                                rootURL: rootURL,
-                                sourceID: sourceID,
-                                systemImage: "folder",
-                                depth: depth + 1,
-                                selectedFolderPath: selectedFolderPath,
-                                expandedPaths: $expandedPaths,
-                                isPinned: appState.isFolderPinned(child.url),
-                                isRecentlyUnpinned: false,
-                                togglePin: {
-                                    appState.togglePinFolderURL(child.url)
-                                }
-                            )
+                    Group {
+                        if voiceOverEnabled {
+                            VStack(alignment: .leading, spacing: 2) { childRows }
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 2) { childRows }
                         }
                     }
                     .padding(.top, 2)
                     .transition(.opacity)
                     .task(id: "\(path)|hidden:\(appState.showsHiddenItems)") {
+                        navigation.forgetChildren(of: SidebarTreeRowID(root: rootPath, path: path))
                         await loadChildrenIfNeeded(forceReload: true)
                     }
                 }
@@ -508,6 +509,23 @@ private struct SidebarFolderNode: View {
         }
         .clipped()
         .animation(isExpanded ? MotionTokens.ifAllowed(MotionTokens.sidebarDisclosure, reduceMotion: reduceMotion) : nil, value: isExpanded)
+    }
+
+    private var childRows: some View {
+        ForEach(children.map { SidebarTreeChild(root: rootPath, reference: $0) }) { item in
+            let reference = item.reference
+            let child = reference.folder
+            SidebarFolderNode(
+                title: child.name, url: child.url, rootURL: rootURL,
+                path: reference.path, rootPath: rootPath, sourceID: sourceID,
+                systemImage: "folder", depth: depth + 1,
+                selectedFolderPath: selectedFolderPath, expandedPaths: $expandedPaths,
+                navigation: navigation,
+                isPinned: appState.isFolderPinned(path: reference.path),
+                isRecentlyUnpinned: false,
+                togglePin: { appState.togglePinFolderURL(child.url) }
+            )
+        }
     }
 
     private var row: some View {
@@ -639,9 +657,6 @@ private struct SidebarFolderNode: View {
             expandedPaths.remove(path)
         } else {
             expandedPaths.insert(path)
-            Task {
-                await loadChildrenIfNeeded()
-            }
         }
     }
 
@@ -659,13 +674,16 @@ private struct SidebarFolderNode: View {
                 sourceID: folderSourceID,
                 rootURL: folderRootURL,
                 showsHiddenItems: showsHiddenItems
-            )
+            ).map { SidebarTreeFolder(folder: $0) }
         }.value
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled, appState.showsHiddenItems == showsHiddenItems else {
             isLoadingChildren = false
             return
         }
         children = loadedChildren
+        navigation.registerChildren(Set(loadedChildren.map {
+            SidebarTreeRowID(root: rootPath, path: $0.path)
+        }), of: SidebarTreeRowID(root: rootPath, path: path))
         hasLoadedChildren = true
         isLoadingChildren = false
     }
@@ -682,6 +700,12 @@ private struct SidebarFolderNode: View {
         guard !Task.isCancelled else { return }
         colorTags = tags
     }
+}
+
+private struct SidebarTreeChild: Identifiable {
+    var root: String
+    var reference: SidebarTreeFolder
+    var id: SidebarTreeRowID { SidebarTreeRowID(root: root, path: reference.path) }
 }
 
 private struct SidebarTagDots: View {
@@ -709,7 +733,7 @@ private struct SidebarTagDots: View {
 private struct SidebarTrashRow: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHovering = false
+    @LightboxViewState private var isHovering = false
 
     private var isSelected: Bool {
         appState.isViewingTrash
@@ -777,7 +801,7 @@ struct SidebarSymbolIcon: View {
     var symbol: String
     var tags: [String] = []
     var url: URL?
-    @State private var loadedTags: [String] = []
+    @LightboxViewState private var loadedTags: [String] = []
     private var filledSymbol: String {
         switch symbol {
         case "folder": "folder.fill"
@@ -837,8 +861,8 @@ private struct SidebarTabRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var appState: AppState
     var tab: LightboxTab
-    @State private var hovering = false
-    @State private var fileDropTargetID: UUID?
+    @LightboxViewState private var hovering = false
+    @LightboxViewState private var fileDropTargetID: UUID?
     private var active: Bool { appState.activeTabID == tab.id }
 
     var body: some View {
@@ -887,15 +911,26 @@ private struct SidebarTabRow: View {
         .onHover { hovering = $0 }
         .help(appState.tabPath(tab))
         .contextMenu { TabContextMenu(tab: tab) }
-        .onDrag {
-            appState.beginTabDrag(tab.id)
-            return NSItemProvider(object: tab.id.uuidString as NSString)
-        }
-        .onDrop(of: [.utf8PlainText], isTargeted: nil) { _ in
-            appState.moveDraggedTab(before: tab.id)
-            appState.endTabDrag()
-            return true
-        }
+        .modifier(LegacyTabReorder(tabID: tab.id, appState: appState))
         .onDrop(of: [UTType(exportedAs: LightboxPasteboardTypes.internalAssetDragIdentifier)], delegate: TabAssetDropDelegate(targetTabID: tab.id, fileDropTargetID: $fileDropTargetID, appState: appState))
+    }
+}
+
+private struct LegacyTabReorder: ViewModifier {
+    var tabID: UUID
+    var appState: AppState
+    func body(content: Content) -> some View {
+        if #available(macOS 27, *) {
+            content
+        } else {
+            content.onDrag {
+                appState.beginTabDrag(tabID)
+                return NSItemProvider(object: tabID.uuidString as NSString)
+            }.onDrop(of: [.utf8PlainText], isTargeted: nil) { _ in
+                appState.moveDraggedTab(before: tabID)
+                appState.endTabDrag()
+                return true
+            }
+        }
     }
 }

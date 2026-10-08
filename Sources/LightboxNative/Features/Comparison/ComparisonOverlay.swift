@@ -9,10 +9,10 @@ struct ComparisonOverlay: View {
 
     private static let coordinateSpaceName = "ComparisonOverlaySpace"
 
-    @State private var isPresented = false
-    @State private var isClosing = false
-    @State private var paneFrames: [CGRect] = []
-    @State private var escapeMonitor: Any?
+    @LightboxViewState private var isPresented = false
+    @LightboxViewState private var isClosing = false
+    @LightboxViewState private var paneFrames: [CGRect] = []
+    @LightboxViewState private var escapeMonitor: Any?
 
     var body: some View {
         GeometryReader { proxy in

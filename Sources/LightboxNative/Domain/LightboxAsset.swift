@@ -160,19 +160,31 @@ enum GalleryAssetSorter {
         field: GallerySortField,
         direction: GallerySortDirection
     ) -> [LightboxAsset] {
-        items.sorted { lhs, rhs in
-            switch field {
-            case .time:
+        switch field {
+        case .time:
+            return items.sorted { lhs, rhs in
                 compare(lhs.addedAt, rhs.addedAt, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            case .size:
-                compare(lhs.fileSize ?? 0, rhs.fileSize ?? 0, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            case .tag:
-                compareTag(lhs, rhs, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            case .fileName:
-                compareText(lhs.originalName, rhs.originalName, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            case .type:
-                compareText(fileType(lhs), fileType(rhs), direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
             }
+        case .size:
+            return items.sorted { lhs, rhs in
+                compare(lhs.fileSize ?? 0, rhs.fileSize ?? 0, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
+            }
+        case .tag:
+            return items.sorted { lhs, rhs in
+                compareTag(lhs, rhs, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
+            }
+        case .fileName:
+            return items.sorted { lhs, rhs in
+                compareText(lhs.originalName, rhs.originalName, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
+            }
+        case .type:
+            // Parsing an escaped file URL during every comparison is expensive.
+            // Keep keys local to this sort so renamed/replaced files cannot reuse stale keys.
+            let keyedItems = items.map { (asset: $0, type: fileType($0)) }
+            return keyedItems.sorted { lhs, rhs in
+                compareText(lhs.type, rhs.type, direction: direction)
+                    ?? tieBreak(lhs.asset, rhs.asset, direction: direction)
+            }.map(\.asset)
         }
     }
 

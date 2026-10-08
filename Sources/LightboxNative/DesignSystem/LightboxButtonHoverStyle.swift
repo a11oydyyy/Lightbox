@@ -53,7 +53,7 @@ private struct LightboxButtonHoverBody<S: Shape>: View {
     var shape: S
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.isEnabled) private var isEnabled
-    @State private var isHovered = false
+    @LightboxViewState private var isHovered = false
 
     var body: some View {
         configuration.label

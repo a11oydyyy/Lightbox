@@ -10,12 +10,14 @@ struct TopPathBar: View {
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isPathFocused: Bool
     @FocusState private var focusedUtility: TopBarUtility?
-    @State private var isSearchExpanded = false
-    @State private var isSortMenuPresented = false
-    @State private var isTabSwitcherPresented = false
-    @State private var isPathEditing = false
-    @State private var pathInput = ""
-    @State private var pathInputHasError = false
+    @LightboxViewState private var isSearchExpanded = false
+    @LightboxViewState private var isSortMenuPresented = false
+    @LightboxViewState private var isTabSwitcherPresented = false
+    @LightboxViewState private var isPathEditing = false
+    @LightboxViewState private var pathInput = ""
+    @LightboxViewState private var pathInputHasError = false
+    @LightboxViewState private var pathSubmissionTask: Task<Void, Never>?
+    @LightboxViewState private var pathEditingSession = UUID()
     private enum TopBarUtility: Hashable {
         case search, sort
     }
@@ -84,6 +86,10 @@ struct TopPathBar: View {
         .onChange(of: appState.activeTabID) { _ in
             cancelPathEditing()
         }
+        .onChange(of: appState.currentFolderURL) { _ in
+            cancelPathEditing()
+        }
+        .onDisappear(perform: cancelPathEditing)
     }
 
     private func primaryCapsule(width: CGFloat, isSelecting: Bool) -> some View {
@@ -206,6 +212,11 @@ struct TopPathBar: View {
                 .focused($isPathFocused)
                 .onSubmit(submitPathInput)
                 .onExitCommand(perform: cancelPathEditing)
+                .onChange(of: pathInput) { _ in
+                    pathSubmissionTask?.cancel()
+                    appState.cancelPendingFolderPath()
+                    pathInputHasError = false
+                }
                 .padding(.horizontal, 7)
                 .frame(height: 26)
                 .background {
@@ -332,6 +343,9 @@ struct TopPathBar: View {
     }
 
     private func beginPathEditing() {
+        pathSubmissionTask?.cancel()
+        appState.cancelPendingFolderPath()
+        pathEditingSession = UUID()
         if isSelecting {
             appState.clearSelection()
         }
@@ -346,18 +360,29 @@ struct TopPathBar: View {
 
     private func cancelPathEditing() {
         guard isPathEditing else { return }
+        pathSubmissionTask?.cancel()
+        appState.cancelPendingFolderPath()
         isPathEditing = false
         isPathFocused = false
         pathInputHasError = false
     }
 
     private func submitPathInput() {
-        guard appState.openFolderPath(pathInput) else {
-            pathInputHasError = true
-            isPathFocused = true
-            return
+        pathSubmissionTask?.cancel()
+        let submittedPath = pathInput
+        let session = pathEditingSession
+        pathSubmissionTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            let opened = await appState.openFolderPath(submittedPath)
+            guard !Task.isCancelled, isPathEditing, pathEditingSession == session,
+                  pathInput == submittedPath else { return }
+            if opened == .opened {
+                cancelPathEditing()
+            } else if opened == .unavailable {
+                pathInputHasError = true
+                isPathFocused = true
+            }
         }
-        cancelPathEditing()
     }
 
     private var selectionContent: some View {
@@ -525,8 +550,8 @@ struct LightboxTabStripLayout: Equatable {
 
 private struct TabStrip: View {
     @EnvironmentObject private var appState: AppState
-    @State private var fileDropTargetID: UUID?
-    @State private var isOverflowPresented = false
+    @LightboxViewState private var fileDropTargetID: UUID?
+    @LightboxViewState private var isOverflowPresented = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -678,7 +703,7 @@ private struct OverflowTabRow: View {
 private struct LightboxTabButton: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHovering = false
+    @LightboxViewState private var isHovering = false
 
     var tab: LightboxTab
     var width: CGFloat
@@ -844,7 +869,7 @@ private struct TabOverflowDropDelegate: DropDelegate {
 
 private struct FileTransferControl: View {
     @EnvironmentObject private var appState: AppState
-    @State private var isPopoverPresented = false
+    @LightboxViewState private var isPopoverPresented = false
 
     var progress: FileTransferProgress
 
@@ -1116,9 +1141,9 @@ private struct SortPopover: View {
 private struct SourceMenuButton: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isSourceMenuPresented = false
-    @State private var menuSnapshotSources: [LibrarySource] = []
-    @State private var menuUnpinnedSourceIDs: Set<LibrarySource.ID> = []
+    @LightboxViewState private var isSourceMenuPresented = false
+    @LightboxViewState private var menuSnapshotSources: [LibrarySource] = []
+    @LightboxViewState private var menuUnpinnedSourceIDs: Set<LibrarySource.ID> = []
 
     private var title: String {
         appState.selectedSource?.displayName ?? "Lightbox"
@@ -1266,7 +1291,7 @@ private struct SourceMenuPopover: View {
 
 private struct PinnedSourceRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pinIsPressed = false
+    @LightboxViewState private var pinIsPressed = false
 
     var source: LibrarySource
     var isSelected: Bool
@@ -1432,7 +1457,7 @@ private extension View {
 private struct TopBarUtilitySurfaceModifier: ViewModifier {
     @Environment(\.lightboxGlassOpacity) private var glassOpacity
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHovering = false
+    @LightboxViewState private var isHovering = false
     var isActive: Bool
 
     func body(content: Content) -> some View {

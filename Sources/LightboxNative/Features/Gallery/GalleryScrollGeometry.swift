@@ -15,8 +15,12 @@ struct GalleryRenderPlan: Equatable {
 // Geometry is interaction data. Moving it does not invalidate the SwiftUI grid.
 @MainActor
 final class GalleryScrollGeometry {
+    let imageLoading = GalleryImageLoadingCoordinator()
+    var isScrolling = false
+    var scrollDirection: GalleryScrollDirection = .stationary
     private(set) var navigationToken: String?
     private(set) var contentFrames: [LightboxAsset.ID: CGRect] = [:]
+    private var frameOwners: [LightboxAsset.ID: UUID] = [:]
     var folderFrame: CGRect?
     var groupHeaderFrames: [String: CGRect] = [:]
     private(set) var origin = GalleryContentOrigin(selection: .zero, preview: .zero, scrollOffset: 0)
@@ -31,16 +35,29 @@ final class GalleryScrollGeometry {
         return true
     }
 
-    func updateContentFrame(_ frame: CGRect, for id: LightboxAsset.ID) {
+    @discardableResult
+    func updateContentFrame(_ frame: CGRect, for id: LightboxAsset.ID,
+                            owner: UUID? = nil, registering: Bool = true) -> Bool {
+        // Lazy columns can mount a replacement before the previous card leaves.
+        // Only the currently registered instance may update or remove its frame.
+        if let owner, !registering, frameOwners[id] != owner { return false }
+        frameOwners[id] = owner
         contentFrames[id] = frame
+        return true
     }
 
-    func remove(_ id: LightboxAsset.ID) {
+    @discardableResult
+    func remove(_ id: LightboxAsset.ID, owner: UUID? = nil) -> Bool {
+        if let owner, frameOwners[id] != owner { return false }
+        frameOwners.removeValue(forKey: id)
         contentFrames.removeValue(forKey: id)
+        return true
     }
 
     func retain(activeAssetIDs: Set<LightboxAsset.ID>) {
+        imageLoading.retain(activeAssetIDs: activeAssetIDs)
         contentFrames = GalleryAssetFrameLifecycle.activeFrames(contentFrames, activeAssetIDs: activeAssetIDs)
+        frameOwners = frameOwners.filter { activeAssetIDs.contains($0.key) }
     }
 
     func updateOrigin(_ origin: GalleryContentOrigin) {
@@ -81,9 +98,13 @@ final class GalleryScrollGeometry {
     }
 
     func clear() {
+        imageLoading.clear()
+        isScrolling = false
+        scrollDirection = .stationary
         settleTask?.cancel()
         settleTask = nil
         contentFrames.removeAll()
+        frameOwners.removeAll()
         folderFrame = nil
         groupHeaderFrames.removeAll()
         origin = GalleryContentOrigin(selection: .zero, preview: .zero, scrollOffset: 0)

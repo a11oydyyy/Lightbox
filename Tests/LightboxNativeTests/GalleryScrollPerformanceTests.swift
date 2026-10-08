@@ -43,6 +43,21 @@ import Testing
     #expect(renderPublications == 0)
 }
 
+@Test @MainActor func replacedGalleryCardCannotClearOrOverwriteNewCardGeometry() {
+    let geometry = GalleryScrollGeometry()
+    let oldOwner = UUID(), newOwner = UUID()
+    let oldFrame = CGRect(x: 0, y: 100, width: 100, height: 80)
+    let newFrame = CGRect(x: 120, y: 100, width: 100, height: 80)
+    geometry.updateContentFrame(oldFrame, for: "photo", owner: oldOwner)
+    geometry.updateContentFrame(newFrame, for: "photo", owner: newOwner)
+    #expect(!geometry.remove("photo", owner: oldOwner))
+    #expect(!geometry.updateContentFrame(oldFrame, for: "photo", owner: oldOwner, registering: false))
+    #expect(geometry.contentFrames["photo"] == newFrame)
+    #expect(geometry.previewFrames["photo"] == newFrame)
+    #expect(geometry.remove("photo", owner: newOwner))
+    #expect(geometry.contentFrames.isEmpty)
+}
+
 @MainActor
 @Test func galleryScrollSmallMovementKeepsImmediateInteractionFrames() throws {
     let geometry = GalleryScrollGeometry()

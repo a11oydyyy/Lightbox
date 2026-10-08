@@ -9,6 +9,7 @@ struct GalleryStoragePerformance: Equatable {
 final class GalleryStoragePerformanceCache {
     private struct Key: Equatable {
         var source: LibrarySource?
+        var conservative: Bool
         var revision: Int
         var assetCount: Int
     }
@@ -17,23 +18,17 @@ final class GalleryStoragePerformanceCache {
     private var value = GalleryStoragePerformance(
         usesConservativeExternalLoading: false, prefersFastRawThumbnails: false
     )
-    private let classifySource: (LibrarySource) -> Bool
-
-    init(classifySource: @escaping (LibrarySource) -> Bool = { $0.usesConservativeExternalLoading }) {
-        self.classifySource = classifySource
-    }
-
     func configuration(
         source: LibrarySource?,
+        usesConservativeExternalLoading conservative: Bool,
         activeAssets: [LightboxAsset],
         revision: Int
     ) -> GalleryStoragePerformance {
-        let nextKey = Key(source: source, revision: revision, assetCount: activeAssets.count)
+        let nextKey = Key(source: source, conservative: conservative, revision: revision, assetCount: activeAssets.count)
         guard key != nextKey else { return value }
 
-        // Resolving symlinks and sampling file extensions belong to a library change,
-        // not each scroll-driven SwiftUI body evaluation.
-        let conservative = source.map(classifySource) ?? false
+        // Storage classification is resolved by the background library refresh.
+        // Only resample extensions when the published policy or library changes.
         var prefersRaw = false
         if conservative, activeAssets.count >= 500 {
             let sample = activeAssets.prefix(120)

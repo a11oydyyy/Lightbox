@@ -3,6 +3,7 @@ import SwiftUI
 struct LightboxCommands: Commands {
     @ObservedObject var appState: AppState
     @ObservedObject private var updater = LightboxUpdateController.shared
+    @ObservedObject private var plugins = LightboxPluginHost.shared
 
     private var updateMenuTitle: String {
         if case let .available(version) = updater.updateState {
@@ -96,6 +97,16 @@ struct LightboxCommands: Commands {
                 Label(appState.localized(.sidebar), systemImage: "sidebar.left")
             }
             .keyboardShortcut("b", modifiers: [.command])
+        }
+
+        CommandMenu("插件") {
+            ForEach(plugins.plugins) { plugin in
+                Button(plugin.manifest.name + "…") { plugins.open(plugin, images: appState.pluginImageURLs) }
+                    .disabled(appState.pluginImageURLs.isEmpty)
+            }
+            if !plugins.plugins.isEmpty { Divider() }
+            Button("安装插件…") { plugins.install() }
+            Button("打开插件文件夹…") { plugins.revealDirectory() }
         }
 
         CommandMenu(appState.localized(.tabs)) {

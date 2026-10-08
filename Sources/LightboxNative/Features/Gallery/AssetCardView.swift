@@ -64,6 +64,7 @@ struct AssetCardView: View, Equatable {
     var asset: LightboxAsset
     var keyboardFocusRequested = false
     var onKeyboard: (UInt16, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onPreviewArrow: (UInt16) -> Bool = { _ in false }
     var onActivate: (() -> Void)? = nil
     var isSelected: Bool
     var isExplicitlySelected: Bool
@@ -71,6 +72,7 @@ struct AssetCardView: View, Equatable {
     var imagePriority: ImageDecodePriority = .normal
     var imageQuality: ImageCacheQuality = .thumbnail
     var loadsImage = true
+    var imageLoadingState: GalleryImageLoadingState?
     var compareTrayLabel: String?
     var isPreviewSourceHidden = false
     var isInteractionEnabled = true
@@ -94,6 +96,11 @@ struct AssetCardView: View, Equatable {
         lhs.keyboardFocusRequested == rhs.keyboardFocusRequested &&
         lhs.asset.id == rhs.asset.id &&
         lhs.asset.sourceURL == rhs.asset.sourceURL &&
+        lhs.asset.originalName == rhs.asset.originalName &&
+        lhs.asset.width == rhs.asset.width &&
+        lhs.asset.height == rhs.asset.height &&
+        lhs.asset.contentModifiedAt == rhs.asset.contentModifiedAt &&
+        lhs.asset.fileSize == rhs.asset.fileSize &&
         lhs.asset.deletedAt == rhs.asset.deletedAt &&
         lhs.asset.tags == rhs.asset.tags &&
         lhs.isSelected == rhs.isSelected &&
@@ -102,6 +109,7 @@ struct AssetCardView: View, Equatable {
             lhs.imagePriority == rhs.imagePriority &&
             lhs.imageQuality == rhs.imageQuality &&
             lhs.loadsImage == rhs.loadsImage &&
+            lhs.imageLoadingState === rhs.imageLoadingState &&
             lhs.compareTrayLabel == rhs.compareTrayLabel &&
             lhs.isPreviewSourceHidden == rhs.isPreviewSourceHidden &&
             lhs.isInteractionEnabled == rhs.isInteractionEnabled &&
@@ -113,12 +121,18 @@ struct AssetCardView: View, Equatable {
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isPressed = false
-    @State private var showsKeyboardFocus = false
+    @LightboxViewState private var isPressed = false
+    @LightboxViewState private var showsKeyboardFocus = false
 
     var body: some View {
-        AssetImageView(asset: asset, quality: imageQuality, loadsImage: loadsImage)
-            .imageDecodePriority(imagePriority)
+        Group {
+            if let imageLoadingState {
+                GalleryAssetImageView(asset: asset, loadingState: imageLoadingState)
+            } else {
+                AssetImageView(asset: asset, quality: imageQuality, loadsImage: loadsImage)
+                    .imageDecodePriority(imagePriority)
+            }
+        }
             .accessibilityHidden(true)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
@@ -129,12 +143,6 @@ struct AssetCardView: View, Equatable {
                 // most visibly in dark mode). primary adapts to color scheme.
                 RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
                     .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.6)
-            }
-            .overlay {
-                if isSelected && !showsKeyboardFocus {
-                    SelectionGlow(cornerRadius: RadiusTokens.card)
-                        .transition(.opacity)
-                }
             }
             .overlay {
                 if isComparePulse {
@@ -174,13 +182,16 @@ struct AssetCardView: View, Equatable {
             // rounded corners can't overhang under hover3D / scaleEffect.
             .compositingGroup()
             .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
-            .hover3D(isReduced: usesReducedHover, isEnabled: isInteractionEnabled && !isPreviewSourceHidden,
+            // Return the outline only after preview teardown restores gallery focus.
+            .hover3D(isReduced: usesReducedHover,
+                     isEnabled: isInteractionEnabled && !isPreviewSourceHidden,
                      isFocused: showsKeyboardFocus, isSelected: isSelected)
             .overlay {
                 AssetInteractionLayer(
                     keyboardFocusRequested: keyboardFocusRequested,
                     accessibilitySelected: isExplicitlySelected,
                     onKeyboard: onKeyboard,
+                    onPreviewArrow: onPreviewArrow,
                     onActivate: onActivate,
                     onFocusChanged: { showsKeyboardFocus = $0 },
                     debugSurface: "gallery-card",
@@ -218,6 +229,7 @@ struct AssetInteractionLayer: NSViewRepresentable {
     var keyboardFocusRequested = false
     var accessibilitySelected = false
     var onKeyboard: (UInt16, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onPreviewArrow: (UInt16) -> Bool = { _ in false }
     var onActivate: (() -> Void)? = nil
     var onFocusChanged: (Bool) -> Void = { _ in }
     var debugSurface = "asset"
@@ -271,6 +283,7 @@ struct AssetInteractionLayer: NSViewRepresentable {
         nsView.onShare = onShare
         nsView.onAddToCompareTray = onAddToCompareTray
         nsView.onKeyboard = onKeyboard
+        nsView.onPreviewArrow = onPreviewArrow
         nsView.onActivate = onActivate
         nsView.onFocusChanged = onFocusChanged
         nsView.configureAccessibility(selected: accessibilitySelected)
@@ -363,6 +376,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         }
     }
     var onKeyboard: (UInt16, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onPreviewArrow: (UInt16) -> Bool = { _ in false }
     var onActivate: (() -> Void)?
     override var acceptsFirstResponder: Bool { isInteractionEnabled && debugSurface == "gallery-card" }
 
@@ -377,8 +391,8 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         return true
     }
 
-    @objc func copy(_ sender: Any?) { onCopy() }
-    override func selectAll(_ sender: Any?) { onKeyboard(0, .command) }
+    @objc func copy(_ sender: Any?) { guard isInteractionEnabled else { return }; onCopy() }
+    override func selectAll(_ sender: Any?) { guard isInteractionEnabled else { return }; onKeyboard(0, .command) }
     @objc func accessibilityCopy() -> Bool { guard isInteractionEnabled else { return false }; onCopy(); return true }
     @objc func accessibilityCompare() -> Bool { guard isInteractionEnabled else { return false }; onAddToCompareTray(); return true }
 
@@ -400,10 +414,15 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     }
 
     override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Keep arrows received by the old responder during initial overlay attachment.
+        if debugSurface == "gallery-card", window?.firstResponder === self,
+           [123, 124].contains(event.keyCode),
+           modifiers.intersection([.command, .control, .option, .shift]).isEmpty,
+           onPreviewArrow(event.keyCode) { return }
         guard isInteractionEnabled else { return }
         showsKeyboardFocus = true
         publishFocusAppearance()
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         // Leave system shortcuts, VoiceOver chords, and text handling to AppKit.
         guard !modifiers.contains(.control), !modifiers.contains(.option) else {
             super.keyDown(with: event); return
@@ -432,11 +451,10 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     var assetURL: URL?
     var isDeleted = false
     var canRevealInFinder = false
+    // hitTest and accessibility reject disabled interaction. Hiding this transparent
+    // view would also discard its existing keyboard focus before the overlay attaches.
     var isInteractionEnabled = true {
-        didSet {
-            guard isInteractionEnabled != oldValue else { return }
-            isHidden = !isInteractionEnabled
-        }
+        didSet { if isInteractionEnabled != oldValue { publishFocusAppearance() } }
     }
     var compareMenuTitle = "Add to Compare Tray"
     var menuTitles = AssetContextMenuTitles.english
@@ -477,6 +495,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isInteractionEnabled else { return }
         if event.modifierFlags.contains(.control) {
             showMenu(with: event)
             return
@@ -527,6 +546,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
             ) else {
                 return
             }
+            guard isInteractionEnabled else { onPressChanged(false); return }
 
             switch nextEvent.type {
             case .leftMouseDragged:
@@ -567,7 +587,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     }
 
     private func beginExternalDrag(with event: NSEvent) {
-        guard let assetURL else { return }
+        guard isInteractionEnabled, let assetURL else { return }
         let resolvedDragURLs = dragSourceURLs()
         let urls = resolvedDragURLs.isEmpty ? [assetURL] : resolvedDragURLs
         let draggingItems = urls.map { url in
@@ -607,6 +627,7 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     }
 
     private func showMenu(with event: NSEvent) {
+        guard isInteractionEnabled else { return }
         let menu = NSMenu()
         menu.autoenablesItems = false
 
@@ -645,7 +666,10 @@ final class AssetInteractionView: NSView, NSDraggingSource {
             let tagItem = NSMenuItem()
             let tagView = ColorTagMenuView(
                 selectedTags: Set(assetTags),
-                onToggleTag: onToggleTag
+                onToggleTag: { [weak self] tag in
+                    guard let self, self.isInteractionEnabled else { return }
+                    self.onToggleTag(tag)
+                }
             )
             tagView.frame = NSRect(origin: .zero, size: tagView.intrinsicContentSize)
             tagItem.view = tagView
@@ -717,34 +741,42 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     }
 
     @objc private func restore() {
+        guard isInteractionEnabled else { return }
         onRestore()
     }
 
     @objc private func moveToTrash() {
+        guard isInteractionEnabled else { return }
         onMoveToTrash()
     }
 
     @objc private func revealInFinder() {
+        guard isInteractionEnabled else { return }
         onRevealInFinder()
     }
 
     @objc private func openWithSelectedApplication(_ item: NSMenuItem) {
+        guard isInteractionEnabled else { return }
         onOpenWith(item.representedObject as? URL)
     }
 
     @objc private func openWithOtherApplication() {
+        guard isInteractionEnabled else { return }
         onOpenWith(nil)
     }
 
     @objc private func copyAsset() {
+        guard isInteractionEnabled else { return }
         onCopy()
     }
 
     @objc private func shareAsset() {
+        guard isInteractionEnabled else { return }
         onShare(self)
     }
 
     @objc private func addToCompareTray() {
+        guard isInteractionEnabled else { return }
         onAddToCompareTray()
     }
 }
@@ -957,16 +989,6 @@ private struct SelectionCheckbox: View {
     }
 }
 
-private struct SelectionGlow: View {
-    var cornerRadius: CGFloat
-    var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius + 2, style: .continuous)
-            .stroke(LightboxColorTokens.accent, lineWidth: LightboxControlMetrics.focusLineWidth)
-            .padding(-2)
-            .allowsHitTesting(false)
-    }
-}
-
 private struct ComparePulseGlow: View {
     var cornerRadius: CGFloat
     var body: some View {
@@ -1021,9 +1043,9 @@ struct AssetImageView: View {
     var quality: ImageCacheQuality = .thumbnail
     var decodePriority: ImageDecodePriority = .normal
     var loadsImage = true
-    @State private var displayState: AssetImageDisplayState
-    @State private var requestID = UUID()
-    @State private var imageRequest: ImageCacheRequest?
+    @LightboxViewState private var displayState: AssetImageDisplayState
+    @LightboxViewState private var requestID = UUID()
+    @LightboxViewState private var imageRequest: ImageCacheRequest?
 
     init(
         asset: LightboxAsset,

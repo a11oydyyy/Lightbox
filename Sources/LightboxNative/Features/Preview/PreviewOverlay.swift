@@ -9,18 +9,19 @@ struct PreviewOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     var asset: LightboxAsset
-    @State private var isPresented = false
-    @State private var isClosing = false
-    @State private var showsInformation = false
-    @State private var lockedPreviewSize: CGSize?
-    @State private var lockedSourceFrame: CGRect?
-    @State private var didStartPresentation = false
-    @State private var presentationTask: Task<Void, Never>?
-    @State private var highResolutionTask: Task<Void, Never>?
-    @State private var imageQuality: ImageCacheQuality = .thumbnail
+    @LightboxViewState private var isPresented = false
+    @LightboxViewState private var isClosing = false
+    @LightboxViewState private var showsInformation = false
+    @LightboxViewState private var lockedPreviewSize: CGSize?
+    @LightboxViewState private var lockedSourceFrame: CGRect?
+    @LightboxViewState private var didStartPresentation = false
+    @LightboxViewState private var presentationTask: Task<Void, Never>?
+    @LightboxViewState private var highResolutionTask: Task<Void, Never>?
+    @LightboxViewState private var imageQuality: ImageCacheQuality = .thumbnail
 
     var body: some View {
         GeometryReader { proxy in
+            let keyboardSessionID = appState.previewSessionID
             let computedSize = PreviewGeometry.previewSize(
                 assetSize: CGSize(width: asset.width, height: asset.height),
                 viewport: proxy.size
@@ -55,6 +56,7 @@ struct PreviewOverlay: View {
             ZStack(alignment: .bottom) {
                 PreviewKeyboardLayer(
                     requestsFocus: !showsInformation,
+                    onFocusAcquired: { appState.markPreviewKeyboardFocusAcquired(sessionID: keyboardSessionID) },
                     onInformation: { showsInformation = true },
                     onPrevious: {
                         appState.stepPreview(.previous)
@@ -362,6 +364,7 @@ struct PreviewOverlay: View {
 
 private struct PreviewKeyboardLayer: NSViewRepresentable {
     var requestsFocus: Bool
+    var onFocusAcquired: () -> Void
     var onInformation: () -> Void
     var onPrevious: () -> Void
     var onNext: () -> Void
@@ -369,6 +372,7 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
 
     func makeNSView(context: Context) -> PreviewKeyboardView {
         let view = PreviewKeyboardView()
+        view.onFocusAcquired = onFocusAcquired
         view.onPrevious = onPrevious
         view.onNext = onNext
         view.onClose = onClose
@@ -376,6 +380,7 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: PreviewKeyboardView, context: Context) {
+        nsView.onFocusAcquired = onFocusAcquired
         nsView.onInformation = onInformation
         nsView.onPrevious = onPrevious
         nsView.onNext = onNext
@@ -395,13 +400,19 @@ final class PreviewKeyboardView: NSView {
     }
 
     private func requestFocusWhenAttached() {
-        guard requestedFocus, window != nil else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.requestedFocus else { return }
-            self.window?.makeFirstResponder(self)
+        guard requestedFocus, let window else { return }
+        if window.firstResponder === self { onFocusAcquired(); return }
+        // Input can arrive in the same event cycle that attaches the overlay.
+        // The view has no synchronous state publication, so claim focus now.
+        if window.makeFirstResponder(self) { onFocusAcquired(); return }
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.requestedFocus, self.window === window,
+                  window.firstResponder !== self else { return }
+            if window.makeFirstResponder(self) { self.onFocusAcquired() }
         }
     }
     var onInformation: () -> Void = {}
+    var onFocusAcquired: () -> Void = {}
     var onPrevious: () -> Void = {}
     var onNext: () -> Void = {}
     var onClose: () -> Void = {}

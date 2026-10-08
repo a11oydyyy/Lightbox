@@ -16,6 +16,30 @@ import Testing
     #expect(nested?.ancestors == ["/Pictures/Trips"])
 }
 
+@Test func sidebarTreeFolderIdentityPreservesRevealAndReload() {
+    let root = URL(fileURLWithPath: "/Volumes/Identity Fixtures", isDirectory: true)
+    let folder = LibraryFolderEntry(sourceID: "volume", url: root.appendingPathComponent("Trip/../穿搭图库/B页", isDirectory: true), rootURL: root)
+    let reference = SidebarTreeFolder(folder: folder)
+    let plan = SidebarTreeRevealPlan(folder: folder.url, roots: [root], showsHiddenItems: true)
+    #expect(reference.id == folder.id)
+    #expect(reference.path == plan?.row.path)
+    #expect(SidebarDirectoryIdentity(url: root).path == plan?.row.root)
+    var renamed = folder
+    renamed.url = root.appendingPathComponent("穿搭图库/C页", isDirectory: true)
+    let reloaded = SidebarTreeFolder(folder: renamed)
+    #expect(reloaded.id != reference.id)
+    #expect(reloaded.path == SidebarTreeRevealPlan(folder: renamed.url, roots: [root], showsHiddenItems: true)?.row.path)
+    #expect(reference.folder.url == folder.url)
+}
+
+@Test func sidebarVolumeIdentityPreservesCanonicalRowPath() {
+    let url = URL(fileURLWithPath: "/Volumes/Folder/../外置盘", isDirectory: true)
+    let volume = SidebarVolume(url: url, displayName: "外置盘")
+    #expect(volume.id == url.standardizedFileURL.path)
+    #expect(volume.id == volume.url.path)
+    #expect(SidebarTreeRevealPlan(folder: volume.url, roots: [volume.url], showsHiddenItems: true)?.row == SidebarTreeRowID(root: volume.id, path: volume.id))
+}
+
 @Test func galleryKeyboardUsesSpatialNeighborsAndStopsAtEdges() {
     let ids = ["a", "b", "c", "d"]
     let frames = ["a": CGRect(x: 0, y: 60, width: 100, height: 150),
@@ -75,4 +99,129 @@ import Testing
     #expect(!focusVisible)
     card.requestedKeyboardFocus = false
     card.removeFromSuperview()
+}
+
+@Test(arguments: [true, false])
+@MainActor func previewKeyboardTakesFocusBeforeNextEventWhenAttached(requestedBeforeAttachment: Bool) throws {
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let content = try #require(window.contentView)
+    let gallery = AssetInteractionView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+    gallery.debugSurface = "gallery-card"
+    content.addSubview(gallery)
+    #expect(window.makeFirstResponder(gallery))
+    let preview = PreviewKeyboardView(frame: .zero)
+    var nextRequests = 0
+    preview.onNext = { nextRequests += 1 }
+    defer {
+        preview.requestedFocus = false
+        window.makeFirstResponder(nil)
+        preview.removeFromSuperview()
+        gallery.removeFromSuperview()
+        window.close()
+    }
+    if requestedBeforeAttachment { preview.requestedFocus = true }
+    content.addSubview(preview)
+    if !requestedBeforeAttachment { preview.requestedFocus = true }
+
+    // The next input event can arrive before an asynchronously queued focus handoff.
+    #expect(window.firstResponder === preview)
+    let next = try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+        timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "\u{F703}", charactersIgnoringModifiers: "\u{F703}", isARepeat: false, keyCode: 124))
+    (window.firstResponder as? PreviewKeyboardView)?.keyDown(with: next)
+    #expect(nextRequests == 1)
+}
+
+@Test @MainActor func previewKeyboardDoesNotTakeFocusWithoutRequest() throws {
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let content = try #require(window.contentView)
+    let information = NSTextField(frame: NSRect(x: 0, y: 0, width: 150, height: 24))
+    content.addSubview(information)
+    #expect(window.makeFirstResponder(information))
+    let originalResponder = window.firstResponder
+    let preview = PreviewKeyboardView(frame: .zero)
+    defer {
+        preview.requestedFocus = false
+        window.makeFirstResponder(nil)
+        preview.removeFromSuperview()
+        information.removeFromSuperview()
+        window.close()
+    }
+    preview.requestedFocus = true
+    preview.requestedFocus = false
+    content.addSubview(preview)
+    #expect(window.firstResponder === originalResponder)
+    #expect(window.firstResponder !== preview)
+}
+
+@MainActor private final class PreviewFocusRefusingView: NSView {
+    var remainingRefusals = 1
+    override var acceptsFirstResponder: Bool { true }
+    override func resignFirstResponder() -> Bool {
+        guard remainingRefusals > 0 else { return true }
+        remainingRefusals -= 1
+        return false
+    }
+}
+
+@Test @MainActor func previewKeyboardRetriesFocusAfterResponderInitiallyRefuses() async throws {
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let content = try #require(window.contentView)
+    let previous = PreviewFocusRefusingView(frame: .zero)
+    content.addSubview(previous)
+    #expect(window.makeFirstResponder(previous))
+    let preview = PreviewKeyboardView(frame: .zero)
+    var acquiredFocus = 0
+    preview.onFocusAcquired = { acquiredFocus += 1 }
+    content.addSubview(preview)
+    defer {
+        preview.requestedFocus = false
+        window.makeFirstResponder(nil)
+        preview.removeFromSuperview()
+        previous.removeFromSuperview()
+        window.close()
+    }
+    preview.requestedFocus = true
+    #expect(window.firstResponder === previous)
+    #expect(previous.remainingRefusals == 0)
+    #expect(acquiredFocus == 0)
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(window.firstResponder === preview)
+    #expect(acquiredFocus == 1)
+}
+
+@Test(arguments: [true, false])
+@MainActor func previewKeyboardCancelledRetryDoesNotTakeFocus(detach: Bool) async throws {
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let content = try #require(window.contentView)
+    let previous = PreviewFocusRefusingView(frame: .zero)
+    content.addSubview(previous)
+    #expect(window.makeFirstResponder(previous))
+    let preview = PreviewKeyboardView(frame: .zero)
+    var acquiredFocus = 0
+    preview.onFocusAcquired = { acquiredFocus += 1 }
+    content.addSubview(preview)
+    defer {
+        preview.requestedFocus = false
+        window.makeFirstResponder(nil)
+        preview.removeFromSuperview()
+        previous.removeFromSuperview()
+        window.close()
+    }
+    preview.requestedFocus = true
+    #expect(window.firstResponder === previous)
+    if detach { preview.removeFromSuperview() }
+    else { preview.requestedFocus = false }
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(window.firstResponder === previous)
+    #expect(window.firstResponder !== preview)
+    #expect(acquiredFocus == 0)
 }
