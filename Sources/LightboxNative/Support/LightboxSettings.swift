@@ -192,6 +192,15 @@ enum LightboxTextKey: String, CaseIterable {
     case sidebarPinned
     case sidebarLocations
     case sidebarVolumes
+    case locationApplications
+    case locationDesktop
+    case locationDocuments
+    case locationDownloads
+    case locationMovies
+    case locationMusic
+    case locationPictures
+    case previousImage
+    case nextImage
     case simplifiedChinese
     case traditionalChinese
     case switchToGrid
@@ -433,6 +442,15 @@ enum LightboxLocalization {
         .sidebarPinned: "Pinned",
         .sidebarLocations: "Locations",
         .sidebarVolumes: "Volumes",
+        .locationApplications: "Applications",
+        .locationDesktop: "Desktop",
+        .locationDocuments: "Documents",
+        .locationDownloads: "Downloads",
+        .locationMovies: "Movies",
+        .locationMusic: "Music",
+        .locationPictures: "Pictures",
+        .previousImage: "Previous Image",
+        .nextImage: "Next Image",
         .about: "About",
         .addSelectedToCompareTray: "Add Selected to Compare Tray",
         .addToCompareTray: "Add to Compare Tray",
@@ -582,6 +600,15 @@ enum LightboxLocalization {
         .sidebarPinned: "固定",
         .sidebarLocations: "位置",
         .sidebarVolumes: "磁盘",
+        .locationApplications: "应用程序",
+        .locationDesktop: "桌面",
+        .locationDocuments: "文稿",
+        .locationDownloads: "下载",
+        .locationMovies: "影片",
+        .locationMusic: "音乐",
+        .locationPictures: "图片",
+        .previousImage: "上一张",
+        .nextImage: "下一张",
         .about: "关于",
         .addSelectedToCompareTray: "加入对比暂存区",
         .addToCompareTray: "加入对比暂存区",
@@ -731,6 +758,15 @@ enum LightboxLocalization {
         .sidebarPinned: "固定",
         .sidebarLocations: "位置",
         .sidebarVolumes: "磁碟",
+        .locationApplications: "應用程式",
+        .locationDesktop: "桌面",
+        .locationDocuments: "文件",
+        .locationDownloads: "下載項目",
+        .locationMovies: "影片",
+        .locationMusic: "音樂",
+        .locationPictures: "圖片",
+        .previousImage: "上一張",
+        .nextImage: "下一張",
         .about: "關於",
         .addSelectedToCompareTray: "加入比較暫存區",
         .addToCompareTray: "加入比較暫存區",
@@ -880,6 +916,15 @@ enum LightboxLocalization {
         .sidebarPinned: "固定",
         .sidebarLocations: "場所",
         .sidebarVolumes: "ディスク",
+        .locationApplications: "アプリケーション",
+        .locationDesktop: "デスクトップ",
+        .locationDocuments: "書類",
+        .locationDownloads: "ダウンロード",
+        .locationMovies: "ムービー",
+        .locationMusic: "ミュージック",
+        .locationPictures: "ピクチャ",
+        .previousImage: "前の画像",
+        .nextImage: "次の画像",
         .about: "情報",
         .addSelectedToCompareTray: "選択項目を比較トレイに追加",
         .addToCompareTray: "比較トレイに追加",

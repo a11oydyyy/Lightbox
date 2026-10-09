@@ -19,26 +19,26 @@ struct GlassSidebar: View {
         let selectedFolderPath = selectedFolderPath
 
         VStack(spacing: 0) {
+            // The window controls and sidebar toggle live in this band.
+            Color.clear
+                .frame(height: SidebarMetrics.titlebarBandHeight)
+                .background(WindowHeaderDragArea())
+
             ScrollViewReader { scrollProxy in
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 24) {
-                    SidebarSection(title: appState.localized(.tabs)) {
+                    SidebarSection(
+                        title: appState.localized(.tabs),
+                        accessory: SidebarSectionAccessory(
+                            symbol: "plus",
+                            label: appState.localized(.newTab),
+                            help: "\(appState.localized(.newTab)) (⌘T)",
+                            action: { appState.newTab() }
+                        )
+                    ) {
                         ReorderableSidebarItems(items: appState.tabs, move: appState.reorderTabs) { tab in
                             SidebarTabRow(tab: tab)
                         }
-                        Button { appState.newTab() } label: {
-                            Image(systemName: "plus")
-                                .font(.system(size: LightboxControlMetrics.iconSize, weight: .medium))
-                                .foregroundStyle(LightboxColorTokens.secondaryText)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: LightboxControlMetrics.iconButtonSize)
-                                .contentShape(RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius))
-                        }
-                        .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)))
-                        .background(LightboxColorTokens.primaryText.opacity(0.04), in: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius))
-                        .help("\(appState.localized(.newTab)) (⌘T)")
-                        .accessibilityLabel(appState.localized(.newTab))
-                        .padding(.top, 4)
                     }
 
                     if !visiblePinnedSources.isEmpty {
@@ -125,7 +125,7 @@ struct GlassSidebar: View {
                     }
                 }
                 .padding(.horizontal, 12)
-                .padding(.top, 22)
+                .padding(.top, 6)
                 .padding(.bottom, 12)
             }
             .onPreferenceChange(SidebarTreeRowsKey.self) { rows in
@@ -184,24 +184,15 @@ struct GlassSidebar: View {
 
     private func title(for location: SidebarLocationID) -> String {
         switch location {
-        case .applications:
-            "Applications"
-        case .desktop:
-            "Desktop"
-        case .documents:
-            "Documents"
-        case .downloads:
-            "Downloads"
-        case .movies:
-            "Movies"
-        case .music:
-            "Music"
-        case .pictures:
-            "Pictures"
-        case .iCloudDrive:
-            "iCloud Drive"
-        case .volumes:
-            "Volumes"
+        case .applications: appState.localized(.locationApplications)
+        case .desktop: appState.localized(.locationDesktop)
+        case .documents: appState.localized(.locationDocuments)
+        case .downloads: appState.localized(.locationDownloads)
+        case .movies: appState.localized(.locationMovies)
+        case .music: appState.localized(.locationMusic)
+        case .pictures: appState.localized(.locationPictures)
+        case .iCloudDrive: "iCloud Drive"
+        case .volumes: appState.localized(.sidebarVolumes)
         }
     }
 
@@ -284,18 +275,49 @@ private enum SidebarRowControl: Hashable {
     case folder, disclosure, pin
 }
 
+enum SidebarMetrics {
+    /// Band at the top of the panel reserved for the window controls and the
+    /// sidebar toggle; the panel starts 8pt below the window edge.
+    static let titlebarBandHeight: CGFloat = 40
+    static let accessorySize: CGFloat = 22
+}
+
+struct SidebarSectionAccessory {
+    var symbol: String
+    var label: String
+    var help: String
+    var action: () -> Void
+}
+
 private struct SidebarSection<Content: View>: View {
     var title: String
+    var accessory: SidebarSectionAccessory? = nil
     @ViewBuilder var content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(LightboxColorTokens.secondaryText)
-                .accessibilityAddTraits(.isHeader)
-                .padding(.leading, 10)
-                .padding(.bottom, 1)
+            HStack(spacing: 0) {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(LightboxColorTokens.secondaryText)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 0)
+                if let accessory {
+                    Button(action: accessory.action) {
+                        Image(systemName: accessory.symbol)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(LightboxColorTokens.secondaryText)
+                            .frame(width: SidebarMetrics.accessorySize, height: SidebarMetrics.accessorySize)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+                    .help(accessory.help)
+                    .accessibilityLabel(accessory.label)
+                }
+            }
+            .frame(height: SidebarMetrics.accessorySize)
+            .padding(.leading, 10)
+            .padding(.trailing, 6)
 
             content
         }
@@ -338,7 +360,7 @@ private struct SidebarPinnedFolderRow: View {
                 }
             } label: {
                 HStack(spacing: 10) {
-                    SidebarSymbolIcon(symbol: systemImage, tags: colorTags)
+                    SidebarSymbolIcon(symbol: systemImage, tags: colorTags, isEmphasized: isSelected)
 
                     Text(title)
                         .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
@@ -380,10 +402,9 @@ private struct SidebarPinnedFolderRow: View {
         .frame(height: 36)
         .background {
             let shape = RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
-            if isSelected {
-                shape.fill(LightboxColorTokens.navigationSelection)
-                    .transition(.opacity)
-            } else if isHovering {
+            // Only the active tab row has a fill; the current folder row is
+            // marked by its semibold label, so the sidebar shows one highlight.
+            if isHovering {
                 shape.fill(
                     LightboxColorTokens.primaryText
                         .opacity(LightboxSelectionTokens.hoverFillOpacity)
@@ -530,23 +551,7 @@ private struct SidebarFolderNode: View {
 
     private var row: some View {
         HStack(spacing: 4) {
-            Button {
-                toggleExpanded()
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(LightboxColorTokens.mutedText)
-                    .frame(width: 14, height: 26)
-                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    .opacity(hasLoadedChildren || isExpanded ? 1 : 0.72)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .focused($focusedControl, equals: .disclosure)
-            .accessibilityLabel(title)
-            .accessibilityValue(appState.localized(isExpanded ? .expandedState : .collapsedState))
-
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 Button {
                     if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
                         appState.openSidebarFolderInNewTab(url)
@@ -555,7 +560,7 @@ private struct SidebarFolderNode: View {
                     }
                 } label: {
                     HStack(spacing: 10) {
-                        SidebarSymbolIcon(symbol: systemImage, tags: colorTags)
+                        SidebarSymbolIcon(symbol: systemImage, tags: colorTags, isEmphasized: isSelected)
 
                         Text(title)
                             .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
@@ -592,15 +597,31 @@ private struct SidebarFolderNode: View {
                 .focused($focusedControl, equals: .pin)
                 .accessibilityLabel(isPinned ? appState.localized(.unpinFolder) : appState.localized(.pinCurrentPath))
                 .help(isPinned ? appState.localized(.unpinFolder) : appState.localized(.pinCurrentPath))
+
+                // Trailing disclosure keeps every sidebar icon on one column.
+                Button {
+                    toggleExpanded()
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(LightboxColorTokens.mutedText)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: SidebarMetrics.accessorySize, height: SidebarMetrics.accessorySize)
+                        .opacity(isHovering || isExpanded || focusedControl != nil ? 1 : 0)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+                .focused($focusedControl, equals: .disclosure)
+                .accessibilityLabel(title)
+                .accessibilityValue(appState.localized(isExpanded ? .expandedState : .collapsedState))
             }
             .padding(.trailing, 6)
             .frame(height: 36)
             .background {
                 let shape = RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
-                if isSelected {
-                    shape.fill(LightboxColorTokens.navigationSelection)
-                        .transition(.opacity)
-                } else if isHovering {
+                // Only the active tab row has a fill; the current folder row is
+                // marked by its semibold label, so the sidebar shows one highlight.
+                if isHovering {
                     shape.fill(
                         LightboxColorTokens.primaryText
                             .opacity(LightboxSelectionTokens.hoverFillOpacity)
@@ -748,7 +769,7 @@ private struct SidebarTrashRow: View {
             }
         } label: {
             HStack(spacing: 10) {
-                SidebarSymbolIcon(symbol: "trash")
+                SidebarSymbolIcon(symbol: "trash", isEmphasized: isSelected)
 
                 Text(appState.localized(.trash))
                     .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
@@ -761,10 +782,9 @@ private struct SidebarTrashRow: View {
             .frame(height: 36)
             .background {
                 let shape = RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
-                if isSelected {
-                    shape.fill(LightboxColorTokens.navigationSelection)
-                        .transition(.opacity)
-                } else if isHovering {
+                // Only the active tab row has a fill; the current folder row is
+                // marked by its semibold label, so the sidebar shows one highlight.
+                if isHovering {
                     shape.fill(
                         LightboxColorTokens.primaryText
                             .opacity(LightboxSelectionTokens.hoverFillOpacity)
@@ -801,6 +821,9 @@ struct SidebarSymbolIcon: View {
     var symbol: String
     var tags: [String] = []
     var url: URL?
+    /// The active tab or current row: a neutral symbol steps up to primary text.
+    /// Location hues and Finder tag colors are unchanged.
+    var isEmphasized = false
     @LightboxViewState private var loadedTags: [String] = []
     private var filledSymbol: String {
         switch symbol {
@@ -817,18 +840,15 @@ struct SidebarSymbolIcon: View {
         }
     }
     private var color: Color {
-        if symbol == "folder" {
-            return LightboxColorTokens.folderColor(tags.isEmpty ? loadedTags : tags)
+        // Fixed locations keep their system hue; folders are neutral unless a
+        // Finder tag colors them.
+        if let location = LightboxColorTokens.locationColor(symbol) {
+            return location
         }
-        switch symbol {
-        case "arrow.down.circle": return LightboxColorTokens.iconGreen
-        case "music.note": return LightboxColorTokens.iconMusicRed
-        case "icloud": return LightboxColorTokens.iconCloudBlue
-        case "film": return LightboxColorTokens.iconPurple
-        case "photo.on.rectangle": return LightboxColorTokens.iconOrange
-        case "externaldrive", "trash": return LightboxColorTokens.secondaryText
-        default: return LightboxColorTokens.accent
+        if symbol == "folder", let tag = MacColorTag.all.first(where: { (tags.isEmpty ? loadedTags : tags).contains($0.name) }) {
+            return tag.color
         }
+        return isEmphasized ? LightboxColorTokens.primaryText : LightboxColorTokens.glyph
     }
     // Keep each symbol within one hue; layer contrast comes from tonal depth.
     private var palette: (Color, Color, Color) {
@@ -869,7 +889,7 @@ private struct SidebarTabRow: View {
         HStack(spacing: 6) {
             Button { appState.selectTab(tab.id) } label: {
                 HStack(spacing: 8) {
-                    SidebarSymbolIcon(symbol: tab.isStartPage ? "plus.square" : "folder", url: tab.isStartPage ? nil : tab.folderURL)
+                    SidebarSymbolIcon(symbol: tab.isStartPage ? "plus.square" : "folder", url: tab.isStartPage ? nil : tab.folderURL, isEmphasized: active)
                     Text(appState.tabTitle(tab))
                         .font(.system(size: 13, weight: active ? .semibold : .medium))
                         .lineLimit(1)
@@ -903,8 +923,19 @@ private struct SidebarTabRow: View {
         .padding(.leading, 8)
         .padding(.trailing, 3)
         .background {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(fileDropTargetID == tab.id ? LightboxColorTokens.accent.opacity(0.16) : (active ? LightboxColorTokens.navigationSelection : LightboxColorTokens.primaryText.opacity(hovering ? LightboxSelectionTokens.hoverFillOpacity : 0)))
+            let shape = RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
+            if fileDropTargetID == tab.id {
+                // A graphite fill alone reads as a second active tab; the stroke
+                // marks the drop, matching the header path segments.
+                LightboxSelectionSurface(
+                    shape: shape,
+                    fillOpacity: LightboxSelectionTokens.dropFillOpacity,
+                    strokeOpacity: LightboxSelectionTokens.emphasisStrokeOpacity,
+                    lineWidth: LightboxSelectionTokens.emphasisLineWidth
+                )
+            } else {
+                shape.fill(active ? LightboxColorTokens.navigationSelection : LightboxColorTokens.primaryText.opacity(hovering ? LightboxSelectionTokens.hoverFillOpacity : 0))
+            }
         }
         .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: hovering)
         .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: active)

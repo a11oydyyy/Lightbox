@@ -3,7 +3,6 @@ import SwiftUI
 
 struct NewTabView: View {
     @EnvironmentObject private var appState: AppState
-    @Environment(\.colorScheme) private var colorScheme
     @LightboxViewState private var unavailablePath: String?
     @LightboxViewState private var folderRequestID: UUID?
 
@@ -29,22 +28,8 @@ struct NewTabView: View {
                         Text(appState.localized(.startBrowsingHint))
                             .font(.system(size: 14))
                             .foregroundStyle(LightboxColorTokens.secondaryText)
-                        HStack(spacing: 12) {
-                            Button { appState.addExternalSource() } label: {
-                                Label(appState.localized(.startOpenFolder), systemImage: "folder.badge.plus")
-                                    .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 5)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(LightboxColorTokens.accent)
-                            .keyboardShortcut("o", modifiers: .command)
-                            Text("⌘O")
-                                .font(.system(size: 12))
-                                .foregroundStyle(LightboxColorTokens.mutedText)
-                                .accessibilityHidden(true)
-                        }
-                        .padding(.top, 8)
+                        openFolderButton
+                            .padding(.top, 8)
                     }
 
                     if geometry.size.width >= 700 {
@@ -77,6 +62,23 @@ struct NewTabView: View {
         .onDisappear {
             folderRequestID = nil
             appState.cancelPendingFolderPath()
+        }
+    }
+
+    @ViewBuilder
+    private var openFolderButton: some View {
+        let button = Button { appState.addExternalSource() } label: {
+            Label(appState.localized(.startOpenFolder), systemImage: "folder.badge.plus")
+                .foregroundStyle(LightboxColorTokens.accentForeground)
+                .padding(.horizontal, 4)
+        }
+        .controlSize(.large)
+        .keyboardShortcut("o", modifiers: .command)
+        .help("\(appState.localized(.startOpenFolder)) (⌘O)")
+        if #available(macOS 26.0, *) {
+            button.buttonStyle(.glassProminent)
+        } else {
+            button.buttonStyle(.borderedProminent)
         }
     }
 

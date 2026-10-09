@@ -1,9 +1,14 @@
 import CoreGraphics
 
 enum PreviewGeometry {
+    static let horizontalMargin: CGFloat = 88
+    static let verticalMargin: CGFloat = 132
+
     static func previewSize(assetSize: CGSize, viewport: CGSize) -> CGSize {
-        let maxWidth = min(1080, max(220, viewport.width - 180))
-        let maxHeight = min(860, max(220, viewport.height - 340))
+        // Fill the window: side margins leave room for the step buttons, and the
+        // symmetric vertical margin keeps the metadata block below the image.
+        let maxWidth = max(220, viewport.width - 2 * horizontalMargin)
+        let maxHeight = max(220, viewport.height - 2 * verticalMargin)
         let scale = min(1, maxWidth / max(1, assetSize.width), maxHeight / max(1, assetSize.height))
         return CGSize(width: assetSize.width * scale, height: assetSize.height * scale)
     }

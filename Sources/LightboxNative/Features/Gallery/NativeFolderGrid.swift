@@ -213,16 +213,18 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
                 shape.fill()
             }
             if focused && !selected {
-                let inset = LightboxControlMetrics.focusLineWidth / 2
+                let inset: CGFloat = 0.5
                 let ring = NSBezierPath(roundedRect: rect.insetBy(dx: inset, dy: inset),
                     xRadius: LightboxControlMetrics.cornerRadius, yRadius: LightboxControlMetrics.cornerRadius)
-                ring.lineWidth = LightboxControlMetrics.focusLineWidth
-                NSColor(LightboxColorTokens.secondaryText).setStroke()
+                ring.lineWidth = 1
+                // A quiet ring: the grid takes focus on any gallery click, so
+                // the marker must not read heavier than selection.
+                NSColor(LightboxColorTokens.secondaryText).withAlphaComponent(0.45).setStroke()
                 ring.stroke()
             }
             let iconKey = tags.first?.name ?? ""
             if icons[iconKey] == nil {
-                let color = NSColor(tags.first?.color ?? LightboxColorTokens.accent)
+                let color = NSColor(tags.first?.color ?? LightboxColorTokens.glyph)
                 icons[iconKey] = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)?
                     .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
                         .applying(.init(hierarchicalColor: color)))

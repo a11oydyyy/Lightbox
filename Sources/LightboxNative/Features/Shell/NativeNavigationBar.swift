@@ -37,6 +37,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         }
     }
     private var searching = false
+    private var shownSearchSymbol = "magnifyingglass"
     private var lastSearchGeneration: Int
     private var lastPathGeneration: Int
     private var lastPath: String = ""
@@ -314,6 +315,14 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         searchField.placeholderString = appState.localized(.search)
         searchField.setAccessibilityLabel(appState.localized(.search))
         if searchField.stringValue != appState.searchText { searchField.stringValue = appState.searchText }
+        // Graphite alone is close to the idle gray, so an active search also
+        // switches to the filled symbol.
+        let searchSymbol = appState.searchText.isEmpty ? "magnifyingglass" : "magnifyingglass.circle.fill"
+        if searchSymbol != shownSearchSymbol {
+            shownSearchSymbol = searchSymbol
+            search.image = NSImage(systemSymbolName: searchSymbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: LightboxControlMetrics.iconSize, weight: .regular))
+        }
         search.contentTintColor = appState.searchText.isEmpty ? .secondaryLabelColor : NSColor(LightboxColorTokens.accent)
         search.toolTip = appState.searchText.isEmpty ? appState.localized(.search) : "\(appState.localized(.search)): \(appState.searchText)"
         if lastSearchGeneration != appState.searchFocusGeneration {

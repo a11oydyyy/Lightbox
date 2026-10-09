@@ -27,7 +27,9 @@ enum GlassTokens {
     }
 
     static func floatingCapsuleShadowOpacity(_ glassOpacity: Double) -> Double {
-        0.035 + glassOpacity * 0.09
+        // System glass draws its own depth on macOS 26 and later.
+        if #available(macOS 26.0, *) { return 0 }
+        return 0.035 + glassOpacity * 0.09
     }
 }
 

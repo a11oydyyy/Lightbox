@@ -9,7 +9,12 @@ struct ResidentSidebarHost: NSViewRepresentable {
     func makeNSView(context: Context) -> NSHostingView<SidebarHostedContent> {
         let host = NSHostingView(rootView: SidebarHostedContent(appState: appState))
         host.sizingOptions = []
-        if #available(macOS 14, *) { host.clipsToBounds = false }
+        if #available(macOS 14, *) {
+            host.clipsToBounds = false
+            // The panel runs under the transparent titlebar so the window
+            // controls sit inside it, as in Finder; it reserves that band itself.
+            host.safeAreaRegions = []
+        }
         return host
     }
 

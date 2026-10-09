@@ -299,15 +299,9 @@ private struct BottomControlGlassModifier<S: Shape>: ViewModifier {
         let strokeOpacity = GlassTokens.floatingCapsuleStrokeOpacity(glassOpacity)
 
         if #available(macOS 26.0, *) {
-            content
-                .background {
-                    shape.fill(LightboxColorTokens.control.opacity(fillOpacity))
-                }
-                .background(.ultraThinMaterial.opacity(materialOpacity), in: shape)
-                .glassEffect(.clear, in: shape)
-                .overlay {
-                    shape.stroke(LightboxColorTokens.primaryText.opacity(strokeOpacity), lineWidth: 0.7)
-                }
+            // System glass alone: extra fill, material and stroke flatten its
+            // lensing into gray frosting and cost legibility over images.
+            content.glassEffect(.regular, in: shape)
         } else {
             content
                 .background {

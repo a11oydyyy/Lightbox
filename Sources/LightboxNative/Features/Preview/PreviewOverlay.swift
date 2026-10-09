@@ -168,6 +168,21 @@ struct PreviewOverlay: View {
                         y: controlsY
                     )
             }
+            .overlay {
+                if appState.activeAssets.count > 1 {
+                    HStack {
+                        PreviewStepButton(symbol: "chevron.left", label: appState.localized(.previousImage)) {
+                            appState.stepPreview(.previous)
+                        }
+                        Spacer(minLength: 0)
+                        PreviewStepButton(symbol: "chevron.right", label: appState.localized(.nextImage)) {
+                            appState.stepPreview(.next)
+                        }
+                    }
+                    .padding(.horizontal, 22)
+                    .previewChromePresentation(isVisible: isPresented, reduceMotion: reduceMotion)
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 Button(action: closeAnimated) {
                     Image(systemName: "xmark")
@@ -509,6 +524,29 @@ private func previewSizeDescription(_ size: CGSize) -> String {
 
 private func previewDurationDescription(_ duration: Duration) -> String {
     "\(duration)"
+}
+
+/// Visible step affordance for the arrow keys; quiet at rest, clear on hover.
+private struct PreviewStepButton: View {
+    var symbol: String
+    var label: String
+    var action: () -> Void
+    @LightboxViewState private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
+        .opacity(isHovering ? 1 : 0.55)
+        .onHover { isHovering = $0 }
+        .help(label)
+        .accessibilityLabel(label)
+    }
 }
 
 private struct PreviewBackgroundVeil: View {

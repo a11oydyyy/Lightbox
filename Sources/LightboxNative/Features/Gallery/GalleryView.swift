@@ -429,7 +429,7 @@ struct GalleryView: View {
             // Reset before constructing cells so the first geometry callback
             // cannot discard their freshly registered image-loading states.
             let _ = prepareGeometry(for: geometryNavigationToken)
-            let folderHorizontalPadding = horizontalPadding + imageColumnInset(viewportWidth: viewport.size.width)
+            let folderHorizontalPadding = horizontalPadding
             let activeAssets = appState.activeAssets
             let activeAssetIDs = appState.activeAssetIDs
             let performanceProfile = GalleryPerformanceProfile.current
@@ -520,7 +520,7 @@ struct GalleryView: View {
                                                 viewportWidth: viewport.size.width,
                                                 minimumColumns: min(GalleryThumbnailSizing.maximumZoomColumnCount, max(1, group.assets.count))
                                             ).usedWidth)
-                                            .frame(maxWidth: .infinity)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                             .padding(.horizontal, horizontalPadding)
                                             .background(SearchGroupHeaderFrameProbe(id: group.id))
 
@@ -977,7 +977,7 @@ struct GalleryView: View {
                     performanceProfile: performanceProfile, menuTitles: menuTitles, reportsOwnFrame: false)
             }
             .frame(width: metrics.usedWidth)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .frame(maxWidth: .infinity, alignment: .leading)
         } else {
         HStack(alignment: .top, spacing: SpacingTokens.regular) {
             ForEach(Array(columns.enumerated()), id: \.offset) { _, columnAssets in
@@ -1004,7 +1004,7 @@ struct GalleryView: View {
             }
         }
         .frame(width: metrics.usedWidth)
-        .frame(maxWidth: .infinity, alignment: .center)
+        .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1154,21 +1154,10 @@ struct GalleryView: View {
         return columns
     }
 
-    private func imageColumnInset(viewportWidth: CGFloat) -> CGFloat {
-        let minimumColumns = min(
-            GalleryThumbnailSizing.maximumZoomColumnCount,
-            max(1, appState.activeAssets.count)
-        )
-        return galleryMetrics(
-            viewportWidth: viewportWidth,
-            minimumColumns: minimumColumns
-        ).leadingInset
-    }
-
     private func galleryMetrics(
         viewportWidth: CGFloat,
         minimumColumns: Int = GalleryThumbnailSizing.maximumZoomColumnCount
-    ) -> (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat, leadingInset: CGFloat) {
+    ) -> (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat) {
         let availableWidth = max(1, viewportWidth - horizontalPadding * 2)
         let spacing = SpacingTokens.regular
         let minimumColumns = max(1, minimumColumns)
@@ -1189,8 +1178,9 @@ struct GalleryView: View {
         let maxItemWidth = floor((availableWidth - CGFloat(columns - 1) * spacing) / CGFloat(columns))
         let itemWidth = min(effectiveThumbnailWidth, maxItemWidth)
         let usedWidth = CGFloat(columns) * itemWidth + CGFloat(columns - 1) * spacing
-        let leadingInset = max(0, floor((availableWidth - usedWidth) / 2))
-        return (columns, itemWidth, usedWidth, leadingInset)
+        // Callers align the grid leading so its edge lines up with the header
+        // and folders; the slider keeps scaling continuously.
+        return (columns, itemWidth, usedWidth)
     }
 
     @ViewBuilder

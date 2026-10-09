@@ -18,12 +18,18 @@ struct Hover3DModifier: ViewModifier {
         isFocused ? MotionTokens.chromeReveal : MotionTokens.feedback
     }
 
+    /// Focus without selection sits further out, so a gap separates it from the
+    /// graphite selection ring that hugs the card at the same tone.
+    private var outlineOffset: CGFloat {
+        isFocused && !isSelected ? 4 : 2
+    }
+
     func body(content: Content) -> some View {
         content
             .overlay {
-                RoundedRectangle(cornerRadius: RadiusTokens.card + 2, style: .continuous)
-                    .stroke(isSelected ? LightboxColorTokens.accent : LightboxColorTokens.secondaryText.opacity(isFocused ? 1 : (colorScheme == .light ? 0.85 : 0.35)), lineWidth: isFocused ? 2 : (isSelected ? LightboxControlMetrics.focusLineWidth : 1))
-                    .padding(-2)
+                RoundedRectangle(cornerRadius: RadiusTokens.card + outlineOffset, style: .continuous)
+                    .stroke(isSelected ? LightboxColorTokens.accent : LightboxColorTokens.secondaryText.opacity(isFocused ? 1 : (colorScheme == .light ? 0.42 : 0.35)), lineWidth: isFocused ? 2 : (isSelected ? LightboxControlMetrics.focusLineWidth : 1))
+                    .padding(-outlineOffset)
                     .opacity(showsOutline ? 1 : 0)
                     // Keep one resident outline through selection and focus handoff.
                     // Scope feedback to the outline so the returning image stays solid.
