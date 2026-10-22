@@ -28,7 +28,7 @@ private final class DecodeGate: @unchecked Sendable {
         _ = cache.image(for: URL(fileURLWithPath: "/tmp/slow-\(UUID())-\(index).jpg"),
             quality: .thumbnailBalanced, priority: .low) { _ in staleCompletions += 1 }
     }
-    for _ in 0..<100 where gate.started < 2 { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { gate.started < 2 }
     #expect(gate.started >= 2)
     try await Task.sleep(for: .milliseconds(50))
     cache.cancelOutstandingRequests(reason: "test-switch-away-from-slow-volume")

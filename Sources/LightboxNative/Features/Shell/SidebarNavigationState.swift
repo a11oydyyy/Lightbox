@@ -78,6 +78,24 @@ final class SidebarNavigationState: ObservableObject {
 }
 
 enum SidebarOrder {
+    /// The row a drag that started at `startIndex` is over after moving
+    /// `translation` points, with rows `pitch` points apart.
+    static func dragTarget(startIndex: Int, translation: CGFloat, pitch: CGFloat, count: Int) -> Int {
+        guard count > 0, pitch > 0 else { return startIndex }
+        let steps = Int((translation / pitch).rounded())
+        return min(max(startIndex + steps, 0), count - 1)
+    }
+
+    /// Where to insert `dragged` so it takes `target`'s place: after it when
+    /// moving down, before it when moving up. Nil means the end.
+    static func insertionPoint<ID: Equatable>(dragging dragged: ID, onto target: ID, in ids: [ID]) -> (before: ID?, moves: Bool) {
+        guard dragged != target,
+              let from = ids.firstIndex(of: dragged),
+              let to = ids.firstIndex(of: target)
+        else { return (nil, false) }
+        return (from < to ? (to + 1 < ids.count ? ids[to + 1] : nil) : target, true)
+    }
+
     /// Ignore stale drag identities; keep the model's relative order for multi-item moves.
     static func moving<Item: Identifiable>(_ ids: [Item.ID], before target: Item.ID?, in items: [Item]) -> [Item] {
         let selected = Set(ids)
@@ -92,24 +110,85 @@ enum SidebarOrder {
     }
 }
 
+/// Rows that can be dragged into a new order within their section.
+///
+/// The drag is handled inside the section rather than through the system's
+/// drag and drop: rows are buttons, which on macOS keep a drag source from
+/// ever starting, and the system reorder container (`reorderable()` /
+/// `reorderContainer`) crashed when a row was lifted on macOS 27, in 2.0.11
+/// as well. Moving the pointer 6pt takes over from the button; a plain click
+/// still reaches it. The dragged row follows the pointer and takes the place
+/// of each row it passes.
 struct ReorderableSidebarItems<Item: Identifiable, Row: View>: View where Item.ID: Sendable {
     var items: [Item]
     var move: ([Item.ID], Item.ID?) -> Void
     @ViewBuilder var row: (Item) -> Row
+    @State private var drag: SidebarRowDrag<Item.ID>?
+    @State private var rowHeight: CGFloat = 36
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static var spacing: CGFloat { 4 }
+    private static var coordinateSpace: String { "SidebarReorder" }
+    private var pitch: CGFloat { rowHeight + Self.spacing }
 
     var body: some View {
-        if #available(macOS 27, *) {
-            VStack(spacing: 4) {
-                ForEach(items, content: row).reorderable()
+        VStack(spacing: Self.spacing) {
+            ForEach(items) { item in
+                let isDragged = drag?.id == item.id
+                row(item)
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.onAppear { rowHeight = proxy.size.height }
+                        }
+                    }
+                    .offset(y: isDragged ? draggedRowOffset : 0)
+                    // The dragged row tracks the pointer exactly; only the rows
+                    // making room for it animate.
+                    .transaction { if isDragged { $0.animation = nil } }
+                    .zIndex(isDragged ? 1 : 0)
+                    .shadow(color: .black.opacity(isDragged ? 0.12 : 0), radius: 6, y: 2)
+                    .highPriorityGesture(
+                        // Measured in the section, not the row: the row moves
+                        // while dragged, which made a row-relative translation jump.
+                        DragGesture(minimumDistance: 6, coordinateSpace: .named(Self.coordinateSpace))
+                            .onChanged { value in dragChanged(item.id, translation: value.translation.height) }
+                            .onEnded { _ in
+                                withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
+                                    drag = nil
+                                }
+                            }
+                    )
             }
-            .reorderContainer(for: Item.self) { difference in
-                switch difference.destination.position {
-                case .before(let id): move(difference.sources, id)
-                case .end: move(difference.sources, nil)
-                }
-            }
-        } else {
-            ForEach(items, content: row)
+        }
+        .coordinateSpace(name: Self.coordinateSpace)
+    }
+
+    /// Keeps the dragged row under the pointer after the rows have reordered.
+    private var draggedRowOffset: CGFloat {
+        guard let drag, let index = items.firstIndex(where: { $0.id == drag.id }) else { return 0 }
+        return drag.translation - CGFloat(index - drag.startIndex) * pitch
+    }
+
+    private func dragChanged(_ id: Item.ID, translation: CGFloat) {
+        let ids = items.map(\.id)
+        if drag?.id != id {
+            guard let start = ids.firstIndex(of: id) else { return }
+            drag = SidebarRowDrag(id: id, startIndex: start, translation: 0)
+        }
+        guard var current = drag else { return }
+        current.translation = translation
+        drag = current
+        let target = SidebarOrder.dragTarget(startIndex: current.startIndex, translation: translation, pitch: pitch, count: ids.count)
+        let point = SidebarOrder.insertionPoint(dragging: id, onto: ids[target], in: ids)
+        guard point.moves else { return }
+        withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
+            move([id], point.before)
         }
     }
+}
+
+private struct SidebarRowDrag<ID: Hashable> {
+    var id: ID
+    var startIndex: Int
+    var translation: CGFloat
 }

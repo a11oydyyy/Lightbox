@@ -18,11 +18,16 @@ struct ComparisonOverlay: View {
         GeometryReader { proxy in
             let isCompact = proxy.size.width < 960
             let usesBoardLayout = assets.count > 2
+            // Clears the close button above and matches the preview's margins.
             let contentPadding = EdgeInsets(
-                top: isCompact ? 56 : 72,
+                top: isCompact ? 64 : 76,
                 leading: isCompact ? 26 : 58,
-                bottom: isCompact ? 42 : 58,
+                bottom: isCompact ? 36 : 48,
                 trailing: isCompact ? 26 : 58
+            )
+            let available = CGSize(
+                width: proxy.size.width - contentPadding.leading - contentPadding.trailing,
+                height: proxy.size.height - contentPadding.top - contentPadding.bottom
             )
 
             ZStack {
@@ -34,7 +39,8 @@ struct ComparisonOverlay: View {
                         closeAnimated()
                     }
 
-                comparisonContent(isCompact: isCompact, viewport: proxy.size)
+                comparisonContent(available: available, horizontalInset: contentPadding.leading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(contentPadding)
                     .opacity(isPresented ? 1 : 0)
                     .scaleEffect(isPresented ? 1 : (usesBoardLayout ? 0.992 : 0.985))
@@ -91,44 +97,37 @@ struct ComparisonOverlay: View {
     }
 
     @ViewBuilder
-    private func comparisonContent(isCompact: Bool, viewport: CGSize) -> some View {
-        if assets.count > 2 {
-            comparisonBoard(viewport: viewport, isCompact: isCompact)
-        } else if isCompact {
-            VStack(spacing: 18) {
-                comparisonPanes(quality: .comparison)
+    private func comparisonContent(available: CGSize, horizontalInset: CGFloat) -> some View {
+        let layout = ComparisonLayout.make(aspectRatios: assets.map(\.aspectRatio), available: available)
+        if layout.scrolls {
+            // Scrolls edge to edge; the inset only pads the first and last image.
+            ScrollView(.horizontal) {
+                LazyHStack(alignment: .top, spacing: ComparisonLayout.spacing) {
+                    ForEach(layout.rows.first ?? [], id: \.self) { pane($0, layout) }
+                }
+                .padding(.horizontal, horizontalInset)
             }
+            .scrollIndicators(.hidden)
+            .padding(.horizontal, -horizontalInset)
         } else {
-            HStack(spacing: 18) {
-                comparisonPanes(quality: .comparison)
-            }
-        }
-    }
-
-    private func comparisonPanes(quality: ImageCacheQuality) -> some View {
-        ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
-            ComparisonPane(label: comparisonLabel(for: index), asset: asset, imageQuality: quality)
-                .recordsComparisonPaneFrame(in: Self.coordinateSpaceName)
-        }
-    }
-
-    private func comparisonBoard(viewport: CGSize, isCompact: Bool) -> some View {
-        let visibleColumns = CGFloat(isCompact ? 2 : min(4, max(3, assets.count)))
-        let outerPadding = isCompact ? 52.0 : 116.0
-        let totalSpacing = (visibleColumns - 1) * 16
-        let paneWidth = max(220, floor((viewport.width - outerPadding - totalSpacing) / visibleColumns))
-
-        return ScrollView(.horizontal) {
-            LazyHStack(spacing: 16) {
-                ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
-                    ComparisonPane(label: comparisonLabel(for: index), asset: asset, imageQuality: .comparison)
-                        .frame(width: paneWidth)
-                        .recordsComparisonPaneFrame(in: Self.coordinateSpaceName)
+            VStack(spacing: ComparisonLayout.spacing) {
+                ForEach(layout.rows, id: \.self) { row in
+                    HStack(alignment: .top, spacing: ComparisonLayout.spacing) {
+                        ForEach(row, id: \.self) { pane($0, layout) }
+                    }
                 }
             }
-            .padding(.horizontal, 1)
         }
-        .scrollIndicators(.hidden)
+    }
+
+    private func pane(_ index: Int, _ layout: ComparisonLayout) -> some View {
+        ComparisonPane(
+            label: comparisonLabel(for: index),
+            asset: assets[index],
+            imageSize: index < layout.imageSizes.count ? layout.imageSizes[index] : .zero
+        )
+        .id(assets[index].id)
+        .recordsComparisonPaneFrame(in: Self.coordinateSpaceName)
     }
 
     private func comparisonLabel(for index: Int) -> String {
@@ -241,37 +240,38 @@ private extension View {
     }
 }
 
+/// One compared image at its layout size, with its number on the image and
+/// its name and file summary directly below.
 private struct ComparisonPane: View {
     var label: String
     var asset: LightboxAsset
-    var imageQuality: ImageCacheQuality
+    var imageSize: CGSize
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
+    }
 
     var body: some View {
         VStack(spacing: 10) {
-            ZStack(alignment: .topLeading) {
-                AssetImageView(asset: asset, contentMode: .fit, quality: imageQuality)
-                    .imageDecodePriority(.high)
-                    .accessibilityLabel(asset.originalName)
-                    .clipShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
-                            .stroke(.white.opacity(0.20), lineWidth: 0.8)
-                    }
-                    .shadow(color: .black.opacity(0.16), radius: 14, y: 8)
-
-                Text(label)
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(LightboxColorTokens.primaryText)
-                    .frame(width: 24, height: 24)
-                    .background(.ultraThinMaterial.opacity(0.76), in: Circle())
-                    .overlay {
-                        Circle()
-                            .stroke(.white.opacity(0.22), lineWidth: 0.7)
-                    }
-                    .padding(10)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
+            AssetImageView(asset: asset, contentMode: .fill, quality: .comparison)
+                .imageDecodePriority(.high)
+                .frame(width: imageSize.width, height: imageSize.height)
+                .clipShape(shape)
+                .overlay { shape.strokeBorder(LightboxColorTokens.border.opacity(0.55), lineWidth: 0.5) }
+                .shadow(color: .black.opacity(0.14), radius: 12, y: 6)
+                .overlay(alignment: .topLeading) {
+                    Text(label)
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                        .frame(width: 22, height: 22)
+                        .background(.black.opacity(0.42), in: Circle())
+                        .overlay { Circle().strokeBorder(.white.opacity(0.28), lineWidth: 0.5) }
+                        .padding(8)
+                        .accessibilityHidden(true)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(label). \(asset.originalName)")
 
             VStack(spacing: 3) {
                 Text(asset.originalName)
@@ -279,18 +279,17 @@ private struct ComparisonPane: View {
                     .foregroundStyle(LightboxColorTokens.primaryText)
                     .lineLimit(1)
                     .truncationMode(.middle)
-
-                Text(dimensions)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(LightboxColorTokens.secondaryText)
+                Text(asset.fileSummaryText)
+                    .font(.system(size: 11))
                     .monospacedDigit()
+                    .foregroundStyle(LightboxColorTokens.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-            .frame(maxWidth: .infinity)
+            // Narrow images borrow the gap beside them for a readable caption.
+            .frame(width: imageSize.width + ComparisonLayout.spacing - 4)
         }
-    }
-
-    private var dimensions: String {
-        "\(Int(asset.width.rounded())) x \(Int(asset.height.rounded()))"
+        .frame(width: imageSize.width)
     }
 }
 

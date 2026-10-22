@@ -15,6 +15,13 @@ struct LightboxAsset: Identifiable, Hashable, Sendable {
     var palette: MockPalette
     var deletedAt: Date?
     var metadataLoaded: Bool
+    /// Camera Raw or Lightroom has saved develop settings for it (see
+    /// `CameraRawSettings`); nil until the background metadata pass has checked.
+    var hasCameraRawSettings: Bool? = nil
+    /// False for other files (PDFs, videos, documents…), which the gallery
+    /// shows as icon tiles when "Show Other Files" is on. They have no pixel
+    /// size to load, so they are square and their metadata counts as loaded.
+    let isImage: Bool
 
     init(
         id: String? = nil,
@@ -41,7 +48,46 @@ struct LightboxAsset: Identifiable, Hashable, Sendable {
         self.fileSize = fileSize
         self.palette = palette
         self.deletedAt = deletedAt
-        self.metadataLoaded = metadataLoaded
+        // Assets without a file (mock and in-memory ones) are images.
+        isImage = sourceURL == nil || Self.isImageName(originalName)
+        self.metadataLoaded = isImage ? metadataLoaded : true
+        if !isImage {
+            self.width = 1
+            self.height = 1
+        }
+    }
+
+    /// Camera RAW formats.
+    static let rawImageExtensions: Set<String> = [
+        "raw", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
+        "raf", "rw2", "orf", "ori", "pef", "srw", "x3f", "erf", "rwl", "3fr",
+        "mef", "mos", "mrw", "dcr", "kdc", "fff", "iiq", "ari", "bay"
+    ]
+
+    /// Extensions the gallery decodes as images, RAW formats included.
+    static let imageExtensions: Set<String> = rawImageExtensions.union([
+        "jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff"
+    ])
+
+    static func isImageName(_ name: String) -> Bool {
+        imageExtensions.contains((name as NSString).pathExtension.lowercased())
+    }
+
+    /// The same file under a new name or path. Becoming an image means its
+    /// size is still to be read.
+    func renamed(to url: URL) -> LightboxAsset {
+        let name = url.lastPathComponent
+        let becomesImage = !isImage && Self.isImageName(name)
+        return LightboxAsset(
+            originalName: name, width: width, height: height, tags: tags, sourceURL: url,
+            addedAt: addedAt, contentModifiedAt: contentModifiedAt, fileSize: fileSize, palette: palette,
+            deletedAt: deletedAt, metadataLoaded: becomesImage ? false : metadataLoaded
+        )
+    }
+
+    /// `isImage` from an ID alone (see `stableID`), without finding the asset.
+    static func isImageID(_ id: ID) -> Bool {
+        !id.hasPrefix("file:") || isImageName(id)
     }
 
     var aspectRatio: CGFloat {
@@ -130,6 +176,12 @@ struct FileContentSignature: Equatable, Hashable, Sendable {
     func matchesModificationMetadata(_ other: FileContentSignature) -> Bool {
         modificationTime == other.modificationTime && fileSize == other.fileSize
     }
+
+    /// For a size stored from `stat` against a listing's resource values:
+    /// the two round the modification time differently by well under 1ms.
+    func matchesStoredMetadata(_ other: FileContentSignature) -> Bool {
+        fileSize == other.fileSize && abs(modificationTime - other.modificationTime) < 0.001
+    }
 }
 
 enum GallerySortField: String, CaseIterable, Codable, Hashable, Sendable {
@@ -138,6 +190,8 @@ enum GallerySortField: String, CaseIterable, Codable, Hashable, Sendable {
     case tag
     case fileName
     case type
+    /// Pixel count; images without a known size and other files count as smallest.
+    case dimensions
 }
 
 enum GallerySortDirection: String, CaseIterable, Codable, Hashable, Sendable {
@@ -160,41 +214,91 @@ enum GalleryAssetSorter {
         field: GallerySortField,
         direction: GallerySortDirection
     ) -> [LightboxAsset] {
+        guard items.count > 1 else { return items }
         switch field {
         case .time:
-            return items.sorted { lhs, rhs in
-                compare(lhs.addedAt, rhs.addedAt, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            }
+            return sorted(items, keys: items.map(\.addedAt), direction: direction)
         case .size:
-            return items.sorted { lhs, rhs in
-                compare(lhs.fileSize ?? 0, rhs.fileSize ?? 0, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            }
+            return sorted(items, keys: items.map { $0.fileSize ?? 0 }, direction: direction)
         case .tag:
-            return items.sorted { lhs, rhs in
-                compareTag(lhs, rhs, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            }
+            return sorted(items, keys: items.map(sortableTagRank), direction: direction)
         case .fileName:
-            return items.sorted { lhs, rhs in
-                compareText(lhs.originalName, rhs.originalName, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            }
+            let ranks = nameRanks(items)
+            return sorted(items, keys: items.map { ranks[$0.originalName] ?? 0 }, direction: direction)
+        case .dimensions:
+            return sorted(items, keys: items.map(pixelCount), direction: direction)
         case .type:
             // Parsing an escaped file URL during every comparison is expensive.
             // Keep keys local to this sort so renamed/replaced files cannot reuse stale keys.
-            let keyedItems = items.map { (asset: $0, type: fileType($0)) }
-            return keyedItems.sorted { lhs, rhs in
-                compareText(lhs.type, rhs.type, direction: direction)
-                    ?? tieBreak(lhs.asset, rhs.asset, direction: direction)
-            }.map(\.asset)
+            let types = items.map(fileType)
+            let ranks = localizedRanks(types)
+            return sorted(items, keys: types.map { ranks[$0] ?? 0 }, direction: direction)
         }
     }
 
-    private static func compare<T: Comparable>(
-        _ lhs: T,
-        _ rhs: T,
+    /// Orders by keys computed once per asset (`keys[i]` belongs to `items[i]`);
+    /// runs of equal keys fall back to name, then ID. Same order as comparing
+    /// `key ?? name ?? id` pairwise, but localized compares happen once per
+    /// distinct name instead of on every comparison, and only indices move.
+    private static func sorted<Key: Comparable>(
+        _ items: [LightboxAsset],
+        keys: [Key],
         direction: GallerySortDirection
-    ) -> Bool? {
-        guard lhs != rhs else { return nil }
-        return direction == .ascending ? lhs < rhs : lhs > rhs
+    ) -> [LightboxAsset] {
+        let ascending = direction == .ascending
+        var order = Array(items.indices)
+        order.sort { ascending ? keys[$0] < keys[$1] : keys[$0] > keys[$1] }
+
+        var runs: [Range<Int>] = []
+        var runStart = 0
+        while runStart < order.count {
+            var runEnd = runStart + 1
+            while runEnd < order.count, keys[order[runEnd]] == keys[order[runStart]] { runEnd += 1 }
+            if runEnd - runStart > 1 { runs.append(runStart..<runEnd) }
+            runStart = runEnd
+        }
+        guard !runs.isEmpty else { return order.map { items[$0] } }
+
+        let rankByName = nameRanks(items)
+        var nameRank = [Int](repeating: 0, count: items.count)
+        for run in runs {
+            for index in order[run] { nameRank[index] = rankByName[items[index].originalName] ?? 0 }
+        }
+        for run in runs {
+            order[run].sort { lhs, rhs in
+                if nameRank[lhs] != nameRank[rhs] {
+                    return ascending ? nameRank[lhs] < nameRank[rhs] : nameRank[lhs] > nameRank[rhs]
+                }
+                return compareText(items[lhs].id, items[rhs].id, direction: direction) ?? false
+            }
+        }
+        return order.map { items[$0] }
+    }
+
+    /// Ranks of every name in `items`, from a small cache: ranking thousands
+    /// of names took ~35 ms, and every sort field (as a tie-break) and every
+    /// rebuild of the same folder needs the same ranks. Only relative order
+    /// matters, so ranks over all names also order any subset.
+    private static func nameRanks(_ items: [LightboxAsset]) -> [String: Int] {
+        let names = Set(items.map(\.originalName))
+        let locale = Locale.current.identifier
+        if let cached = NameRankCache.shared.ranks(for: names, locale: locale) { return cached }
+        let ranks = localizedRanks(Array(names))
+        NameRankCache.shared.store(ranks, for: names, locale: locale)
+        return ranks
+    }
+
+    /// Dense ranks under `localizedStandardCompare`; values it treats as equal share a rank.
+    private static func localizedRanks(_ values: [String]) -> [String: Int] {
+        let unique = Set(values).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        var ranks: [String: Int] = [:]
+        ranks.reserveCapacity(unique.count)
+        var rank = 0
+        for (index, value) in unique.enumerated() {
+            if index > 0, unique[index - 1].localizedStandardCompare(value) != .orderedSame { rank += 1 }
+            ranks[value] = rank
+        }
+        return ranks
     }
 
     private static func compareText(
@@ -207,17 +311,6 @@ enum GalleryAssetSorter {
         return direction == .ascending ? order == .orderedAscending : order == .orderedDescending
     }
 
-    private static func compareTag(
-        _ lhs: LightboxAsset,
-        _ rhs: LightboxAsset,
-        direction: GallerySortDirection
-    ) -> Bool? {
-        let lhsRank = sortableTagRank(lhs)
-        let rhsRank = sortableTagRank(rhs)
-        guard lhsRank != rhsRank else { return nil }
-        return direction == .ascending ? lhsRank < rhsRank : lhsRank > rhsRank
-    }
-
     private static func sortableTagRank(_ asset: LightboxAsset) -> Int {
         firstTagRank(asset) ?? Int.max
     }
@@ -228,24 +321,27 @@ enum GalleryAssetSorter {
         return MacColorTag.all.firstIndex { $0.name == firstTag }
     }
 
+    private static func pixelCount(_ asset: LightboxAsset) -> CGFloat {
+        guard asset.isImage, asset.metadataLoaded, asset.width > 1, asset.height > 1 else { return 0 }
+        return asset.width * asset.height
+    }
+
     private static func fileType(_ asset: LightboxAsset) -> String {
         let extensionFromURL = asset.sourceURL?.pathExtension.lowercased() ?? ""
         if !extensionFromURL.isEmpty {
             return extensionFromURL
         }
 
-        return URL(fileURLWithPath: asset.originalName).pathExtension.lowercased()
+        // A string split, not a file URL: building a URL per asset resolves the
+        // relative name against the working directory and dominated this sort.
+        return (asset.originalName as NSString).pathExtension.lowercased()
     }
+}
 
-    private static func tieBreak(
-        _ lhs: LightboxAsset,
-        _ rhs: LightboxAsset,
-        direction: GallerySortDirection
-    ) -> Bool {
-        compareText(lhs.originalName, rhs.originalName, direction: direction)
-            ?? compareText(lhs.id, rhs.id, direction: direction)
-            ?? false
-    }
+/// How the gallery shows a folder: the masonry grid, or Finder-style rows.
+enum GalleryViewMode: String, Codable, Hashable, Sendable {
+    case grid
+    case list
 }
 
 enum LibraryFilter: Hashable, Sendable {
@@ -286,5 +382,31 @@ enum GalleryLayoutMode: String, Codable, Hashable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         try container.encode(rawValue)
+    }
+}
+
+/// The last few name rankings `GalleryAssetSorter` computed. Sorting also runs
+/// off the main thread (search results), so access is locked.
+private final class NameRankCache: @unchecked Sendable {
+    static let shared = NameRankCache()
+    private static let capacity = 4
+    private let lock = NSLock()
+    private var entries: [(names: Set<String>, locale: String, ranks: [String: Int])] = []
+
+    func ranks(for names: Set<String>, locale: String) -> [String: Int]? {
+        lock.withLock {
+            guard let index = entries.firstIndex(where: { $0.locale == locale && $0.names == names }) else { return nil }
+            let entry = entries.remove(at: index)
+            entries.append(entry)
+            return entry.ranks
+        }
+    }
+
+    func store(_ ranks: [String: Int], for names: Set<String>, locale: String) {
+        lock.withLock {
+            entries.removeAll { $0.locale == locale && $0.names == names }
+            entries.append((names, locale, ranks))
+            if entries.count > Self.capacity { entries.removeFirst(entries.count - Self.capacity) }
+        }
     }
 }

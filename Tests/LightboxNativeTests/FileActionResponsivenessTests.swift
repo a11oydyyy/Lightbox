@@ -29,7 +29,7 @@ private final class FileCheckCounter: @unchecked Sendable {
         finished = true
         return existing
     }
-    for _ in 0..<500 where counter.count == 0 { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { counter.count == 0 }
     try #require(counter.count > 0)
     // Main actor can observe the worker while its first disk call is blocked;
     // unlike a 50ms sleep, this does not depend on concurrent test scheduling.
@@ -44,7 +44,7 @@ private final class FileCheckCounter: @unchecked Sendable {
     defer { counter.releaseFirstCheck() }
     let urls = (0..<100).map { URL(fileURLWithPath: "/tmp/\($0).jpg") }
     let work = Task { try await FileActionResolver.existingURLs(urls, exists: counter.check) }
-    for _ in 0..<500 where counter.count == 0 { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { counter.count == 0 }
     try #require(counter.count > 0)
     work.cancel()
     counter.releaseFirstCheck()

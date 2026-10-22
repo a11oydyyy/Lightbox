@@ -71,3 +71,27 @@ private struct LightboxButtonHoverBody<S: Shape>: View {
             .onHover { isHovered = $0 }
     }
 }
+
+/// Text-only controls such as section disclosures: the label steps up to
+/// primary text on hover or press instead of gaining a fill.
+struct LightboxTextHoverStyle: ButtonStyle {
+    var rest: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        LightboxTextHoverBody(configuration: configuration, rest: rest)
+    }
+}
+
+private struct LightboxTextHoverBody: View {
+    let configuration: ButtonStyle.Configuration
+    var rest: Color
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @LightboxViewState private var isHovered = false
+
+    var body: some View {
+        configuration.label
+            .foregroundStyle(isHovered || configuration.isPressed ? LightboxColorTokens.primaryText : rest)
+            .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isHovered)
+            .onHover { isHovered = $0 }
+    }
+}

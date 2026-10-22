@@ -28,7 +28,7 @@ enum LightboxTabStore {
     ) {
         guard !tabs.isEmpty else { return }
         let session = TabSessionState(
-            tabs: tabs.map(TabSession.init),
+            tabs: tabs.map(SavedTab.init),
             activeTabID: tabs.contains(where: { $0.id == activeTabID }) ? activeTabID : tabs[0].id
         )
         guard let data = try? JSONEncoder().encode(session) else { return }
@@ -37,11 +37,11 @@ enum LightboxTabStore {
 }
 
 private struct TabSessionState: Codable {
-    var tabs: [TabSession]
+    var tabs: [SavedTab]
     var activeTabID: UUID
 }
 
-private struct TabSession: Codable {
+private struct SavedTab: Codable {
     var id: UUID
     var source: LibrarySource
     var folderPath: String
@@ -51,6 +51,7 @@ private struct TabSession: Codable {
     var forwardHistory: [TabLocationSession]
     var searchText: String
     var filter: TabFilterSession
+    var attributeFilter: GalleryAttributeFilter?
     var sortField: GallerySortField
     var sortDirection: GallerySortDirection
     var layoutMode: GalleryLayoutMode
@@ -67,6 +68,7 @@ private struct TabSession: Codable {
         forwardHistory = tab.forwardHistory.map(TabLocationSession.init)
         searchText = tab.searchText
         filter = TabFilterSession(tab.filter)
+        attributeFilter = tab.attributeFilter.isActive ? tab.attributeFilter : nil
         sortField = tab.sortField
         sortDirection = tab.sortDirection
         layoutMode = tab.layoutMode
@@ -88,6 +90,7 @@ private struct TabSession: Codable {
             forwardHistory: forwardHistory.map { $0.makeLocation(resolvingAgainst: sources) },
             searchText: searchText,
             filter: filter.value,
+            attributeFilter: attributeFilter ?? GalleryAttributeFilter(),
             sortField: sortField,
             sortDirection: sortDirection,
             layoutMode: layoutMode,

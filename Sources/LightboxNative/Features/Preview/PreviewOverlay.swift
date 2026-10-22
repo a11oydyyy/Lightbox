@@ -9,15 +9,25 @@ struct PreviewOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     var asset: LightboxAsset
+    /// Source frame and session publish here rather than on `appState`.
+    @ObservedObject var presentation: PreviewPresentationState
     @LightboxViewState private var isPresented = false
     @LightboxViewState private var isClosing = false
     @LightboxViewState private var showsInformation = false
+    /// Showing the image at 100% (`PreviewLoupe`).
+    @LightboxViewState private var isZoomed = false
     @LightboxViewState private var lockedPreviewSize: CGSize?
     @LightboxViewState private var lockedSourceFrame: CGRect?
+    /// The image the locked geometry belongs to. A step to another image
+    /// must never reuse the previous image's box (a landscape image squeezed
+    /// into a portrait one), so geometry locked for another ID is ignored.
+    @LightboxViewState private var lockedAssetID: LightboxAsset.ID?
     @LightboxViewState private var didStartPresentation = false
     @LightboxViewState private var presentationTask: Task<Void, Never>?
     @LightboxViewState private var highResolutionTask: Task<Void, Never>?
     @LightboxViewState private var imageQuality: ImageCacheQuality = .thumbnail
+    /// Measured height of the details block below the image.
+    @LightboxViewState private var controlsHeight: CGFloat = 64
 
     var body: some View {
         GeometryReader { proxy in
@@ -26,13 +36,14 @@ struct PreviewOverlay: View {
                 assetSize: CGSize(width: asset.width, height: asset.height),
                 viewport: proxy.size
             )
-            let size = lockedPreviewSize ?? computedSize
+            let locksGeometry = lockedAssetID == asset.id
+            let size = (locksGeometry ? lockedPreviewSize : nil) ?? computedSize
             let computedSourceFrame = PreviewGeometry.sourceFrame(
                 recordedFrame: appState.previewSourceFrame,
                 fallbackSize: computedSize,
                 viewport: proxy.size
             )
-            let sourceFrame = lockedSourceFrame ?? computedSourceFrame
+            let sourceFrame = (locksGeometry ? lockedSourceFrame : nil) ?? computedSourceFrame
             let visibleFrame = PreviewGeometry.visibleFrame(
                 isPresented: isPresented,
                 sourceFrame: sourceFrame,
@@ -46,12 +57,18 @@ struct PreviewOverlay: View {
                 viewport: proxy.size
             )
             let scale = PreviewGeometry.scale(sourceFrame: visibleFrame, previewSize: size)
+            // Opened, a card's corners; at the thumbnail, the thumbnail's own
+            // (the list's are smaller), so the close lands without a snap.
             let cornerRadius = PreviewGeometry.compensatedCornerRadius(
-                displayRadius: RadiusTokens.card,
+                displayRadius: isPresented ? RadiusTokens.card : appState.previewSourceCornerRadius,
                 scale: scale,
                 maxRadius: min(size.width, size.height) / 2
             )
-            let controlsY = min(proxy.size.height - 58, presentedFrame.maxY + 86)
+            let controlsTop = PreviewGeometry.controlsTop(
+                imageBottom: presentedFrame.maxY,
+                controlsHeight: controlsHeight,
+                viewportHeight: proxy.size.height
+            )
 
             ZStack(alignment: .bottom) {
                 PreviewKeyboardLayer(
@@ -64,8 +81,13 @@ struct PreviewOverlay: View {
                     onNext: {
                         appState.stepPreview(.next)
                     },
+                    onCull: { mark in
+                        appState.markPreviewAsset(mark)
+                    },
+                    onZoom: { toggleZoom() },
                     onClose: {
                         if showsInformation { showsInformation = false }
+                        else if isZoomed { isZoomed = false }
                         else { closeAnimated() }
                     }
                 )
@@ -150,6 +172,7 @@ struct PreviewOverlay: View {
                     // Clip in viewport coordinates, after scale and position. A
                     // partially hidden source must return beneath the opaque header.
                     .clipShape(PreviewImageViewportClip())
+                    .opacity(showsLoupe ? 0 : 1)
                     // No `.compositingGroup()` here: during the open/close scale it
                     // forced an offscreen re-composite of the image + its radius-14
                     // shadow every frame (a slow path during the zoom). The view
@@ -161,11 +184,25 @@ struct PreviewOverlay: View {
                     .id(asset.id)
                     .animation(MotionTokens.ifAllowed(MotionTokens.preview, reduceMotion: reduceMotion), value: asset.id)
 
-                PreviewControls(asset: asset, showsInfo: $showsInformation)
-                    .previewChromePresentation(isVisible: isPresented, reduceMotion: reduceMotion)
+                if showsLoupe {
+                    PreviewLoupe(asset: asset, imageFrame: presentedFrame) { isZoomed = false }
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+                        .transition(.opacity)
+                }
+
+                PreviewControls(asset: asset, showsInfo: $showsInformation, onZoom: zoomAction)
+                    .background {
+                        GeometryReader { controls in
+                            Color.clear
+                                .onAppear { controlsHeight = controls.size.height }
+                                .onChange(of: controls.size.height) { controlsHeight = $0 }
+                        }
+                    }
+                    .previewChromePresentation(isVisible: isPresented && !showsLoupe, reduceMotion: reduceMotion)
                     .position(
                         x: proxy.size.width / 2,
-                        y: controlsY
+                        y: controlsTop + controlsHeight / 2
                     )
             }
             .overlay {
@@ -180,9 +217,33 @@ struct PreviewOverlay: View {
                         }
                     }
                     .padding(.horizontal, 22)
-                    .previewChromePresentation(isVisible: isPresented, reduceMotion: reduceMotion)
+                    .previewChromePresentation(isVisible: isPresented && !showsLoupe, reduceMotion: reduceMotion)
                 }
             }
+            .overlay(alignment: .top) {
+                if showsLoupe, appState.cullFeedback == nil {
+                    PreviewZoomBadge()
+                        .padding(.top, 58)
+                        .transition(.opacity)
+                }
+            }
+            .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: showsLoupe)
+            .overlay(alignment: .top) {
+                if let feedback = appState.cullFeedback {
+                    CullFeedbackBadge(mark: feedback.mark)
+                        .id(feedback.id)
+                        .padding(.top, 58)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        .task(id: feedback.id) {
+                            try? await Task.sleep(for: .milliseconds(900))
+                            guard !Task.isCancelled, appState.cullFeedback?.id == feedback.id else { return }
+                            withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
+                                appState.cullFeedback = nil
+                            }
+                        }
+                }
+            }
+            .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: appState.cullFeedback)
             .overlay(alignment: .topTrailing) {
                 Button(action: closeAnimated) {
                     Image(systemName: "xmark")
@@ -197,10 +258,9 @@ struct PreviewOverlay: View {
                 .padding(.trailing, 22)
             }
             .onAppear {
-                if lockedPreviewSize == nil {
+                if lockedAssetID != asset.id {
+                    lockedAssetID = asset.id
                     lockedPreviewSize = computedSize
-                }
-                if lockedSourceFrame == nil {
                     lockedSourceFrame = computedSourceFrame
                 }
                 previewOverlayLogger.info("preview overlay appear asset=\(asset.originalName, privacy: .public) viewport=\(previewSizeDescription(proxy.size), privacy: .public) previewSize=\(previewSizeDescription(size), privacy: .public) recordedFrame=\(previewFrameDescription(appState.previewSourceFrame), privacy: .public) lockedFrame=\(previewFrameDescription(lockedSourceFrame), privacy: .public)")
@@ -218,15 +278,30 @@ struct PreviewOverlay: View {
                 highResolutionTask?.cancel()
             }
             .onChange(of: asset.id) { _ in
+                // Stepped onto something without pixels to zoom into (a document,
+                // a deleted item): back to the fitted view. This closure may carry
+                // the previous image's values, so ask the app state.
+                if isZoomed, let current = appState.previewAsset,
+                   !(current.isImage && current.sourceURL != nil && !current.isDeleted) {
+                    isZoomed = false
+                }
                 previewOverlayLogger.info("preview overlay asset-change asset=\(asset.originalName, privacy: .public) direction=\(appState.previewStepDirection?.rawValue ?? "none", privacy: .public)")
                 highResolutionTask?.cancel()
                 imageQuality = .thumbnail
-                withAnimation(MotionTokens.ifAllowed(MotionTokens.previewGeometry, reduceMotion: reduceMotion)) {
-                    lockedPreviewSize = computedSize
-                    lockedSourceFrame = computedSourceFrame
+                // This closure may carry the previous image's values; read the
+                // stepped-to image from the app state instead.
+                if let current = appState.previewAsset {
+                    lockGeometry(for: current, viewport: proxy.size)
                 }
                 if isPresented, !isClosing {
                     scheduleHighResolutionUpgrade()
+                }
+            }
+            .onChange(of: CGSize(width: asset.width, height: asset.height)) { _ in
+                // Real dimensions can arrive after the preview opened.
+                guard let current = appState.previewAsset, current.id == lockedAssetID else { return }
+                withAnimation(MotionTokens.ifAllowed(MotionTokens.previewGeometry, reduceMotion: reduceMotion)) {
+                    lockGeometry(for: current, viewport: proxy.size)
                 }
             }
             .onChange(of: appState.isPreviewClosing) { closing in
@@ -244,6 +319,29 @@ struct PreviewOverlay: View {
     // plain crossfade reads cleanly. A directional slide was tried but the spring
     // deceleration made each step look like hitting the end of an album — dropped.
     private var previewStepTransition: AnyTransition { .opacity }
+
+    private func lockGeometry(for current: LightboxAsset, viewport: CGSize) {
+        let size = PreviewGeometry.previewSize(
+            assetSize: CGSize(width: current.width, height: current.height),
+            viewport: viewport
+        )
+        lockedAssetID = current.id
+        lockedPreviewSize = size
+        lockedSourceFrame = PreviewGeometry.sourceFrame(
+            recordedFrame: appState.previewSourceFrame,
+            fallbackSize: size,
+            viewport: viewport
+        )
+    }
+
+    /// Before locking a single value for the shown image, drop geometry that
+    /// was locked for another one.
+    private func claimLockedGeometry() {
+        guard lockedAssetID != asset.id else { return }
+        lockedAssetID = asset.id
+        lockedPreviewSize = nil
+        lockedSourceFrame = nil
+    }
 
     private var compareMenuTitle: String {
         if appState.selectedAssetIDs.count > 1, appState.selectedAssetIDs.contains(asset.id) {
@@ -303,7 +401,25 @@ struct PreviewOverlay: View {
         closeAnimated()
     }
 
+    private var canZoom: Bool {
+        asset.isImage && asset.sourceURL != nil && !asset.isDeleted
+    }
+
+    private var showsLoupe: Bool { isZoomed && canZoom }
+
+    private var zoomAction: (() -> Void)? {
+        guard canZoom else { return nil }
+        return { toggleZoom() }
+    }
+
+    private func toggleZoom() {
+        guard isZoomed || (canZoom && isPresented && !isClosing) else { return }
+        showsInformation = false
+        isZoomed.toggle()
+    }
+
     private func closeAnimated() {
+        isZoomed = false
         let didBeginPresentation = isPresented
         let delay: Duration = reduceMotion || !didBeginPresentation ? .milliseconds(60) : MotionTokens.previewGeometryDuration
         let sourceRevealDelay: Duration = reduceMotion || !didBeginPresentation ? .milliseconds(0) : MotionTokens.previewSourceRevealDelay
@@ -328,6 +444,7 @@ struct PreviewOverlay: View {
             return
         }
         if let currentFrame = appState.previewSpaceFrame(for: asset.id) {
+            claimLockedGeometry()
             lockedSourceFrame = currentFrame
         }
         isClosing = true
@@ -340,7 +457,9 @@ struct PreviewOverlay: View {
 
     private func closeFromExternalRoute() {
         guard !isClosing else { return }
+        isZoomed = false
         if let currentFrame = appState.previewSpaceFrame(for: asset.id) {
+            claimLockedGeometry()
             lockedSourceFrame = currentFrame
         }
         isClosing = true
@@ -383,6 +502,8 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
     var onInformation: () -> Void
     var onPrevious: () -> Void
     var onNext: () -> Void
+    var onCull: (CullMark) -> Void
+    var onZoom: () -> Void
     var onClose: () -> Void
 
     func makeNSView(context: Context) -> PreviewKeyboardView {
@@ -390,6 +511,8 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
         view.onFocusAcquired = onFocusAcquired
         view.onPrevious = onPrevious
         view.onNext = onNext
+        view.onCull = onCull
+        view.onZoom = onZoom
         view.onClose = onClose
         return view
     }
@@ -399,6 +522,8 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
         nsView.onInformation = onInformation
         nsView.onPrevious = onPrevious
         nsView.onNext = onNext
+        nsView.onCull = onCull
+        nsView.onZoom = onZoom
         nsView.onClose = onClose
         nsView.requestedFocus = requestsFocus
     }
@@ -430,6 +555,8 @@ final class PreviewKeyboardView: NSView {
     var onFocusAcquired: () -> Void = {}
     var onPrevious: () -> Void = {}
     var onNext: () -> Void = {}
+    var onCull: (CullMark) -> Void = { _ in }
+    var onZoom: () -> Void = {}
     var onClose: () -> Void = {}
 
     override var acceptsFirstResponder: Bool { true }
@@ -438,7 +565,16 @@ final class PreviewKeyboardView: NSView {
         guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
             super.keyDown(with: event); return
         }
-        if event.charactersIgnoringModifiers?.lowercased() == "i" { onInformation(); return }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "i": onInformation(); return
+        // Culling, as in Lightroom: pick, reject, unflag.
+        case "p": onCull(.keep); return
+        case "x": onCull(.reject); return
+        case "u": onCull(.clear); return
+        // 100% to check focus, as Lightroom's Z.
+        case "z": onZoom(); return
+        default: break
+        }
         switch event.keyCode {
         case 123:
             onPrevious()
@@ -449,6 +585,65 @@ final class PreviewKeyboardView: NSView {
         default:
             super.keyDown(with: event)
         }
+    }
+}
+
+/// Confirms a culling mark: the Finder tag's color and the mark's name.
+private struct CullFeedbackBadge: View {
+    @EnvironmentObject private var appState: AppState
+    var mark: CullMark
+
+    private var symbol: String {
+        switch mark {
+        case .keep: "checkmark.circle.fill"
+        case .reject: "xmark.circle.fill"
+        case .clear: "circle.dashed"
+        }
+    }
+
+    private var tint: Color {
+        mark.tag.flatMap { tag in MacColorTag.all.first { $0.name == tag }?.color } ?? LightboxColorTokens.secondaryText
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(tint)
+            Text(CullText(appState.appLanguage).feedback(mark))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(LightboxColorTokens.primaryText)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 30)
+        .background(Capsule(style: .continuous).fill(LightboxColorTokens.control))
+        .overlay(Capsule(style: .continuous).stroke(LightboxColorTokens.border.opacity(0.6), lineWidth: 0.7))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Says the preview is at 100% and how to leave it.
+private struct PreviewZoomBadge: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "plus.magnifyingglass")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(LightboxColorTokens.secondaryText)
+            Text(CullText(appState.appLanguage).zoomBadge)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(LightboxColorTokens.primaryText)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 30)
+        .background(Capsule(style: .continuous).fill(LightboxColorTokens.control))
+        .overlay(Capsule(style: .continuous).stroke(LightboxColorTokens.border.opacity(0.6), lineWidth: 0.7))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
     }
 }
 

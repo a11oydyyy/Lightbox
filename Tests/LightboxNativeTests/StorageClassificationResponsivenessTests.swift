@@ -32,9 +32,7 @@ private final class StorageClassificationObservation: @unchecked Sendable {
     let observation = StorageClassificationObservation()
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"),
                          libraryDefaults: defaults, storageClassifier: observation.classify)
-    for _ in 0..<500 where state.libraryLoadingStatus != nil {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    await waitWhile { state.libraryLoadingStatus != nil }
     #expect(observation.count > 0)
     #expect(observation.mainCount == 0)
 }
@@ -101,19 +99,15 @@ private final class MonitorConstructionObservation: @unchecked Sendable {
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"),
                          libraryDefaults: defaults, storageClassifier: { _ in false },
                          directoryMonitorFactory: observation.make)
-    for _ in 0..<500 where state.libraryLoadingStatus != nil || observation.failures == 0 {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    await waitWhile { state.libraryLoadingStatus != nil || observation.failures == 0 }
     try #require(observation.failures == 1)
     try await Task.sleep(for: .milliseconds(20))
     #expect(observation.count == 1) // Failure must not cause an automatic retry loop.
     state.refreshLibrary()
-    for _ in 0..<500 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     try #require(state.libraryLoadingStatus == nil && observation.count == 2)
     try Data().write(to: photos.appendingPathComponent("after-retry.png"))
-    for _ in 0..<500 where !state.assets.contains(where: { $0.originalName == "after-retry.png" }) {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    await waitWhile { !state.assets.contains(where: { $0.originalName == "after-retry.png" }) }
     #expect(state.assets.contains { $0.originalName == "after-retry.png" })
 }
 
@@ -134,20 +128,18 @@ private final class MonitorConstructionObservation: @unchecked Sendable {
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"),
                          libraryDefaults: defaults, storageClassifier: { _ in false },
                          directoryMonitorFactory: observation.make)
-    for _ in 0..<500 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     try #require(state.libraryLoadingStatus == nil && observation.count == 1)
     #expect(!state.selectedSourceUsesConservativeExternalLoading)
     for _ in 0..<3 {
         state.refreshLibrary()
-        for _ in 0..<500 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(5)) }
+        await waitWhile { state.libraryLoadingStatus != nil }
         try #require(state.libraryLoadingStatus == nil)
     }
     #expect(observation.count == 1)
     let png = try #require(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aO1sAAAAASUVORK5CYII="))
     try png.write(to: photos.appendingPathComponent("new.png"))
-    for _ in 0..<500 where !state.assets.contains(where: { $0.originalName == "new.png" }) {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    await waitWhile { !state.assets.contains(where: { $0.originalName == "new.png" }) }
     #expect(state.assets.contains { $0.originalName == "new.png" })
     #expect(observation.count == 1)
 }
@@ -170,20 +162,18 @@ private final class MonitorConstructionObservation: @unchecked Sendable {
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"),
                          libraryDefaults: defaults, storageClassifier: control.classify)
-    for _ in 0..<500 where control.count == 0 { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { control.count == 0 }
     try #require(control.count == 1 && !control.firstCompleted)
     #expect(control.mainCount == 0)
     #expect(state.selectedSourceUsesConservativeExternalLoading)
     // This main-actor interaction must finish while the old disk call is blocked.
     state.currentFolderURL = fast
     state.refreshLibrary()
-    for _ in 0..<500 where control.count < 2 || state.libraryLoadingStatus != nil {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    await waitWhile { control.count < 2 || state.libraryLoadingStatus != nil }
     try #require(control.count >= 2 && state.libraryLoadingStatus == nil)
     #expect(state.currentFolderURL == fast && !control.firstCompleted)
     control.release()
-    for _ in 0..<500 where !control.firstCompleted { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { !control.firstCompleted }
     try #require(control.firstCompleted)
     // Let any rejected main-actor publication run before checking the current policy.
     try await Task.sleep(for: .milliseconds(20))

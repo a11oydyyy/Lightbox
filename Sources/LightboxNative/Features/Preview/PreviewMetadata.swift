@@ -14,6 +14,8 @@ struct PreviewMetadata: Sendable {
     var file: [Entry] = []
     var exposureSummary: String = ""
     var imagePropertiesAvailable = false
+    /// Camera Raw or Lightroom has saved develop settings for the image.
+    var hasCameraRawSettings = false
 
     static func read(url: URL) -> PreviewMetadata {
         let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
@@ -35,6 +37,10 @@ struct PreviewMetadata: Sendable {
             if let date = values.contentModificationDate { result.file.append(.init(label: "Modified", value: formatter.string(from: date))) }
         }
         result.file.append(.init(label: "Path", value: url.path))
+        result.hasCameraRawSettings = CameraRawSettings.hasSettings(for: url)
+        if result.hasCameraRawSettings {
+            result.file.append(.init(label: "Camera Raw", value: "Has develop settings"))
+        }
         return result
     }
 

@@ -3,6 +3,14 @@ import SwiftUI
 
 struct WindowConfigurator: NSViewRepresentable {
     @ObservedObject var appState: AppState
+    /// Scan and transfer progress publish here, not on `appState`; observing
+    /// it keeps the header current without re-rendering the window.
+    @ObservedObject private var activity: BackgroundActivityState
+
+    init(appState: AppState) {
+        self.appState = appState
+        activity = appState.activity
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(appState: appState)
@@ -20,49 +28,51 @@ struct WindowConfigurator: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSToolbarDelegate {
+    final class Coordinator: NSObject {
         private let appState: AppState
         private var headerAccessory: NSTitlebarAccessoryViewController?
         private var headerHost: NativeNavigationBar?
         private var sidebarChromeVisible: Bool?
-        private let sidebarItemID = NSToolbarItem.Identifier("Lightbox.ToggleSidebar")
         private var sidebarButton: NSButton?
-        private var sidebarItem: NSToolbarItem?
 
         init(appState: AppState) {
             self.appState = appState
             super.init()
         }
 
-        func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-            [sidebarItemID]
-        }
-
-        func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-            [sidebarItemID]
-        }
-
-        func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
-            guard itemIdentifier == sidebarItemID else { return nil }
-            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.isNavigational = true
-            let button = NSButton(image: NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: nil)!, target: self, action: #selector(toggleSidebar))
+        /// The sidebar toggle sits beside the window controls, outside the
+        /// toolbar: macOS 26+ puts a glass platter behind every toolbar item,
+        /// which doubled up with this button's own hover fill. Same control as
+        /// the header's back/forward buttons, at the standard 28pt toolbar size
+        /// so its fill clears the edges of the sidebar's 40pt top band.
+        private func installSidebarButton(in window: NSWindow) {
+            guard sidebarButton == nil, let zoom = window.standardWindowButton(.zoomButton),
+                  let titlebar = zoom.superview else { return }
+            let button = HeaderIconButton()
+            button.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: LightboxControlMetrics.iconSize, weight: .regular))
+            button.target = self
+            button.action = #selector(toggleSidebar)
+            button.focusRingType = .none
             button.bezelStyle = .texturedRounded
             button.isBordered = false
             button.imagePosition = .imageOnly
-            button.setFrameSize(NSSize(width: 36, height: 32))
-            item.view = button
-            item.label = appState.localized(.openSidebar)
-            sidebarItem = item
+            button.translatesAutoresizingMaskIntoConstraints = false
+            titlebar.addSubview(button)
+            let size = LightboxControlMetrics.toolbarButtonSize
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: size),
+                button.heightAnchor.constraint(equalToConstant: size),
+                // Where the toolbar item used to sit.
+                button.centerXAnchor.constraint(equalTo: zoom.centerXAnchor, constant: 42),
+                button.centerYAnchor.constraint(equalTo: zoom.centerYAnchor)
+            ])
             sidebarButton = button
             updateSidebarButton()
-            return item
         }
 
         func updateSidebarButton() {
             let title = appState.localized(appState.sidebarCollapsed ? .openSidebar : .closeSidebar)
-            sidebarItem?.label = title
-            sidebarItem?.toolTip = title
             sidebarButton?.toolTip = title
             sidebarButton?.setAccessibilityLabel(title)
             let visible = appState.isOverlayChromeVisible
@@ -113,8 +123,9 @@ struct WindowConfigurator: NSViewRepresentable {
             window.isMovableByWindowBackground = false
             window.styleMask.insert(.fullSizeContentView)
             window.toolbarStyle = .unified
+            // An empty toolbar: it gives the titlebar its unified height and
+            // places the window controls; the header is a titlebar accessory.
             let toolbar = NSToolbar(identifier: "Lightbox.WindowHeader")
-            toolbar.delegate = self
             toolbar.displayMode = .iconOnly
             toolbar.showsBaselineSeparator = false
             toolbar.allowsUserCustomization = false
@@ -131,6 +142,8 @@ struct WindowConfigurator: NSViewRepresentable {
             accessory.layoutAttribute = .right
             accessory.view = host
             window.addTitlebarAccessoryViewController(accessory)
+            installSidebarButton(in: window)
+            appState.quickLook.attach(to: window)
             headerAccessory = accessory
             headerHost = host
             window.minSize = NSSize(width: 980, height: 680)

@@ -64,9 +64,9 @@ import Testing
     window.contentView = host
     defer { window.close() }
     func wait(_ condition: () -> Bool) async throws {
-        for _ in 0..<300 where !condition() {
+        await waitWhile {
             host.layoutSubtreeIfNeeded()
-            try await Task.sleep(for: .milliseconds(10))
+            return !condition()
         }
         try #require(condition())
     }

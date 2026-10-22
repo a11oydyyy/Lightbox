@@ -94,3 +94,25 @@ import Testing
     #expect(path.contains(CGPoint(x: 600, y: 53)))
     #expect(path.boundingRect == CGRect(x: 0, y: 52, width: 1200, height: 748))
 }
+
+@MainActor
+@Test func collapsedSubfolderGroupsAreRememberedAcrossLaunches() throws {
+    let work = FileManager.default.temporaryDirectory.appendingPathComponent("CollapsedGroups-\(UUID())")
+    try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+    let suite = "LightboxCollapsedGroups-\(UUID())"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer {
+        defaults.removePersistentDomain(forName: suite)
+        try? FileManager.default.removeItem(at: work)
+    }
+    let exports = work.appendingPathComponent("Exports").standardizedFileURL.path
+    let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
+    state.setGroup(exports, collapsed: true)
+    #expect(state.isGroupCollapsed(exports))
+
+    let relaunched = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
+    #expect(relaunched.isGroupCollapsed(exports))
+    relaunched.setGroup(exports, collapsed: false)
+    #expect(!relaunched.isGroupCollapsed(exports))
+    #expect(defaults.stringArray(forKey: AppState.collapsedGroupFoldersKey) == [])
+}

@@ -11,9 +11,6 @@ enum LightboxColorTokens {
     static let accentForeground = adaptive("accent-foreground", light: 0xFFFFFF, dark: 0x1C1C1E)
     /// Untagged folder and location symbols in the sidebar and gallery.
     static let glyph = adaptive("glyph", light: 0x86868C, dark: 0x8E8E95)
-    static func folderColor(_ tags: [String]) -> Color {
-        MacColorTag.all.first(where: { tags.contains($0.name) })?.color ?? glyph
-    }
 
     // Fixed sidebar locations carry Apple system hues, as in System Settings.
     // User folders stay `glyph` so Finder tags remain the only folder color.

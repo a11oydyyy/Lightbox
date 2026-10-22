@@ -21,7 +21,7 @@ struct RootShellView: View {
     // pad) + the 8pt resize handle. Used as the expanded width the collapse
     // animates to/from.
     private var sidebarSlotWidth: CGFloat {
-        appState.sidebarWidth + 18
+        appState.sidebarWidth + SidebarMetrics.panelLeadingInset + SidebarMetrics.resizeHandleWidth
     }
 
     private var overlayIsPresented: Bool {
@@ -71,7 +71,7 @@ struct RootShellView: View {
                 // the slide, so clipping bought nothing but the artifact.
                 HStack(spacing: 0) {
                     ResidentSidebarHost(appState: appState)
-                        .frame(width: appState.sidebarWidth + 10)
+                        .frame(width: appState.sidebarWidth + SidebarMetrics.panelLeadingInset)
                         .frame(maxHeight: .infinity)
                         .accessibilityHidden(appState.hasActiveOverlay || appState.sidebarCollapsed)
                     SidebarResizeHandle(isResizing: $isResizingSidebar)
@@ -99,6 +99,11 @@ struct RootShellView: View {
                             .id(appState.activeTabID)
                             .accessibilityHidden(appState.hasActiveOverlay)
                             .disabled(appState.hasActiveOverlay)
+                            .allowsHitTesting(!overlayIsPresented)
+                    } else if appState.galleryViewMode == .list {
+                        GalleryListView()
+                            .accessibilityHidden(appState.hasActiveOverlay)
+                            .id("\(appState.activeTabID.uuidString)|\(appState.selectedFilter.identityKey)|list")
                             .allowsHitTesting(!overlayIsPresented)
                     } else {
                     GalleryView(isResizingSidebar: isResizingSidebar || isTogglingSidebar)
@@ -162,11 +167,8 @@ struct RootShellView: View {
             .zIndex(3)
             }
 
-            if let asset = appState.previewAsset {
-                PreviewOverlay(asset: asset)
-                    .id(appState.previewSessionID)
-                    .zIndex(4)
-            }
+            PreviewOverlayHost(preview: appState.preview)
+                .zIndex(4)
 
             PreviewRootClickCatcherLayer(appState: appState)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -193,6 +195,19 @@ struct RootShellView: View {
             sidebarToggleTask?.cancel()
             sidebarVisibilityTask?.cancel()
         }
+        .sheet(item: $appState.renameRequest) { request in
+            RenameSheet(appState: appState, request: request)
+        }
+        .sheet(item: $appState.folderRenameRequest) { request in
+            RenameFolderSheet(appState: appState, request: request)
+        }
+        .sheet(item: $appState.newFolderRequest) { request in
+            NewFolderSheet(appState: appState, request: request)
+        }
+        .alert(appState.fileOperationAlert ?? "", isPresented: Binding(
+            get: { appState.fileOperationAlert != nil },
+            set: { if !$0 { appState.fileOperationAlert = nil } }
+        )) {}
     }
 
     // Freeze the gallery's column count for the duration of the ⌘B slot animation,
@@ -321,7 +336,7 @@ private struct SidebarResizeHandle: View {
         // (no visible bar/grabber, which flickered and read as clutter).
         Rectangle()
             .fill(Color.primary.opacity(0.001))
-            .frame(width: 8)
+            .frame(width: SidebarMetrics.resizeHandleWidth)
             .contentShape(Rectangle())
             .onHover { hovering in
                 if hovering {
@@ -359,5 +374,20 @@ private struct SidebarResizeHandle: View {
                     appState.sidebarWidth = LightboxSettingsStore.defaultSidebarWidth
                 }
             }
+    }
+}
+
+/// Shows the open preview. Stepping to another image publishes on
+/// `appState.preview` rather than on `AppState`, so this host observes it and
+/// the rest of the window stays put.
+struct PreviewOverlayHost: View {
+    @EnvironmentObject private var appState: AppState
+    @ObservedObject var preview: PreviewPresentationState
+
+    var body: some View {
+        if let asset = appState.previewAsset {
+            PreviewOverlay(asset: asset, presentation: preview)
+                .id(preview.sessionID)
+        }
     }
 }

@@ -6,12 +6,11 @@ import SwiftUI
 @MainActor
 final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValidation, NSGestureRecognizerDelegate {
     private let appState: AppState
-    private let back = KeyboardAwareHeaderButton()
-    private let forward = KeyboardAwareHeaderButton()
-    private let up = KeyboardAwareHeaderButton()
-    private let search = KeyboardAwareHeaderButton()
-    private let sort = KeyboardAwareHeaderButton()
-    private let titleButton = KeyboardAwareHeaderButton()
+    private let back = HeaderIconButton()
+    private let forward = HeaderIconButton()
+    private let up = HeaderIconButton()
+    private let search = HeaderIconButton()
+    private let titleButton = HeaderIconButton()
     private lazy var locationDoubleClick = NSClickGestureRecognizer(target: self, action: #selector(zoomLocation))
     private let activity = NSView()
     private let activityLabel = NativeProgressLabel()
@@ -44,8 +43,16 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     private var lastViewingTrash = false
     private var lastChromeVisible: Bool?
     private var lastSidebarCollapsed: Bool?
+    private var lastLayoutSearching: Bool?
     private var lastActiveTabID: UUID?
     private var layoutTargets: [ObjectIdentifier: NSRect] = [:]
+    /// Title, scan progress and breadcrumbs fade as one group.
+    private let locationSlot = HeaderSlotView()
+    private var presentedTargets: [ObjectIdentifier: Bool] = [:]
+    private var hasLaidOutControls = false
+    private var allCrumbs: [PathBreadcrumb] = []
+    /// First crumb shown; earlier ones collapse into a leading ellipsis.
+    private var shownCrumbStart = 0
 
     init(appState: AppState) {
         self.appState = appState
@@ -60,8 +67,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
             (back, "chevron.left", #selector(goBack)),
             (forward, "chevron.right", #selector(goForward)),
             (up, "chevron.up", #selector(goUp)),
-            (search, "magnifyingglass", #selector(showSearch)),
-            (sort, "line.3.horizontal.decrease", #selector(showSort))
+            (search, "magnifyingglass", #selector(showSearch))
         ] {
             button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: LightboxControlMetrics.iconSize, weight: .regular))
@@ -79,7 +85,8 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         titleButton.lineBreakMode = .byTruncatingMiddle
         titleButton.target = self
         titleButton.action = #selector(beginPathEditing)
-        addSubview(titleButton)
+        addSubview(locationSlot)
+        locationSlot.addSubview(titleButton)
         activity.wantsLayer = true
         activityLabel.font = titleButton.font
         activityLabel.textColor = .labelColor
@@ -87,14 +94,14 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         activityLabel.lineBreakMode = .byClipping
         activityLabel.maximumNumberOfLines = 1
         activity.addSubview(activityLabel)
-        addSubview(activity)
+        locationSlot.addSubview(activity)
         ancestors.focusRingType = .none
         ancestors.pathStyle = .standard
         ancestors.backgroundColor = .clear
         ancestors.font = .systemFont(ofSize: 11)
         ancestors.target = self
         ancestors.action = #selector(openAncestor)
-        addSubview(ancestors)
+        locationSlot.addSubview(ancestors)
         editor.focusRingType = .none
         editor.delegate = self
         editor.font = .systemFont(ofSize: 12)
@@ -241,7 +248,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         label(forward, appState.localized(.goForward))
         label(up, appState.localized(.goToParentFolder))
         label(search, appState.localized(.search))
-        label(sort, appState.localized(.sort))
         back.isEnabled = appState.canGoBack
         forward.isEnabled = appState.canGoForward
         up.isEnabled = appState.canOpenParentFolder
@@ -276,17 +282,8 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
             // queries (statfs can stall removable/network storage). We already
             // have each segment's title and URL. Bridge explicit component cells
             // to path items, whose URL is read-only, without auto-resolving paths.
-            let pathControl = NSPathControl()
-            if let pathCell = pathControl.cell as? NSPathCell {
-                pathCell.pathComponentCells = crumbs.map { crumb in
-                    let component = NSPathComponentCell(textCell: crumb.title)
-                    component.url = crumb.url
-                    component.attributedStringValue = NSAttributedString(string: crumb.title, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
-                    component.image = nil
-                    return component
-                }
-            }
-            ancestors.setPathItems(pathControl.pathItems)
+            allCrumbs = crumbs
+            showCrumbs(from: 0)
             let menu = NSMenu()
             for crumb in crumbs {
                 let item = NSMenuItem(title: crumb.title, action: #selector(openPathMenuItem(_:)), keyEquivalent: "")
@@ -351,8 +348,8 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         isFadingActivity = animated
         activityTransitionGeneration &+= 1
         let generation = activityTransitionGeneration
-        titleButton.isHidden = editingPath || appState.selectedAssetCount > 1
-        activity.isHidden = titleButton.isHidden
+        titleButton.isHidden = false
+        activity.isHidden = false
         titleButton.setAccessibilityHidden(visible)
         activity.setAccessibilityHidden(!visible)
         activityLabel.setAccessibilityHidden(!visible)
@@ -371,9 +368,12 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     override func layout() {
         super.layout()
         let collapsed = appState.sidebarCollapsed
-        let animated = lastSidebarCollapsed != nil && lastSidebarCollapsed != collapsed
+        // Opening or closing search re-centers the title; glide it like a sidebar toggle.
+        let searchToggled = lastLayoutSearching != nil && lastLayoutSearching != searching
+        let animated = ((lastSidebarCollapsed != nil && lastSidebarCollapsed != collapsed) || searchToggled)
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         lastSidebarCollapsed = collapsed
+        lastLayoutSearching = searching
         NSAnimationContext.runAnimationGroup { context in
             context.duration = animated ? MotionTokens.sidebarChromeDurationSeconds : 0
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.33, 0, 0.2, 1)
@@ -398,22 +398,19 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         let leading = max(0, galleryInset - origin)
         let selecting = appState.selectedAssetCount > 1
         let hasTransfer = appState.fileTransferProgress != nil
+        // Selection only swaps the center slot; navigation and search stay put.
         for (index, button) in [back, forward, up].enumerated() {
             place(button, at: NSRect(x: leading + CGFloat(index) * 32, y: 6, width: LightboxControlMetrics.iconButtonSize, height: LightboxControlMetrics.iconButtonSize), animated: animated)
-            button.isHidden = selecting
         }
         // Match the trailing icon center to the 26-point top inset.
         let right = bounds.width - 8 - (hasTransfer ? 44 : 0)
-        place(sort, at: NSRect(x: right - 34, y: 6, width: 32, height: 32), animated: animated)
-        place(search, at: NSRect(x: right - 70, y: 6, width: 32, height: 32), animated: animated)
-        sort.isHidden = selecting || appState.isShowingStartPage
-        search.isHidden = selecting || searching || appState.isShowingStartPage
-        searchField.isHidden = selecting || !searching
+        // Sorting lives with the filters in the bottom bar.
+        place(search, at: NSRect(x: right - 34, y: 6, width: 32, height: 32), animated: animated)
         let center = (windowWidth + galleryInset) / 2 - origin
         let searchWidth = min(200, max(120, right - center - 80))
-        place(searchField, at: NSRect(x: right - searchWidth - 40, y: 8, width: searchWidth, height: 28), animated: animated)
+        place(searchField, at: NSRect(x: right - searchWidth - 4, y: 8, width: searchWidth, height: 28), animated: animated)
         let leftEdge = leading + 108
-        let rightEdge = right - (searching ? searchWidth + 52 : 82)
+        let rightEdge = right - (searching ? searchWidth + 16 : 46)
         let halfWidth = max(20, min(center - leftEdge, rightEdge - center))
         let location = NSRect(x: center - halfWidth, y: 0, width: halfWidth * 2, height: 44)
         let titleWidth = min(location.width, ceil((titleButton.title as NSString).size(withAttributes: [
@@ -426,19 +423,100 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         place(activity, at: NSRect(x: activityX, y: ancestors.pathItems.isEmpty ? 10 : 0, width: activityWidth, height: 23), animated: animated)
         let labelFrame = activity.bounds.insetBy(dx: 0, dy: 2)
         if activityLabel.frame != labelFrame { activityLabel.frame = labelFrame }
-        let ancestorWidth = min(location.width, ancestors.pathItems.reduce(CGFloat(0)) { width, item in
-            width + (item.title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width + 20
-        })
+        let fittingStart = crumbStart(fitting: location.width)
+        if fittingStart != shownCrumbStart { showCrumbs(from: fittingStart) }
+        let ancestorWidth = min(location.width, ancestors.pathItems.reduce(CGFloat(0)) { $0 + Self.crumbWidth($1.title) })
         place(ancestors, at: NSRect(x: center - ancestorWidth / 2, y: 23, width: ancestorWidth, height: 19), animated: animated)
         place(editor, at: NSRect(x: location.minX, y: 8, width: location.width, height: 28), animated: animated)
-        titleButton.isHidden = selecting || editingPath || (lastActivityVisible == true && !isFadingActivity)
-        activity.isHidden = selecting || editingPath || (lastActivityVisible != true && !isFadingActivity)
-        ancestors.isHidden = selecting || editingPath || ancestors.pathItems.isEmpty
-        editor.isHidden = selecting || !editingPath
-        selectionHost.isHidden = !selecting
-        place(selectionHost, at: NSRect(x: leading, y: 0, width: max(0, right - leading), height: 44), animated: animated)
+        titleButton.isHidden = lastActivityVisible == true && !isFadingActivity
+        activity.isHidden = lastActivityVisible != true && !isFadingActivity
+        ancestors.isHidden = ancestors.pathItems.isEmpty
+        // Center the selection where the title sits; widen toward the free
+        // space between the controls only when the symmetric slot is too narrow.
+        let selectionWidth = ceil(selectionHost.fittingSize.width)
+        let selectionFrame = selectionWidth <= location.width
+            ? location
+            : NSRect(x: leftEdge, y: 0, width: max(0, rightEdge - leftEdge), height: 44)
+        place(selectionHost, at: selectionFrame, animated: animated)
+        if locationSlot.frame != bounds { locationSlot.frame = bounds }
+
+        let fades = hasLaidOutControls && window != nil
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        hasLaidOutControls = true
+        setPresented(locationSlot, !selecting && !editingPath, animated: fades)
+        setPresented(editor, !selecting && editingPath, animated: fades)
+        setPresented(selectionHost, selecting, animated: fades)
+        setPresented(search, !searching && !appState.isShowingStartPage, animated: fades)
+        setPresented(searchField, searching, animated: fades)
         transferHost.isHidden = !hasTransfer
         place(transferHost, at: NSRect(x: bounds.width - 42, y: 4, width: 40, height: 36), animated: animated)
+    }
+
+    /// Crossfades a header element in or out. The view stays in the hierarchy
+    /// while fading and is hidden only once the fade-out completes, unless a
+    /// newer request presented it again.
+    private func setPresented(_ view: NSView, _ presented: Bool, animated: Bool) {
+        let id = ObjectIdentifier(view)
+        guard presentedTargets[id] != presented else { return }
+        presentedTargets[id] = presented
+        guard animated else {
+            view.alphaValue = 1
+            view.isHidden = !presented
+            return
+        }
+        if presented && view.isHidden {
+            view.alphaValue = 0
+            view.isHidden = false
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = MotionTokens.headerSwapDurationSeconds
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            view.animator().alphaValue = presented ? 1 : 0
+        } completionHandler: { [weak self, weak view] in
+            guard let self, let view, self.presentedTargets[ObjectIdentifier(view)] == false else { return }
+            view.isHidden = true
+            view.alphaValue = 1
+        }
+    }
+
+    /// Shows crumbs from `start` on. Hidden leading crumbs collapse into one
+    /// "…" item that opens the deepest hidden folder; the title's context menu
+    /// still lists every ancestor.
+    private func showCrumbs(from start: Int) {
+        shownCrumbStart = start
+        var shown = Array(allCrumbs.dropFirst(start))
+        if start > 0 { shown.insert(PathBreadcrumb(title: "…", url: allCrumbs[start - 1].url), at: 0) }
+        let pathControl = NSPathControl()
+        if let pathCell = pathControl.cell as? NSPathCell {
+            pathCell.pathComponentCells = shown.map { crumb in
+                let component = NSPathComponentCell(textCell: crumb.title)
+                component.url = crumb.url
+                component.attributedStringValue = NSAttributedString(string: crumb.title, attributes: [.font: Self.crumbFont, .foregroundColor: NSColor.secondaryLabelColor])
+                component.image = nil
+                return component
+            }
+        }
+        ancestors.setPathItems(pathControl.pathItems)
+    }
+
+    private static let crumbFont = NSFont.systemFont(ofSize: 11)
+
+    private static func crumbWidth(_ title: String) -> CGFloat {
+        (title as NSString).size(withAttributes: [.font: crumbFont]).width + 20
+    }
+
+    /// The fewest leading crumbs to hide so the rest fit `width` whole,
+    /// instead of NSPathControl shrinking every segment to a few letters.
+    private func crumbStart(fitting width: CGFloat) -> Int {
+        guard allCrumbs.count > 1 else { return 0 }
+        var used = allCrumbs.reduce(CGFloat(0)) { $0 + Self.crumbWidth($1.title) }
+        var start = 0
+        let ellipsis = Self.crumbWidth("…")
+        while used + (start > 0 ? ellipsis : 0) > width, start < allCrumbs.count - 1 {
+            used -= Self.crumbWidth(allCrumbs[start].title)
+            start += 1
+        }
+        return start
     }
 
     @objc private func openPathMenuItem(_ sender: NSMenuItem) {
@@ -478,42 +556,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         needsLayout = true
         layoutSubtreeIfNeeded()
         window?.makeFirstResponder(searchField)
-    }
-    @objc private func showSort() {
-        popover?.close()
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        let heading = NSMenuItem(title: appState.localized(.sortBy), action: nil, keyEquivalent: "")
-        heading.isEnabled = false
-        menu.addItem(heading)
-        for (index, field) in GallerySortField.allCases.enumerated() {
-            let item = NSMenuItem(title: appState.sortFieldTitle(field), action: #selector(selectSortField(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = index
-            item.state = appState.sortField == field ? .on : .off
-            menu.addItem(item)
-        }
-        menu.addItem(.separator())
-        let direction = NSMenuItem(title: appState.sortDirectionTitle, action: #selector(toggleSortDirection), keyEquivalent: "")
-        direction.target = self
-        direction.image = NSImage(systemSymbolName: appState.sortDirection == .ascending ? "arrow.up" : "arrow.down", accessibilityDescription: nil)
-        menu.addItem(direction)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sort.bounds.maxY + 4), in: sort)
-    }
-    @objc private func selectSortField(_ sender: NSMenuItem) {
-        guard GallerySortField.allCases.indices.contains(sender.tag) else { return }
-        let field = GallerySortField.allCases[sender.tag]
-        guard field != appState.sortField else { return }
-        appState.setSortField(field)
-    }
-    @objc private func toggleSortDirection() { appState.toggleSortDirection() }
-    private func showPanel(_ kind: NativeHeaderPanel.Kind, from button: NSButton) {
-        popover?.close()
-        let panel = NSPopover()
-        panel.behavior = .transient
-        panel.contentViewController = NSHostingController(rootView: NativeHeaderPanel(appState: appState, kind: kind, close: { [weak panel] in panel?.close() }))
-        popover = panel
-        panel.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -647,72 +689,6 @@ final class BreadcrumbPathControl: NSPathControl {
     }
 }
 
-/// Keyboard navigation gets a quiet marker; mouse clicks retain the borderless style.
-private final class KeyboardAwareHeaderButton: NSButton {
-    private var showsKeyboardFocus = false
-    private var isHovered = false
-    private var hoverTracking: NSTrackingArea?
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.cornerRadius = LightboxControlMetrics.cornerRadius
-    }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    private func updateFeedback() {
-        guard let layer else { return }
-        let opacity = !isEnabled || window?.isKeyWindow != true ? 0
-            : isHighlighted ? LightboxControlMetrics.pressedOpacity
-            : isHovered ? LightboxControlMetrics.hoverOpacity : 0
-        let target = NSColor(LightboxColorTokens.primaryText).withAlphaComponent(opacity).cgColor
-        guard layer.backgroundColor != target else { return }
-        let previous = layer.presentation()?.backgroundColor ?? layer.backgroundColor
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.backgroundColor = target
-        CATransaction.commit()
-        layer.removeAnimation(forKey: "feedback")
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
-        let fade = CABasicAnimation(keyPath: "backgroundColor")
-        fade.fromValue = previous ?? NSColor.clear.cgColor
-        fade.toValue = target
-        fade.duration = MotionTokens.feedbackDurationSeconds
-        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer.add(fade, forKey: "feedback")
-    }
-    override func updateTrackingAreas() {
-        if let hoverTracking { removeTrackingArea(hoverTracking) }
-        let tracking = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
-        addTrackingArea(tracking)
-        hoverTracking = tracking
-        super.updateTrackingAreas()
-    }
-    override func mouseEntered(with event: NSEvent) { isHovered = true; needsDisplay = true }
-    override func mouseExited(with event: NSEvent) { isHovered = false; needsDisplay = true }
-    override var acceptsFirstResponder: Bool { isEnabled }
-    override func becomeFirstResponder() -> Bool {
-        showsKeyboardFocus = NSApp.currentEvent?.type == .keyDown
-        needsDisplay = true
-        return super.becomeFirstResponder()
-    }
-    override func resignFirstResponder() -> Bool {
-        showsKeyboardFocus = false
-        needsDisplay = true
-        return super.resignFirstResponder()
-    }
-    override func draw(_ dirtyRect: NSRect) {
-        updateFeedback()
-        super.draw(dirtyRect)
-        guard showsKeyboardFocus, window?.firstResponder === self else { return }
-        NSColor(LightboxColorTokens.secondaryText).setStroke()
-        let line = NSBezierPath()
-        line.move(to: NSPoint(x: 5, y: 2))
-        line.line(to: NSPoint(x: bounds.width - 5, y: 2))
-        line.lineWidth = LightboxControlMetrics.focusLineWidth
-        line.stroke()
-    }
-}
-
 /// Shared opacity transition for the titlebar accessory and native sidebar button.
 @MainActor
 enum NativeChromeTransition {
@@ -737,5 +713,16 @@ enum NativeChromeTransition {
         fade.fillMode = .backwards
         fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
         view.layer?.add(fade, forKey: "previewChromeReveal")
+    }
+}
+
+/// A pass-through group: hit testing reaches its children but never the group
+/// itself, so clicks between them fall through to the header.
+private final class HeaderSlotView: NSView {
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
     }
 }

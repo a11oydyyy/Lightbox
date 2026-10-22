@@ -1,5 +1,8 @@
 import AppKit
+import OSLog
 import SwiftUI
+
+let scrollRestoreLogger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "ScrollRestore")
 
 struct GalleryMasonryFrameKey: LayoutValueKey {
     static let defaultValue = CGRect.zero
@@ -90,12 +93,28 @@ struct GalleryMasonryPlacement {
     func removeAll() { entries.removeAll() }
 }
 
+/// Asks the grid to scroll one of its cards into view. A new `generation`
+/// repeats the request for the same card.
+struct GalleryRevealRequest: Equatable {
+    var assetID: LightboxAsset.ID
+    var anchor: UnitPoint
+    var generation: Int
+}
+
 struct GalleryVirtualMasonryGrid<Card: View>: View {
     var placement: GalleryMasonryPlacement
     var width: CGFloat
     var viewportHeight: CGFloat
     var isScaling: Bool
     var revealAssetIDs: Set<LightboxAsset.ID>
+    var revealRequest: GalleryRevealRequest? = nil
+    /// Called with a reveal's generation once the clip view has scrolled to it
+    /// (or was already there).
+    var revealLanded: (Int) -> Void = { _ in }
+    /// When set, called as the view scrolls with the card whose top is nearest
+    /// the top of the scroll view, and the scroll offset. Measured in the same
+    /// grid coordinates a reveal uses, so revealing that card returns here.
+    var topAssetChanged: ((LightboxAsset.ID?, CGFloat) -> Void)? = nil
     var framesChanged: ([LightboxAsset.ID: CGRect], Set<LightboxAsset.ID>, Set<LightboxAsset.ID>, UUID) -> Void
     @ViewBuilder var card: (LightboxAsset) -> Card
     @LightboxViewState private var mountRevision = 0
@@ -147,9 +166,19 @@ struct GalleryVirtualMasonryGrid<Card: View>: View {
             frameOwner.ids = ids
             framesChanged(frames, removed, added, frameOwner.id)
         }
-        .background(GalleryMasonryViewportProbe { rect in
+        .background(GalleryMasonryViewportProbe(reveal: revealRequest.flatMap { request in
+            placement.frames[request.assetID].map { (request, $0) }
+        }, revealLanded: revealLanded) { rect, scrollOffset in
             let next = placement.assets(intersecting: rect.insetBy(dx: 0, dy: -mountMargin)).map(\.id)
             viewportState.rect = rect
+            if let topAssetChanged {
+                let top = placement.assets(intersecting: rect)
+                    .compactMap { asset in placement.frames[asset.id].map { (asset.id, $0) } }
+                    .filter { $0.1.maxY >= rect.minY }
+                    .min { abs($0.1.minY - rect.minY) < abs($1.1.minY - rect.minY) }?
+                    .0
+                topAssetChanged(top, scrollOffset)
+            }
             // Pixel scrolling updates geometry/load priorities elsewhere. Only
             // change this subtree when a card enters or leaves the mount window.
             if next != viewportState.mountedIDs {
@@ -185,17 +214,22 @@ private struct GalleryMasonryFramesKey: PreferenceKey {
 }
 
 private struct GalleryMasonryViewportProbe: NSViewRepresentable {
-    var changed: (CGRect) -> Void
+    var reveal: (GalleryRevealRequest, CGRect)?
+    var revealLanded: (Int) -> Void
+    var changed: (CGRect, CGFloat) -> Void
     func makeNSView(context: Context) -> GalleryMasonryViewportView { GalleryMasonryViewportView() }
     func updateNSView(_ view: GalleryMasonryViewportView, context: Context) {
         view.changed = changed
+        view.revealLanded = revealLanded
         view.scheduleUpdate()
+        if let reveal { view.reveal(reveal.1, anchor: reveal.0.anchor, generation: reveal.0.generation) }
     }
     static func dismantleNSView(_ view: GalleryMasonryViewportView, coordinator: ()) { view.detach() }
 }
 
 private final class GalleryMasonryViewportView: NSView {
-    var changed: ((CGRect) -> Void)?
+    var changed: ((CGRect, CGFloat) -> Void)?
+    var revealLanded: ((Int) -> Void)?
     private weak var clip: NSClipView?
     private var token: NSObjectProtocol?
     private var pending = false
@@ -222,12 +256,39 @@ private final class GalleryMasonryViewportView: NSView {
             guard let self else { return }
             self.pending = false
             guard let clip = self.clip, self.window != nil else { return }
-            self.changed?(self.convert(clip.bounds, from: clip))
+            self.changed?(self.convert(clip.bounds, from: clip), clip.bounds.origin.y)
         }
     }
     func detach() {
         if let token { NotificationCenter.default.removeObserver(token) }
         token = nil
         clip = nil
+    }
+
+    private var revealedGeneration: Int?
+
+    /// Scrolls the enclosing clip view so `frame` (in grid coordinates) sits at
+    /// `anchor`, with the same alignment rule as `ScrollViewProxy.scrollTo`.
+    /// The grid already knows every card rect, so this works for unmounted
+    /// cards in very tall galleries, where `scrollTo` lands on the wrong offset.
+    func reveal(_ frame: CGRect, anchor: UnitPoint, generation: Int) {
+        guard revealedGeneration != generation else { return }
+        revealedGeneration = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let clip = self.clip, let scrollView = clip.enclosingScrollView else { return }
+            let target = clip.convert(frame, from: self)
+            let visibleHeight = clip.bounds.height
+            let documentHeight = clip.documentView?.frame.height ?? 0
+            var origin = clip.bounds.origin
+            origin.y = target.minY + anchor.y * target.height - anchor.y * visibleHeight
+            let wanted = origin.y
+            origin.y = min(max(0, origin.y), max(0, documentHeight - visibleHeight))
+            scrollRestoreLogger.info("reveal generation=\(generation) wanted=\(Int(wanted)) applied=\(Int(origin.y)) from=\(Int(clip.bounds.origin.y)) document=\(Int(documentHeight)) visible=\(Int(visibleHeight))")
+            if abs(origin.y - clip.bounds.origin.y) > 0.5 {
+                clip.scroll(to: origin)
+                scrollView.reflectScrolledClipView(clip)
+            }
+            self.revealLanded?(generation)
+        }
     }
 }

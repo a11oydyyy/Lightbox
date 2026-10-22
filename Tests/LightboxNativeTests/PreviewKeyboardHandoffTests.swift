@@ -17,7 +17,7 @@ import Testing
     let tab = LightboxTab(source: source, folderURL: work)
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
-    for _ in 0..<500 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     try #require(state.libraryLoadingStatus == nil)
     state.sortField = .fileName
     state.sortDirection = .ascending
@@ -146,7 +146,7 @@ import Testing
     let tab = LightboxTab(source: source, folderURL: work)
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
-    for _ in 0..<500 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     try #require(state.libraryLoadingStatus == nil)
     state.sortField = .fileName
     state.sortDirection = .ascending

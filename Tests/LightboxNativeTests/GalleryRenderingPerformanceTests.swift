@@ -19,7 +19,7 @@ import Testing
     let tab = LightboxTab(source: source, folderURL: folder)
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let state = AppState(indexDatabaseURL: folder.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
-    for _ in 0..<100 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(20)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     #expect(state.libraryLoadingStatus == nil)
     state.assets = (0..<2_000).map { index in
         LightboxAsset(id: "render-\(index)", originalName: "\(index).jpg", width: 400,
@@ -102,12 +102,10 @@ private func milliseconds(_ duration: Duration) -> Double {
     let loadingStart = clock.now
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
     state.thumbnailWidth = 206
-    for _ in 0..<500 where state.libraryLoadingStatus != nil || state.assets.isEmpty {
-        try await Task.sleep(for: .milliseconds(10))
-    }
+    await waitWhile { state.libraryLoadingStatus != nil || state.assets.isEmpty }
     #expect(!state.assets.isEmpty && state.libraryLoadingStatus == nil)
     let scanMilliseconds = milliseconds(loadingStart.duration(to: clock.now))
-    for _ in 0..<500 where state.assets.contains(where: { !$0.metadataLoaded }) { try await Task.sleep(for: .milliseconds(10)) }
+    await waitWhile { state.assets.contains(where: { !$0.metadataLoaded }) }
     let metadataMilliseconds = milliseconds(loadingStart.duration(to: clock.now))
     let host = NSHostingView(rootView: GalleryView().environmentObject(state).coordinateSpace(name: "PreviewSpace"))
     let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 2320, height: 1360),

@@ -33,6 +33,7 @@ struct SettingsView: View {
             Section(appState.localized(.folders)) {
                 Toggle(appState.localized(.showFolderCards), isOn: $appState.showFolderCards)
                 Toggle(appState.localized(.showHiddenFiles), isOn: $appState.showsHiddenItems)
+                Toggle(appState.localized(.showOtherFiles), isOn: $appState.showsOtherFiles)
             }
 
             Section(appState.localized(.sidebar)) {

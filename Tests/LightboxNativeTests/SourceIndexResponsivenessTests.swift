@@ -28,7 +28,7 @@ private final class SQLiteWriteHold: @unchecked Sendable {
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let databaseURL = work.appendingPathComponent("index.sqlite")
     let state = AppState(indexDatabaseURL: databaseURL, libraryDefaults: defaults)
-    for _ in 0..<100 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(10)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     try await Task.sleep(for: .milliseconds(100))
     let hold = try SQLiteWriteHold(url: databaseURL)
     let release = Task.detached {

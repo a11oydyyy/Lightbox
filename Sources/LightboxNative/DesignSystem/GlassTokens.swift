@@ -26,6 +26,15 @@ enum GlassTokens {
         0.025 + glassOpacity * 0.08
     }
 
+    /// macOS 26 floating capsules: canvas tint over system glass, enough to
+    /// keep labels legible over busy images. The glass still turns dark over
+    /// dark photos, so what sits on it uses hierarchical (adaptive) styles.
+    static let floatingCapsuleTintOpacity: Double = 0.6
+
+    /// Gallery popovers: canvas over the popover's glass. Their small gray
+    /// labels sit right over photos, so they need more than the capsules.
+    static let popoverTintOpacity: Double = 0.88
+
     static func floatingCapsuleShadowOpacity(_ glassOpacity: Double) -> Double {
         // System glass draws its own depth on macOS 26 and later.
         if #available(macOS 26.0, *) { return 0 }
@@ -44,38 +53,6 @@ extension EnvironmentValues {
     }
 }
 
-extension View {
-    func lightboxGlass<S: Shape>(_ shape: S, interactive: Bool = false) -> some View {
-        modifier(LightboxGlassModifier(shape: shape, interactive: interactive))
-    }
-}
-
-private struct LightboxGlassModifier<S: Shape>: ViewModifier {
-    @Environment(\.lightboxGlassOpacity) private var glassOpacity
-
-    var shape: S
-    var interactive: Bool
-
-    func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content
-                .background { shape.fill(LightboxColorTokens.control.opacity(glassOpacity * 0.55)) }
-                .background(.ultraThinMaterial.opacity(glassOpacity * 0.34), in: shape)
-                .glassEffect(.regular.interactive(interactive), in: shape)
-                .overlay {
-                    shape.stroke(LightboxColorTokens.border.opacity(glassOpacity * 0.6), lineWidth: 0.7)
-                }
-        } else {
-            content
-                .background { shape.fill(LightboxColorTokens.control.opacity(glassOpacity * 0.55)) }
-                .background(.ultraThinMaterial.opacity(glassOpacity), in: shape)
-                .overlay {
-                    shape.stroke(LightboxColorTokens.border.opacity(glassOpacity * 0.6), lineWidth: 0.7)
-                }
-        }
-    }
-}
-
 struct GlassGroup<Content: View>: View {
     var spacing: CGFloat? = nil
     @ViewBuilder var content: () -> Content
@@ -88,5 +65,13 @@ struct GlassGroup<Content: View>: View {
         } else {
             content()
         }
+    }
+}
+
+extension View {
+    /// A gallery popover's content: tinted with the canvas so its labels stay
+    /// legible over dark or busy photos.
+    func lightboxPopoverSurface() -> some View {
+        background(LightboxColorTokens.canvas.opacity(GlassTokens.popoverTintOpacity))
     }
 }

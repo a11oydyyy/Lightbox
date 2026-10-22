@@ -25,7 +25,6 @@ struct LightboxApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             LightboxCommands(appState: appState)
-            SidebarCommands()
             TextEditingCommands()
         }
 

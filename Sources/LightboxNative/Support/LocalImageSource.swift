@@ -9,6 +9,11 @@ enum LocalFolderSnapshotUnavailableReason: String, Equatable, Sendable {
     case sourceUnavailable
 }
 
+struct FolderImageSummary: Equatable, Sendable {
+    var imageCount: Int
+    var coverURL: URL?
+}
+
 enum LocalFolderSnapshotAvailability: Equatable, Sendable {
     case available
     case unavailable(LocalFolderSnapshotUnavailableReason)
@@ -32,12 +37,6 @@ struct SystemTrashSnapshot: Sendable {
 
 enum LocalImageSource {
     private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "DirectoryScan")
-    private static let supportedImageExtensions = Set([
-        "jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff",
-        "raw", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
-        "raf", "rw2", "orf", "ori", "pef", "srw", "x3f", "erf", "rwl", "3fr",
-        "mef", "mos", "mrw", "dcr", "kdc", "fff", "iiq", "ari", "bay"
-    ])
     private static let pendingMetadataSize = CGSize(width: 1, height: 1)
     private static let folderSnapshotResourceKeys: [URLResourceKey] = [
         .isDirectoryKey,
@@ -48,7 +47,13 @@ enum LocalImageSource {
     ]
 
     static func isSupportedImageURL(_ url: URL) -> Bool {
-        supportedImageExtensions.contains(url.pathExtension.lowercased())
+        LightboxAsset.imageExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// Whether a regular file is listed: images always, other files only
+    /// when the gallery shows them.
+    static func isListedFileURL(_ url: URL, includesOtherFiles: Bool) -> Bool {
+        includesOtherFiles || isSupportedImageURL(url)
     }
 
     static func folderAvailability(in folder: URL) -> LocalFolderSnapshotAvailability {
@@ -58,34 +63,6 @@ enum LocalImageSource {
         }
         closedir(directory)
         return .available
-    }
-
-    static func loadAssets(
-        in folder: URL,
-        isDeleted: Bool = false,
-        recursive: Bool = false,
-        probeMetadata: Bool = true
-    ) -> [LightboxAsset] {
-        imageURLs(in: folder, recursive: recursive).enumerated().map { index, url in
-            let fallbackSize = MockLibrary.importFallbackSizes[index % MockLibrary.importFallbackSizes.count]
-            let size = probeMetadata ? ImageProbe.dimensions(for: url) ?? fallbackSize : fallbackSize
-            let values = try? url.resourceValues(forKeys: Set(folderSnapshotResourceKeys))
-            let addedAt = addedDate(from: values) ?? .distantPast
-            return LightboxAsset(
-                originalName: url.lastPathComponent,
-                width: size.width,
-                height: size.height,
-                tags: probeMetadata ? FinderTagStore.colorTags(for: url) : [],
-                sourceURL: url,
-                addedAt: addedAt,
-                contentModifiedAt: values?.contentModificationDate,
-                fileSize: fileSize(from: values),
-                palette: MockPalette.imported[index % MockPalette.imported.count],
-                deletedAt: isDeleted ? addedAt : nil,
-                metadataLoaded: probeMetadata
-            )
-        }
-        .sorted(by: sortByAddedDate)
     }
 
     static func loadSystemTrashAssets(in folders: [URL]) -> [LightboxAsset] {
@@ -237,6 +214,7 @@ enum LocalImageSource {
         probeFolderTags: Bool = true,
         initialMetadataLimit: Int = 0,
         showsHiddenItems: Bool = false,
+        includesOtherFiles: Bool = false,
         cachedDimensions: [String: CachedAssetDimensions] = [:]
     ) -> LocalFolderSnapshot {
         let readStartedAt = Date()
@@ -297,6 +275,10 @@ enum LocalImageSource {
             let url = entry.url
             let values = try? url.resourceValues(forKeys: classificationKeys)
             if entry.isDirectory ?? (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                // Apps, Photos libraries and other packages are files to the
+                // user, as in Finder: never opened, summarized or tag-read as
+                // folders (a Photos library also asks for Photos access).
+                if isPackageURL(url) { continue }
                 folders.append(LibraryFolderEntry(
                     sourceID: sourceID,
                     url: url.standardizedFileURL,
@@ -306,7 +288,8 @@ enum LocalImageSource {
                 continue
             }
 
-            guard isSupportedImageURL(url) else {
+            let isImage = isSupportedImageURL(url)
+            guard isImage || includesOtherFiles else {
                 continue
             }
             if let isRegularFile = entry.isRegularFile, !isRegularFile {
@@ -318,7 +301,11 @@ enum LocalImageSource {
             let cachedSize = cachedDimensions[url.standardizedFileURL.path]
             let size: CGSize
             let metadataLoaded: Bool
-            if probeMetadata {
+            if !isImage {
+                // Other files are square tiles; nothing to probe.
+                size = Self.pendingMetadataSize
+                metadataLoaded = true
+            } else if probeMetadata {
                 size = ImageProbe.dimensions(for: url) ?? fallbackSize
                 metadataLoaded = true
             } else if let cachedSize {
@@ -422,6 +409,7 @@ enum LocalImageSource {
         sourceID: LibrarySource.ID,
         rootURL: URL,
         showsHiddenItems: Bool = false,
+        includesOtherFiles: Bool = false,
         concurrentDirectoryLimit: Int = 4,
         onProgress: (@Sendable (LightboxSearchScanResult) -> Void)? = nil
     ) async -> LightboxSearchScanResult {
@@ -439,7 +427,7 @@ enum LocalImageSource {
                     let child = searchAssets(
                         in: directory, sourceID: sourceID, rootURL: rootURL,
                         query: .parse(""), recursive: false, showsHiddenItems: showsHiddenItems,
-                        skipsPackages: true, maxResults: .max, maxFolderResults: .max, maxVisited: .max,
+                        includesOtherFiles: includesOtherFiles, skipsPackages: true, maxResults: .max, maxFolderResults: .max, maxVisited: .max,
                         loadsFinderTags: false,
                         onProgress: { progress?.update(directory: directory, snapshot: $0) }
                     )
@@ -481,6 +469,7 @@ enum LocalImageSource {
         query: LightboxSearchQuery,
         recursive: Bool,
         showsHiddenItems: Bool = false,
+        includesOtherFiles: Bool = false,
         collectsFolders: Bool = true,
         probeDimensions: Bool = false,
         skipsPackages: Bool = false,
@@ -549,7 +538,8 @@ enum LocalImageSource {
             }
 
             let mayMatchFolder = collectsFolders && query.mayMatchFolderName(url.lastPathComponent)
-            let mayMatchAsset = isSupportedImageURL(url) && query.mayMatchAssetName(url.lastPathComponent)
+            let isImage = isSupportedImageURL(url)
+            let mayMatchAsset = (isImage || includesOtherFiles) && query.mayMatchAssetName(url.lastPathComponent)
             guard mayMatchFolder || mayMatchAsset else {
                 return false
             }
@@ -584,7 +574,7 @@ enum LocalImageSource {
             let fallbackSize = (recursive || !loadsFinderTags) && !probeDimensions
                 ? pendingMetadataSize
                 : MockLibrary.importFallbackSizes[assets.count % MockLibrary.importFallbackSizes.count]
-            let dimensions = probeDimensions ? autoreleasepool {
+            let dimensions = probeDimensions && isImage ? autoreleasepool {
                 recursive
                     ? dimensionCache.dimensions(for: url, resolver: dimensionResolver)
                     : dimensionResolver(url)
@@ -944,6 +934,22 @@ enum LocalImageSource {
         }
     }
 
+    /// Image count and cover (first image in Finder name order) of a folder's
+    /// direct children, from one directory read. Nil when it cannot be read.
+    static func folderImageSummary(in folder: URL, showsHiddenItems: Bool = false) -> FolderImageSummary? {
+        let result = posixDirectoryEntries(
+            in: folder.standardizedFileURL,
+            options: showsHiddenItems ? [] : [.skipsHiddenFiles]
+        )
+        guard result.availability == .available else { return nil }
+        let images = visibleDirectoryEntries(result.urls, showsHiddenItems: showsHiddenItems)
+            .filter { $0.isDirectory != true && isSupportedImageURL($0.url) }
+        let cover = images.min {
+            $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending
+        }
+        return FolderImageSummary(imageCount: images.count, coverURL: cover?.url)
+    }
+
     static func folders(
         in folder: URL,
         sourceID: LibrarySource.ID,
@@ -959,7 +965,7 @@ enum LocalImageSource {
             let isDirectory = entry.isDirectory
                 ?? (try? entry.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory)
                 ?? false
-            guard isDirectory else {
+            guard isDirectory, !isPackageURL(entry.url) else {
                 return nil
             }
 
@@ -973,6 +979,11 @@ enum LocalImageSource {
         .sorted { lhs, rhs in
             lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
+    }
+
+    /// A directory Finder shows as a file: an app, a Photos library, a bundle.
+    static func isPackageURL(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true
     }
 
     static func isHiddenItemURL(_ url: URL) -> Bool {

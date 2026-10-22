@@ -35,6 +35,8 @@ print(matches[0])
 PY
 )"
 fi
+# Record the source before building, so the app names what it was built from.
+while IFS='=' read -r key value; do export "$key=$value"; done < <("$ROOT_DIR/script/build_provenance.sh")
 source "$ROOT_DIR/script/build_toolchain.sh"
 lightbox_configure_toolchain "$ROOT_DIR"
 swift build --product LightboxNative -c release "${LIGHTBOX_SWIFT_BUILD_ARGS[@]}"
@@ -48,16 +50,20 @@ if [[ -d "$BIN_DIR/LightboxNative_LightboxNative.bundle" ]]; then
     ditto "$BIN_DIR/LightboxNative_LightboxNative.bundle" "$APP/Contents/Resources/LightboxNative_LightboxNative.bundle"
 fi
 python3 - "$APP" "$BUNDLE_ID" "$APP_NAME" <<'PY'
-import plistlib,sys
+import os,plistlib,sys
 from pathlib import Path
 app=Path(sys.argv[1])
 info={
+ 'LightboxGitCommit':os.environ['LIGHTBOX_GIT_COMMIT'],
+ 'LightboxGitDirty':os.environ['LIGHTBOX_GIT_DIRTY']=='true',
+ 'LightboxSourceDigest':os.environ['LIGHTBOX_SOURCE_DIGEST'],
+ 'LightboxBuildDate':os.environ['LIGHTBOX_BUILD_DATE'],
  'CFBundleExecutable':'LightboxLocalNative',
  'CFBundleIdentifier':sys.argv[2],
  'CFBundleName':sys.argv[3],
  'CFBundleDisplayName':sys.argv[3],
- 'CFBundleShortVersionString':'2.0.9-local.1',
- 'CFBundleVersion':'123',
+ 'CFBundleShortVersionString':'2.4.2-local.1',
+ 'CFBundleVersion':'133',
  'CFBundleIconFile':'AppIcon',
  'CFBundlePackageType':'APPL',
  'LSMinimumSystemVersion':'15.0',
@@ -65,11 +71,6 @@ info={
  'NSPrincipalClass':'NSApplication',
  'NSAppleEventsUsageDescription':'Lightbox asks Finder to restore images from the system Trash.',
  'UTExportedTypeDeclarations':[{
-  'UTTypeIdentifier':'io.github.a11oydyyy.lightbox.plugin-package',
-  'UTTypeDescription':'Lightbox Plugin',
-  'UTTypeConformsTo':['com.apple.package'],
-  'UTTypeTagSpecification':{'public.filename-extension':['lightboxplugin']},
- },{
   'UTTypeIdentifier':'io.github.a11oydyyy.lightbox.internal-asset-drag',
   'UTTypeDescription':'Lightbox Internal Asset Drag',
   'UTTypeConformsTo':['public.data'],

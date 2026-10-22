@@ -21,6 +21,15 @@ struct IndexedAssetMetadata: Sendable {
     var tags: [String]?
 }
 
+/// An image's pixel size, valid while the file still has `signature`'s
+/// modification time and size.
+struct StoredImageDimensions: Sendable, Equatable {
+    var path: String
+    var signature: FileContentSignature
+    var width: CGFloat
+    var height: CGFloat
+}
+
 struct IndexedVisibleSnapshot: Sendable {
     var folders: [LibraryFolderEntry]
     var assets: [LightboxAsset]
@@ -70,25 +79,34 @@ final class LightboxIndexStore {
         Self.logger.info("index source upsert source=\(source.id, privacy: .public) kind=\(source.kind.rawValue, privacy: .public) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
     }
 
+    /// Replaces the cached contents of one folder in a single transaction.
+    /// Returns whether the new snapshot was committed: any failed step rolls
+    /// the whole replacement back, keeping the previous snapshot.
+    @discardableResult
     func replaceVisibleSnapshot(
         source: LibrarySource,
         folderURL: URL,
         folders: [LibraryFolderEntry],
         assets: [LightboxAsset]
-    ) {
+    ) -> Bool {
         let startedAt = Date()
         guard !Task.isCancelled else {
             Self.logger.info("index snapshot skipped cancelled-before-start source=\(source.id, privacy: .public) folder=\(folderURL.path, privacy: .public)")
-            return
+            return false
         }
         guard database != nil else {
             Self.logger.error("index snapshot skipped database unavailable source=\(source.id, privacy: .public) folder=\(folderURL.path, privacy: .public)")
-            return
+            return false
+        }
+        func rollBack(_ phase: String) -> Bool {
+            exec("ROLLBACK;", context: "snapshot rollback \(phase)")
+            Self.logger.error("index snapshot failed source=\(source.id, privacy: .public) phase=\(phase, privacy: .public) folder=\(folderURL.path, privacy: .public)")
+            return false
         }
         Self.logger.info("index snapshot begin source=\(source.id, privacy: .public) kind=\(source.kind.rawValue, privacy: .public) folder=\(folderURL.path, privacy: .public) folders=\(folders.count) assets=\(assets.count)")
-        guard exec("BEGIN IMMEDIATE TRANSACTION;", context: "snapshot begin") else { return }
+        guard exec("BEGIN IMMEDIATE TRANSACTION;", context: "snapshot begin") else { return false }
         let deleteStartedAt = Date()
-        deleteItems(sourceID: source.id, parentPath: folderURL.path)
+        guard deleteItems(sourceID: source.id, parentPath: folderURL.path) else { return rollBack("delete") }
         let deleteSeconds = Date().timeIntervalSince(deleteStartedAt)
 
         var folderResourceSeconds: TimeInterval = 0
@@ -96,12 +114,12 @@ final class LightboxIndexStore {
             guard !Task.isCancelled else {
                 exec("ROLLBACK;", context: "snapshot rollback folders")
                 Self.logger.info("index snapshot cancelled source=\(source.id, privacy: .public) phase=folders elapsed=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
-                return
+                return false
             }
             let resourceStartedAt = Date()
             let mtime = modificationTime(for: folder.url)
             folderResourceSeconds += Date().timeIntervalSince(resourceStartedAt)
-            insertItem(
+            guard insertItem(
                 id: folder.id,
                 sourceID: source.id,
                 path: folder.url.path,
@@ -114,7 +132,7 @@ final class LightboxIndexStore {
                 width: nil,
                 height: nil,
                 tags: folder.tags
-            )
+            ) else { return rollBack("folders") }
         }
 
         var assetResourceSeconds: TimeInterval = 0
@@ -123,7 +141,7 @@ final class LightboxIndexStore {
             guard !Task.isCancelled else {
                 exec("ROLLBACK;", context: "snapshot rollback assets")
                 Self.logger.info("index snapshot cancelled source=\(source.id, privacy: .public) phase=assets inserted=\(insertedAssets) elapsed=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
-                return
+                return false
             }
             guard let url = asset.sourceURL else { continue }
             let resourceStartedAt = Date()
@@ -131,7 +149,7 @@ final class LightboxIndexStore {
             let size = signature?.fileSize
             let mtime = signature.map { Date(timeIntervalSince1970: $0.modificationTime) }
             assetResourceSeconds += Date().timeIntervalSince(resourceStartedAt)
-            insertItem(
+            guard insertItem(
                 id: "\(source.id):\(url.standardizedFileURL.path)",
                 sourceID: source.id,
                 path: url.path,
@@ -145,15 +163,16 @@ final class LightboxIndexStore {
                 height: asset.metadataLoaded ? Double(asset.height) : nil,
                 tags: asset.tags,
                 metadataLoaded: asset.metadataLoaded
-            )
+            ) else { return rollBack("assets") }
             insertedAssets += 1
             if insertedAssets % 100 == 0 {
                 Self.logger.info("index snapshot progress source=\(source.id, privacy: .public) assets=\(insertedAssets)/\(assets.count) resource=\(assetResourceSeconds, format: .fixed(precision: 2))s elapsed=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
             }
         }
 
-        exec("COMMIT;", context: "snapshot commit")
+        guard exec("COMMIT;", context: "snapshot commit") else { return rollBack("commit") }
         Self.logger.info("index snapshot complete source=\(source.id, privacy: .public) folders=\(folders.count) assets=\(insertedAssets) delete=\(deleteSeconds, format: .fixed(precision: 2))s folderResource=\(folderResourceSeconds, format: .fixed(precision: 2))s assetResource=\(assetResourceSeconds, format: .fixed(precision: 2))s total=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s")
+        return true
     }
 
     func cachedDimensions(sourceID: String, parentPath: String) -> [String: CachedAssetDimensions] {
@@ -293,8 +312,7 @@ final class LightboxIndexStore {
             dimension_version = CASE WHEN ? = 1 THEN ? ELSE dimension_version END,
             tags = CASE WHEN ? = 1 THEN ? ELSE tags END,
             indexed_at = ?
-        WHERE source_id = ?
-          AND path = ?;
+        WHERE id = ?;
         """
         var updatedCount = 0
 
@@ -316,8 +334,10 @@ final class LightboxIndexStore {
                 sqlite3_bind_int(statement, 6, update.tags == nil ? 0 : 1)
                 bindText(Self.encodedTags(update.tags ?? []), to: statement, at: 7)
                 sqlite3_bind_double(statement, 8, Date().timeIntervalSince1970)
-                bindText(sourceID, to: statement, at: 9)
-                bindText(update.url.standardizedFileURL.path, to: statement, at: 10)
+                // By the row's key (`replaceVisibleSnapshot`'s "source:path"):
+                // no index covers `path`, so matching on it scanned the
+                // whole source once per image.
+                bindText("\(sourceID):\(update.url.standardizedFileURL.path)", to: statement, at: 9)
                 let result = sqlite3_step(statement)
                 if result == SQLITE_DONE, sqlite3_changes(database) > 0 {
                     updatedCount += 1
@@ -331,6 +351,122 @@ final class LightboxIndexStore {
         Self.logger.info("index metadata updated source=\(sourceID, privacy: .public) rows=\(updatedCount)/\(updates.count) seconds=\(Date().timeIntervalSince(startedAt), format: .fixed(precision: 3))")
     }
 
+    /// A stored folder summary, valid while the folder's modification time
+    /// still equals `modificationTime` (adding, removing or renaming a child
+    /// changes it).
+    func cachedFolderSummary(path: String) -> (modificationTime: Double, summary: FolderImageSummary)? {
+        var result: (Double, FolderImageSummary)?
+        withStatement("SELECT mtime, image_count, cover_path FROM folder_summaries WHERE path = ?;") { statement in
+            bindText(path, to: statement, at: 1)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return }
+            let cover = columnText(statement, at: 2).map { URL(fileURLWithPath: $0, isDirectory: false) }
+            result = (sqlite3_column_double(statement, 0),
+                      FolderImageSummary(imageCount: Int(sqlite3_column_int64(statement, 1)), coverURL: cover))
+        }
+        return result
+    }
+
+    func storeFolderSummary(_ summary: FolderImageSummary, path: String, modificationTime: Double) {
+        withStatement("""
+        INSERT INTO folder_summaries (path, mtime, image_count, cover_path, indexed_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, image_count = excluded.image_count,
+            cover_path = excluded.cover_path, indexed_at = excluded.indexed_at;
+        """) { statement in
+            bindText(path, to: statement, at: 1)
+            sqlite3_bind_double(statement, 2, modificationTime)
+            sqlite3_bind_int64(statement, 3, Int64(summary.imageCount))
+            if let cover = summary.coverURL { bindText(cover.path, to: statement, at: 4) } else { sqlite3_bind_null(statement, 4) }
+            sqlite3_bind_double(statement, 5, Date().timeIntervalSince1970)
+            _ = stepDone(statement, context: "store folder summary")
+        }
+    }
+
+    /// Image sizes by path, for any folder, scanned or not: the folder
+    /// snapshot in `items` holds only folders that were opened, so recursive
+    /// results and searches keep theirs here.
+    func storeImageDimensions(_ entries: [StoredImageDimensions]) {
+        guard !entries.isEmpty, !Task.isCancelled else { return }
+        guard exec("BEGIN IMMEDIATE TRANSACTION;", context: "image dimensions begin") else { return }
+        for entry in entries {
+            withStatement("""
+            INSERT INTO image_dimensions (path, mtime, file_size, width, height, version)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, file_size = excluded.file_size,
+                width = excluded.width, height = excluded.height, version = excluded.version;
+            """) { statement in
+                bindText(entry.path, to: statement, at: 1)
+                sqlite3_bind_double(statement, 2, entry.signature.modificationTime)
+                sqlite3_bind_int64(statement, 3, entry.signature.fileSize)
+                sqlite3_bind_double(statement, 4, Double(entry.width))
+                sqlite3_bind_double(statement, 5, Double(entry.height))
+                sqlite3_bind_int(statement, 6, Int32(Self.dimensionCacheVersion))
+                _ = stepDone(statement, context: "store image dimensions")
+            }
+        }
+        exec("COMMIT;", context: "image dimensions commit")
+    }
+
+    /// Stored sizes for these paths. Callers check each signature against the
+    /// file's current one.
+    func storedImageDimensions(paths: [String]) -> [String: StoredImageDimensions] {
+        var result: [String: StoredImageDimensions] = [:]
+        withStatement("""
+        SELECT mtime, file_size, width, height FROM image_dimensions WHERE path = ? AND version = ?;
+        """) { statement in
+            for path in paths {
+                guard !Task.isCancelled else { return }
+                sqlite3_reset(statement)
+                bindText(path, to: statement, at: 1)
+                sqlite3_bind_int(statement, 2, Int32(Self.dimensionCacheVersion))
+                guard sqlite3_step(statement) == SQLITE_ROW,
+                      let stored = storedDimensions(statement, path: path) else { continue }
+                result[path] = stored
+            }
+        }
+        return result
+    }
+
+    /// Stored sizes for every image below `folderPath`, at any depth.
+    func storedImageDimensions(under folderPath: String) -> [String: StoredImageDimensions] {
+        let prefix = folderPath.hasSuffix("/") ? folderPath : folderPath + "/"
+        // "0" follows "/", so the range is exactly the paths starting with the prefix.
+        let upperBound = String(prefix.dropLast()) + "0"
+        var result: [String: StoredImageDimensions] = [:]
+        withStatement("""
+        SELECT path, mtime, file_size, width, height FROM image_dimensions
+        WHERE path >= ? AND path < ? AND version = ?;
+        """) { statement in
+            bindText(prefix, to: statement, at: 1)
+            bindText(upperBound, to: statement, at: 2)
+            sqlite3_bind_int(statement, 3, Int32(Self.dimensionCacheVersion))
+            while !Task.isCancelled, sqlite3_step(statement) == SQLITE_ROW {
+                guard let path = columnText(statement, at: 0) else { continue }
+                // Columns shift by one: path comes first here.
+                guard let signature = FileContentSignature(
+                    modificationTime: nullableDouble(statement, at: 1),
+                    fileSize: nullableInt64(statement, at: 2)
+                ) else { continue }
+                let width = CGFloat(sqlite3_column_double(statement, 3))
+                let height = CGFloat(sqlite3_column_double(statement, 4))
+                guard width > 0, height > 0 else { continue }
+                result[path] = StoredImageDimensions(path: path, signature: signature, width: width, height: height)
+            }
+        }
+        return result
+    }
+
+    private func storedDimensions(_ statement: OpaquePointer?, path: String) -> StoredImageDimensions? {
+        guard let signature = FileContentSignature(
+            modificationTime: nullableDouble(statement, at: 0),
+            fileSize: nullableInt64(statement, at: 1)
+        ) else { return nil }
+        let width = CGFloat(sqlite3_column_double(statement, 2))
+        let height = CGFloat(sqlite3_column_double(statement, 3))
+        guard width > 0, height > 0 else { return nil }
+        return StoredImageDimensions(path: path, signature: signature, width: width, height: height)
+    }
+
     private func openDatabase() {
         try? FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
@@ -342,9 +478,11 @@ final class LightboxIndexStore {
             return
         }
 
+        // Set the timeout first: switching to WAL needs a lock, and without a
+        // timeout a concurrent connection makes it fail at once ("database is locked").
+        exec("PRAGMA busy_timeout=3000;", context: "pragma busy_timeout")
         exec("PRAGMA journal_mode=WAL;", context: "pragma journal_mode")
         exec("PRAGMA synchronous=NORMAL;", context: "pragma synchronous")
-        exec("PRAGMA busy_timeout=3000;", context: "pragma busy_timeout")
     }
 
     private func prepareSchema() {
@@ -402,16 +540,37 @@ final class LightboxIndexStore {
             )
         }
 
+        exec("""
+        CREATE TABLE IF NOT EXISTS folder_summaries (
+            path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            image_count INTEGER NOT NULL,
+            cover_path TEXT,
+            indexed_at REAL NOT NULL
+        );
+        """)
+
+        exec("""
+        CREATE TABLE IF NOT EXISTS image_dimensions (
+            path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            file_size INTEGER NOT NULL,
+            width REAL NOT NULL,
+            height REAL NOT NULL,
+            version INTEGER NOT NULL
+        );
+        """)
+
         exec("CREATE INDEX IF NOT EXISTS idx_items_source_parent ON items(source_id, parent_path);")
         exec("CREATE INDEX IF NOT EXISTS idx_items_source_relative ON items(source_id, relative_path);")
     }
 
-    private func deleteItems(sourceID: String, parentPath: String) {
+    private func deleteItems(sourceID: String, parentPath: String) -> Bool {
         withStatement("DELETE FROM items WHERE source_id = ? AND parent_path = ?;") { statement in
             bindText(sourceID, to: statement, at: 1)
             bindText(parentPath, to: statement, at: 2)
-            stepDone(statement, context: "delete items")
-        }
+            return stepDone(statement, context: "delete items")
+        } ?? false
     }
 
     private func insertItem(
@@ -428,7 +587,7 @@ final class LightboxIndexStore {
         height: Double?,
         tags: [String],
         metadataLoaded: Bool = false
-    ) {
+    ) -> Bool {
         let sql = """
         INSERT INTO items (
             id, source_id, path, relative_path, parent_path, is_directory,
@@ -451,7 +610,7 @@ final class LightboxIndexStore {
             indexed_at = excluded.indexed_at;
         """
 
-        withStatement(sql) { statement in
+        return withStatement(sql) { statement in
             bindText(id, to: statement, at: 1)
             bindText(sourceID, to: statement, at: 2)
             bindText(path, to: statement, at: 3)
@@ -467,23 +626,26 @@ final class LightboxIndexStore {
             sqlite3_bind_int(statement, 13, metadataLoaded ? 1 : 0)
             sqlite3_bind_int(statement, 14, metadataLoaded ? Int32(Self.dimensionCacheVersion) : 0)
             sqlite3_bind_double(statement, 15, Date().timeIntervalSince1970)
-            stepDone(statement, context: "insert item")
-        }
+            return stepDone(statement, context: "insert item")
+        } ?? false
     }
 
-    private func withStatement(_ sql: String, body: (OpaquePointer?) -> Void) {
-        guard let database else { return }
+    /// Runs `body` with a prepared statement; nil when it could not be
+    /// prepared.
+    @discardableResult
+    private func withStatement<Result>(_ sql: String, body: (OpaquePointer?) -> Result) -> Result? {
+        guard let database else { return nil }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
             logSQLiteError(context: "prepare statement", code: sqlite3_errcode(database))
-            return
+            return nil
         }
 
         defer {
             sqlite3_finalize(statement)
         }
 
-        body(statement)
+        return body(statement)
     }
 
     private func table(_ tableName: String, hasColumn columnName: String) -> Bool {

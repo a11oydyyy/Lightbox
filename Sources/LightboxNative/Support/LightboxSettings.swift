@@ -127,7 +127,6 @@ enum LightboxTextKey: String, CaseIterable {
     case collapsedState
     case folderTileWidth
     case grid
-    case currentFolderScope
     case includeSubfolders
     case includeSubfoldersHelp
     case scanningSubfolders
@@ -182,6 +181,8 @@ enum LightboxTextKey: String, CaseIterable {
     case showFolderCards
     case folders
     case showHiddenFiles
+    case showOtherFiles
+    case quickLook
     case showICloudDrive
     case showMovies
     case showMusic
@@ -205,13 +206,13 @@ enum LightboxTextKey: String, CaseIterable {
     case traditionalChinese
     case switchToGrid
     case switchToMasonry
-    case sort
     case sortAscending
     case sortBy
     case sortDescending
     case sortFileName
     case sortSize
     case sortTag
+    case sortDimensions
     case sortTime
     case sortType
     case system
@@ -237,6 +238,8 @@ enum LightboxSettingsStore {
         static let sidebarVisibleLocationIDs = "Lightbox.sidebar.visibleLocationIDs"
         static let showFolderCards = "Lightbox.gallery.showFolderCards"
         static let showsHiddenItems = "Lightbox.gallery.showsHiddenItems"
+        static let showsOtherFiles = "Lightbox.gallery.showsOtherFiles"
+        static let viewMode = "Lightbox.gallery.viewMode"
     }
 
     static let defaultGlassOpacity = 0.85
@@ -246,9 +249,10 @@ enum LightboxSettingsStore {
     static let defaultSidebarLocationIDs: Set<SidebarLocationID> = Set(SidebarLocationID.allCases)
     static let defaultShowFolderCards = true
     static let defaultShowsHiddenItems = false
+    static let defaultShowsOtherFiles = false
 
-    static func loadColorMode() -> LightboxColorMode {
-        guard let rawValue = UserDefaults.standard.string(forKey: Key.colorMode),
+    static func loadColorMode(defaults: UserDefaults = .standard) -> LightboxColorMode {
+        guard let rawValue = defaults.string(forKey: Key.colorMode),
               let mode = LightboxColorMode(rawValue: rawValue)
         else {
             return .system
@@ -256,12 +260,12 @@ enum LightboxSettingsStore {
         return mode
     }
 
-    static func saveColorMode(_ mode: LightboxColorMode) {
-        UserDefaults.standard.set(mode.rawValue, forKey: Key.colorMode)
+    static func saveColorMode(_ mode: LightboxColorMode, defaults: UserDefaults = .standard) {
+        defaults.set(mode.rawValue, forKey: Key.colorMode)
     }
 
-    static func loadLanguage() -> LightboxLanguage {
-        guard let rawValue = UserDefaults.standard.string(forKey: Key.language),
+    static func loadLanguage(defaults: UserDefaults = .standard) -> LightboxLanguage {
+        guard let rawValue = defaults.string(forKey: Key.language),
               let language = LightboxLanguage(rawValue: rawValue)
         else {
             return .english
@@ -269,71 +273,91 @@ enum LightboxSettingsStore {
         return language
     }
 
-    static func saveLanguage(_ language: LightboxLanguage) {
-        UserDefaults.standard.set(language.rawValue, forKey: Key.language)
+    static func saveLanguage(_ language: LightboxLanguage, defaults: UserDefaults = .standard) {
+        defaults.set(language.rawValue, forKey: Key.language)
     }
 
-    static func loadSidebarCollapsed() -> Bool {
-        guard UserDefaults.standard.object(forKey: Key.sidebarCollapsed) != nil else {
+    static func loadSidebarCollapsed(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: Key.sidebarCollapsed) != nil else {
             return defaultSidebarCollapsed
         }
 
-        return UserDefaults.standard.bool(forKey: Key.sidebarCollapsed)
+        return defaults.bool(forKey: Key.sidebarCollapsed)
     }
 
-    static func saveSidebarCollapsed(_ collapsed: Bool) {
-        UserDefaults.standard.set(collapsed, forKey: Key.sidebarCollapsed)
+    static func saveSidebarCollapsed(_ collapsed: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(collapsed, forKey: Key.sidebarCollapsed)
     }
 
-    static func loadSidebarWidth() -> CGFloat {
-        guard UserDefaults.standard.object(forKey: Key.sidebarWidth) != nil else {
+    static func loadSidebarWidth(defaults: UserDefaults = .standard) -> CGFloat {
+        guard defaults.object(forKey: Key.sidebarWidth) != nil else {
             return defaultSidebarWidth
         }
 
-        return clampSidebarWidth(UserDefaults.standard.double(forKey: Key.sidebarWidth))
+        return clampSidebarWidth(defaults.double(forKey: Key.sidebarWidth))
     }
 
-    static func saveSidebarWidth(_ width: CGFloat) {
-        UserDefaults.standard.set(clampSidebarWidth(width), forKey: Key.sidebarWidth)
+    static func saveSidebarWidth(_ width: CGFloat, defaults: UserDefaults = .standard) {
+        defaults.set(clampSidebarWidth(width), forKey: Key.sidebarWidth)
     }
 
-    static func loadSidebarVisibleLocationIDs() -> Set<SidebarLocationID> {
-        guard let rawIDs = UserDefaults.standard.stringArray(forKey: Key.sidebarVisibleLocationIDs) else {
+    static func loadSidebarVisibleLocationIDs(defaults: UserDefaults = .standard) -> Set<SidebarLocationID> {
+        guard let rawIDs = defaults.stringArray(forKey: Key.sidebarVisibleLocationIDs) else {
             return defaultSidebarLocationIDs
         }
 
         return Set(rawIDs.compactMap(SidebarLocationID.init(rawValue:)))
     }
 
-    static func saveSidebarVisibleLocationIDs(_ ids: Set<SidebarLocationID>) {
+    static func saveSidebarVisibleLocationIDs(_ ids: Set<SidebarLocationID>, defaults: UserDefaults = .standard) {
         let rawIDs = SidebarLocationID.allCases
             .filter { ids.contains($0) }
             .map(\.rawValue)
-        UserDefaults.standard.set(rawIDs, forKey: Key.sidebarVisibleLocationIDs)
+        defaults.set(rawIDs, forKey: Key.sidebarVisibleLocationIDs)
     }
 
-    static func loadShowFolderCards() -> Bool {
-        guard UserDefaults.standard.object(forKey: Key.showFolderCards) != nil else {
+    static func loadShowFolderCards(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: Key.showFolderCards) != nil else {
             return defaultShowFolderCards
         }
 
-        return UserDefaults.standard.bool(forKey: Key.showFolderCards)
+        return defaults.bool(forKey: Key.showFolderCards)
     }
 
-    static func saveShowFolderCards(_ isVisible: Bool) {
-        UserDefaults.standard.set(isVisible, forKey: Key.showFolderCards)
+    static func saveShowFolderCards(_ isVisible: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(isVisible, forKey: Key.showFolderCards)
     }
 
-    static func loadShowsHiddenItems() -> Bool {
-        guard UserDefaults.standard.object(forKey: Key.showsHiddenItems) != nil else {
+    static func loadShowsHiddenItems(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: Key.showsHiddenItems) != nil else {
             return defaultShowsHiddenItems
         }
 
-        return UserDefaults.standard.bool(forKey: Key.showsHiddenItems)
+        return defaults.bool(forKey: Key.showsHiddenItems)
     }
 
-    static func saveShowsHiddenItems(_ isVisible: Bool) {
-        UserDefaults.standard.set(isVisible, forKey: Key.showsHiddenItems)
+    static func saveShowsHiddenItems(_ isVisible: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(isVisible, forKey: Key.showsHiddenItems)
+    }
+
+    static func loadViewMode(defaults: UserDefaults = .standard) -> GalleryViewMode {
+        defaults.string(forKey: Key.viewMode).flatMap(GalleryViewMode.init(rawValue:)) ?? .grid
+    }
+
+    static func saveViewMode(_ mode: GalleryViewMode, defaults: UserDefaults = .standard) {
+        defaults.set(mode.rawValue, forKey: Key.viewMode)
+    }
+
+    static func loadShowsOtherFiles(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: Key.showsOtherFiles) != nil else {
+            return defaultShowsOtherFiles
+        }
+
+        return defaults.bool(forKey: Key.showsOtherFiles)
+    }
+
+    static func saveShowsOtherFiles(_ isVisible: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(isVisible, forKey: Key.showsOtherFiles)
     }
 
     static func clampSidebarWidth(_ width: CGFloat) -> CGFloat {
@@ -386,6 +410,19 @@ enum LightboxLocalization {
             return simplifiedChinese[key] != nil
         case .japanese:
             return japanese[key] != nil
+        }
+    }
+
+    static func folderImageCount(_ count: Int, language: LightboxLanguage) -> String {
+        switch language.resolved {
+        case .english:
+            return count == 1 ? "1 image" : "\(count) images"
+        case .traditionalChinese:
+            return "\(count) 張"
+        case .simplifiedChinese:
+            return "\(count) 张"
+        case .japanese:
+            return "\(count)枚"
         }
     }
 
@@ -514,9 +551,8 @@ enum LightboxLocalization {
         .language: "Language",
         .light: "Light",
         .liquidGlassOpacity: "Liquid Glass Opacity",
-        .currentFolderScope: "This folder",
         .includeSubfolders: "Include subfolders",
-        .includeSubfoldersHelp: "Choose whether to browse and search images in this folder only, or in all its subfolders too.",
+        .includeSubfoldersHelp: "Include subfolders: browse and search the images in all subfolders too (grid view).",
         .scanningSubfolders: "Scanning subfolders…",
         .searchingImages: "Searching images…",
         .recursiveResultsIncomplete: "Some folders could not be read. The displayed images may be incomplete.",
@@ -562,6 +598,8 @@ enum LightboxLocalization {
         .showFolderCards: "Show Folders",
         .folders: "Folders",
         .showHiddenFiles: "Show Hidden Files",
+        .showOtherFiles: "Show Other Files",
+        .quickLook: "Quick Look",
         .showICloudDrive: "Show iCloud Drive",
         .showMovies: "Show Movies",
         .showMusic: "Show Music",
@@ -573,13 +611,13 @@ enum LightboxLocalization {
         .traditionalChinese: "繁體中文",
         .switchToGrid: "Switch to grid",
         .switchToMasonry: "Switch to masonry",
-        .sort: "Sort",
         .sortAscending: "Ascending",
         .sortBy: "Sort By",
         .sortDescending: "Descending",
         .sortFileName: "File Name",
         .sortSize: "Size",
         .sortTag: "Tag",
+        .sortDimensions: "Dimensions",
         .sortTime: "Time",
         .sortType: "Type",
         .system: "System",
@@ -672,9 +710,8 @@ enum LightboxLocalization {
         .language: "语言",
         .light: "浅色",
         .liquidGlassOpacity: "Liquid Glass 透明度",
-        .currentFolderScope: "当前文件夹",
         .includeSubfolders: "包含子文件夹",
-        .includeSubfoldersHelp: "切换浏览和搜索范围：仅当前文件夹，或包含所有子文件夹中的图片。",
+        .includeSubfoldersHelp: "包含子文件夹：一并浏览和搜索所有子文件夹中的图片（网格视图）。",
         .scanningSubfolders: "正在扫描子文件夹…",
         .searchingImages: "正在搜索图片…",
         .recursiveResultsIncomplete: "部分文件夹无法读取，当前显示的图片可能不完整。",
@@ -720,6 +757,8 @@ enum LightboxLocalization {
         .showFolderCards: "显示文件夹",
         .folders: "文件夹",
         .showHiddenFiles: "显示隐藏文件",
+        .showOtherFiles: "显示其他文件",
+        .quickLook: "快速查看",
         .showICloudDrive: "显示 iCloud Drive",
         .showMovies: "显示影片",
         .showMusic: "显示音乐",
@@ -731,13 +770,13 @@ enum LightboxLocalization {
         .traditionalChinese: "繁體中文",
         .switchToGrid: "切换到网格",
         .switchToMasonry: "切换到瀑布流",
-        .sort: "排序",
         .sortAscending: "正序",
         .sortBy: "排序方式",
         .sortDescending: "倒序",
         .sortFileName: "文件名",
         .sortSize: "大小",
         .sortTag: "标签",
+        .sortDimensions: "尺寸",
         .sortTime: "时间",
         .sortType: "类型",
         .system: "跟随系统",
@@ -830,9 +869,8 @@ enum LightboxLocalization {
         .language: "語言",
         .light: "淺色",
         .liquidGlassOpacity: "Liquid Glass 透明度",
-        .currentFolderScope: "目前資料夾",
         .includeSubfolders: "包含子資料夾",
-        .includeSubfoldersHelp: "切換瀏覽和搜尋範圍：僅目前資料夾，或包含所有子資料夾中的圖片。",
+        .includeSubfoldersHelp: "包含子資料夾：一併瀏覽和搜尋所有子資料夾中的圖片（網格檢視）。",
         .scanningSubfolders: "正在掃描子資料夾…",
         .searchingImages: "正在搜尋圖片…",
         .recursiveResultsIncomplete: "部分資料夾無法讀取，目前顯示的圖片可能不完整。",
@@ -878,6 +916,8 @@ enum LightboxLocalization {
         .showFolderCards: "顯示資料夾",
         .folders: "資料夾",
         .showHiddenFiles: "顯示隱藏檔案",
+        .showOtherFiles: "顯示其他檔案",
+        .quickLook: "快速查看",
         .showICloudDrive: "顯示 iCloud Drive",
         .showMovies: "顯示影片",
         .showMusic: "顯示音樂",
@@ -889,13 +929,13 @@ enum LightboxLocalization {
         .traditionalChinese: "繁體中文",
         .switchToGrid: "切換到網格",
         .switchToMasonry: "切換到瀑布流",
-        .sort: "排序",
         .sortAscending: "正序",
         .sortBy: "排序方式",
         .sortDescending: "倒序",
         .sortFileName: "檔名",
         .sortSize: "大小",
         .sortTag: "標籤",
+        .sortDimensions: "尺寸",
         .sortTime: "時間",
         .sortType: "類型",
         .system: "跟隨系統",
@@ -988,9 +1028,8 @@ enum LightboxLocalization {
         .language: "言語",
         .light: "ライト",
         .liquidGlassOpacity: "Liquid Glass の透明度",
-        .currentFolderScope: "現在のフォルダ",
         .includeSubfolders: "サブフォルダを含む",
-        .includeSubfoldersHelp: "現在のフォルダ内だけ、またはすべてのサブフォルダ内の画像も表示・検索します。",
+        .includeSubfoldersHelp: "サブフォルダを含む：すべてのサブフォルダ内の画像も表示・検索します（グリッド表示）。",
         .scanningSubfolders: "サブフォルダをスキャン中…",
         .searchingImages: "画像を検索中…",
         .recursiveResultsIncomplete: "一部のフォルダを読み取れません。画像がすべて表示されていない可能性があります。",
@@ -1036,6 +1075,8 @@ enum LightboxLocalization {
         .showFolderCards: "フォルダを表示",
         .folders: "フォルダ",
         .showHiddenFiles: "隠しファイルを表示",
+        .showOtherFiles: "その他のファイルを表示",
+        .quickLook: "クイックルック",
         .showICloudDrive: "iCloud Drive を表示",
         .showMovies: "ムービーを表示",
         .showMusic: "ミュージックを表示",
@@ -1047,13 +1088,13 @@ enum LightboxLocalization {
         .traditionalChinese: "繁體中文",
         .switchToGrid: "グリッドに切り替え",
         .switchToMasonry: "メイソンリーに切り替え",
-        .sort: "並べ替え",
         .sortAscending: "昇順",
         .sortBy: "並べ替え",
         .sortDescending: "降順",
         .sortFileName: "ファイル名",
         .sortSize: "サイズ",
         .sortTag: "タグ",
+        .sortDimensions: "寸法",
         .sortTime: "時刻",
         .sortType: "種類",
         .system: "システム",

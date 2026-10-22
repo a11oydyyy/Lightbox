@@ -164,7 +164,7 @@ struct GlassSidebar: View {
                 .allowsHitTesting(false)
         }
         .shadow(color: .black.opacity(GlassTokens.sidebarShadowOpacity(appState.glassOpacity)), radius: 10, y: 3)
-        .padding(.leading, 10)
+        .padding(.leading, SidebarMetrics.panelLeadingInset)
         .padding(.top, 8)
         .padding(.bottom, 10)
         .onChange(of: appState.currentFolderURL) { _ in
@@ -279,6 +279,10 @@ enum SidebarMetrics {
     /// Band at the top of the panel reserved for the window controls and the
     /// sidebar toggle; the panel starts 8pt below the window edge.
     static let titlebarBandHeight: CGFloat = 40
+    /// The panel's inset from the window's leading edge.
+    static let panelLeadingInset: CGFloat = 10
+    /// Invisible resize strip between the panel and the gallery.
+    static let resizeHandleWidth: CGFloat = 8
     static let accessorySize: CGFloat = 22
 }
 
@@ -353,7 +357,9 @@ private struct SidebarPinnedFolderRow: View {
     var body: some View {
         HStack(spacing: 4) {
             Button {
-                if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
+                // The keys held now, not `NSApp.currentEvent`: with the row's
+                // drag gesture the action can run after another event.
+                if NSEvent.modifierFlags.contains(.command) {
                     appState.openSidebarFolderInNewTab(url)
                 } else {
                     appState.openSidebarFolder(url)
@@ -793,9 +799,9 @@ private struct SidebarTrashRow: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous))
         }
-        .buttonStyle(LightboxButtonHoverStyle(
-            shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
-        ))
+        // The row paints its own hover, like the folder rows; a hover style
+        // here would add a second fill and make this row darker.
+        .buttonStyle(.plain)
         .contextMenu {
             Button(appState.localized(.open)) {
                 appState.openTrashFromSidebar()
@@ -909,19 +915,20 @@ private struct SidebarTabRow: View {
             .accessibilityAddTraits(active ? .isSelected : [])
 
             Button { appState.closeTab(tab.id) } label: {
+                // Same size and column as the section's + button.
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .medium))
-                    .frame(width: 24, height: 28)
-                    .contentShape(Rectangle())
+                    .frame(width: SidebarMetrics.accessorySize, height: SidebarMetrics.accessorySize)
+                    .contentShape(Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(LightboxButtonHoverStyle(shape: Circle()))
             .opacity(active || hovering ? 1 : 0)
             .help(appState.localized(.closeTab))
             .accessibilityLabel(appState.localized(.closeTab))
         }
         .foregroundStyle(LightboxColorTokens.primaryText)
         .padding(.leading, 8)
-        .padding(.trailing, 3)
+        .padding(.trailing, 6)
         .background {
             let shape = RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)
             if fileDropTargetID == tab.id {
@@ -942,26 +949,7 @@ private struct SidebarTabRow: View {
         .onHover { hovering = $0 }
         .help(appState.tabPath(tab))
         .contextMenu { TabContextMenu(tab: tab) }
-        .modifier(LegacyTabReorder(tabID: tab.id, appState: appState))
         .onDrop(of: [UTType(exportedAs: LightboxPasteboardTypes.internalAssetDragIdentifier)], delegate: TabAssetDropDelegate(targetTabID: tab.id, fileDropTargetID: $fileDropTargetID, appState: appState))
     }
 }
 
-private struct LegacyTabReorder: ViewModifier {
-    var tabID: UUID
-    var appState: AppState
-    func body(content: Content) -> some View {
-        if #available(macOS 27, *) {
-            content
-        } else {
-            content.onDrag {
-                appState.beginTabDrag(tabID)
-                return NSItemProvider(object: tabID.uuidString as NSString)
-            }.onDrop(of: [.utf8PlainText], isTargeted: nil) { _ in
-                appState.moveDraggedTab(before: tabID)
-                appState.endTabDrag()
-                return true
-            }
-        }
-    }
-}

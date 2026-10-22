@@ -87,7 +87,7 @@ private final class MonitorDescriptorProbe: @unchecked Sendable {
     var invalidations = 0
     monitor.start(onInvalidated: { invalidations += 1 }) {}
     defer { gate.signal(); monitor.stop() }
-    for _ in 0..<300 where !probe.didBegin { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { !probe.didBegin }
     try #require(probe.didBegin)
     monitor.stop()
     gate.signal()
@@ -106,10 +106,10 @@ private final class MonitorDescriptorProbe: @unchecked Sendable {
     monitor.start(onInvalidated: { invalidations += 1 }) { changes += 1 }
     defer { monitor.stop() }
     try Data().write(to: folder.appendingPathComponent("attached.png"))
-    for _ in 0..<500 where changes == 0 { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { changes == 0 }
     try #require(changes > 0)
     try FileManager.default.moveItem(at: folder, to: work.appendingPathComponent("old-photos"))
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    for _ in 0..<500 where invalidations == 0 { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { invalidations == 0 }
     #expect(invalidations == 1)
 }

@@ -64,7 +64,7 @@ private final class SlowDirectoryCheck: @unchecked Sendable {
 }
 
 @MainActor private func waitForDirectoryCondition(_ condition: () -> Bool) async throws {
-    for _ in 0..<500 where !condition() { try await Task.sleep(for: .milliseconds(5)) }
+    await waitWhile { !condition() }
     try #require(condition())
 }
 

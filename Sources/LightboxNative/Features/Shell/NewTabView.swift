@@ -68,8 +68,9 @@ struct NewTabView: View {
     @ViewBuilder
     private var openFolderButton: some View {
         let button = Button { appState.addExternalSource() } label: {
+            // The style picks the label color: white on the graphite fill, dark
+            // on the gray it turns in an inactive window (forced white vanished there).
             Label(appState.localized(.startOpenFolder), systemImage: "folder.badge.plus")
-                .foregroundStyle(LightboxColorTokens.accentForeground)
                 .padding(.horizontal, 4)
         }
         .controlSize(.large)
@@ -151,7 +152,7 @@ struct NewTabView: View {
             .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
-        .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)))
+        .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: RadiusTokens.control, style: .continuous)))
         .help(url.path)
     }
 }

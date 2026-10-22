@@ -15,6 +15,7 @@ struct LightboxTab: Identifiable, Equatable, Sendable {
     var forwardHistory: [LightboxTabLocation]
     var searchText: String
     var filter: LibraryFilter
+    var attributeFilter: GalleryAttributeFilter
     var isStartPage: Bool = false
     var sortField: GallerySortField
     var isPinned: Bool
@@ -37,6 +38,7 @@ struct LightboxTab: Identifiable, Equatable, Sendable {
         forwardHistory: [LightboxTabLocation] = [],
         searchText: String = "",
         filter: LibraryFilter = .all,
+        attributeFilter: GalleryAttributeFilter = GalleryAttributeFilter(),
         sortField: GallerySortField = .time,
         sortDirection: GallerySortDirection = .descending,
         layoutMode: GalleryLayoutMode = .masonry,
@@ -56,6 +58,7 @@ struct LightboxTab: Identifiable, Equatable, Sendable {
         self.forwardHistory = forwardHistory
         self.searchText = searchText
         self.filter = filter
+        self.attributeFilter = attributeFilter
         self.sortField = sortField
         self.sortDirection = sortDirection
         self.layoutMode = layoutMode

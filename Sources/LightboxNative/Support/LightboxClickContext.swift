@@ -13,10 +13,12 @@ struct LightboxClickContext {
     var windowSize: CGSize
     var localLocation: CGPoint
     var bounds: CGRect
+    var clickCount: Int
 
     @MainActor
     init(event: NSEvent, in view: NSView, trigger: LightboxClickTrigger) {
         self.trigger = trigger
+        clickCount = event.clickCount
         modifierFlags = event.modifierFlags
         windowLocation = event.locationInWindow
         windowSize = view.window?.contentView?.bounds.size ?? view.bounds.size

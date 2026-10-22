@@ -31,6 +31,9 @@ enum MotionTokens {
     static let chromeHide = Animation.easeOut(duration: chromeHideDurationSeconds)
     static let chromeReveal = Animation.easeOut(duration: chromeRevealDurationSeconds)
     static let preview = Animation.easeInOut(duration: 0.24)
+    // Header center-slot swaps (location, path editor, selection, search field):
+    // a plain crossfade, matching the scan-progress title fade.
+    static let headerSwapDurationSeconds = 0.20
 
     // Press: quick down with a critically damped release.
     static let pressIn = Animation.easeOut(duration: 0.12)

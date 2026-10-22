@@ -13,6 +13,8 @@ struct AssetContextMenuTitles: Equatable {
     var defaultApp: String
     var share: String
     var showInFinder: String
+    var rename = "Rename…"
+    var quickLook = "Quick Look"
 
     static let english = AssetContextMenuTitles(
         copy: "Copy",
@@ -57,6 +59,8 @@ struct AssetContextMenuTitles: Equatable {
             share: appState.localized(.share),
             showInFinder: appState.localized(.showInFinder)
         )
+        rename = appState.renameText.menuItem
+        quickLook = appState.localized(.quickLook)
     }
 }
 
@@ -91,6 +95,12 @@ struct AssetCardView: View, Equatable {
     var onCopy: () -> Void
     var onShare: (NSView) -> Void
     var onAddToCompareTray: () -> Void
+    /// Nil leaves Rename out of the menu.
+    var onRename: (() -> Void)?
+    /// Space, when it does something other than `onActivate`; nil leaves
+    /// Quick Look out of the menu.
+    var onQuickLook: (() -> Void)?
+    var onSpace: (() -> Void)?
 
     nonisolated static func == (lhs: AssetCardView, rhs: AssetCardView) -> Bool {
         lhs.keyboardFocusRequested == rhs.keyboardFocusRequested &&
@@ -103,6 +113,7 @@ struct AssetCardView: View, Equatable {
         lhs.asset.fileSize == rhs.asset.fileSize &&
         lhs.asset.deletedAt == rhs.asset.deletedAt &&
         lhs.asset.tags == rhs.asset.tags &&
+        lhs.asset.hasCameraRawSettings == rhs.asset.hasCameraRawSettings &&
         lhs.isSelected == rhs.isSelected &&
         lhs.isExplicitlySelected == rhs.isExplicitlySelected &&
             lhs.showsSelectionControl == rhs.showsSelectionControl &&
@@ -126,7 +137,9 @@ struct AssetCardView: View, Equatable {
 
     var body: some View {
         Group {
-            if let imageLoadingState {
+            if !asset.isImage {
+                FileTileView(asset: asset)
+            } else if let imageLoadingState {
                 GalleryAssetImageView(asset: asset, loadingState: imageLoadingState)
             } else {
                 AssetImageView(asset: asset, quality: imageQuality, loadsImage: loadsImage)
@@ -139,7 +152,7 @@ struct AssetCardView: View, Equatable {
             .clipShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
             .overlay {
                 // strokeBorder draws inside the rounded clip (centered .stroke
-                // bled half-outside, showing a corner box under hover3D/scale,
+                // bled half-outside, showing a corner box under scale effects,
                 // most visibly in dark mode). primary adapts to color scheme.
                 RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous)
                     .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.6)
@@ -156,19 +169,19 @@ struct AssetCardView: View, Equatable {
                         .transition(.opacity)
                 }
             }
-            .overlay(alignment: .topLeading) {
-                SelectionCheckbox(isSelected: isExplicitlySelected)
-                    .accessibilityHidden(true)
-                    .opacity(showsSelectionControl || isExplicitlySelected ? 1 : 0)
-                    .padding(8)
-                    .allowsHitTesting(false)
-                    .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isExplicitlySelected)
-            }
             .overlay(alignment: .topTrailing) {
                 if let compareTrayLabel {
                     CompareTrayMembershipBadge(label: compareTrayLabel)
                         .padding(8)
                         .transition(.scale(scale: 0.72).combined(with: .opacity))
+                }
+            }
+            .overlay(alignment: .bottomLeading) {
+                if asset.hasCameraRawSettings == true {
+                    CameraRawSettingsBadge()
+                        .padding(.leading, 8)
+                        .padding(.bottom, 8)
+                        .transition(.opacity)
                 }
             }
             .overlay(alignment: .bottomTrailing) {
@@ -179,13 +192,18 @@ struct AssetCardView: View, Equatable {
             }
             .opacity(isPreviewSourceHidden ? 0 : 1)
             // Flatten the clipped card + overlays before transforms so the
-            // rounded corners can't overhang under hover3D / scaleEffect.
+            // rounded corners can't overhang under scaleEffect.
             .compositingGroup()
             .contentShape(RoundedRectangle(cornerRadius: RadiusTokens.card, style: .continuous))
             // Return the outline only after preview teardown restores gallery focus.
-            .hover3D(isReduced: usesReducedHover,
-                     isEnabled: isInteractionEnabled && !isPreviewSourceHidden,
-                     isFocused: showsKeyboardFocus, isSelected: isSelected)
+            .modifier(CardHoverChrome(
+                isEnabled: isInteractionEnabled && !isPreviewSourceHidden,
+                isFocused: showsKeyboardFocus,
+                isHighlighted: isSelected,
+                isExplicitlySelected: isExplicitlySelected,
+                isSelecting: showsSelectionControl,
+                reduceMotion: reduceMotion
+            ))
             .overlay {
                 AssetInteractionLayer(
                     keyboardFocusRequested: keyboardFocusRequested,
@@ -216,7 +234,10 @@ struct AssetCardView: View, Equatable {
                     onRevealInFinder: onRevealInFinder,
                     onCopy: onCopy,
                     onShare: onShare,
-                    onAddToCompareTray: onAddToCompareTray
+                    onAddToCompareTray: onAddToCompareTray,
+                    onRename: onRename,
+                    onQuickLook: onQuickLook,
+                    onSpace: onSpace
                 )
             }
             .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: isComparePulse)
@@ -254,6 +275,9 @@ struct AssetInteractionLayer: NSViewRepresentable {
     var onCopy: () -> Void
     var onShare: (NSView) -> Void
     var onAddToCompareTray: () -> Void
+    var onRename: (() -> Void)? = nil
+    var onQuickLook: (() -> Void)? = nil
+    var onSpace: (() -> Void)? = nil
 
     func makeNSView(context: Context) -> AssetInteractionView {
         AssetInteractionView()
@@ -282,6 +306,9 @@ struct AssetInteractionLayer: NSViewRepresentable {
         nsView.onCopy = onCopy
         nsView.onShare = onShare
         nsView.onAddToCompareTray = onAddToCompareTray
+        nsView.onRename = onRename
+        nsView.onQuickLook = onQuickLook
+        nsView.onSpace = onSpace
         nsView.onKeyboard = onKeyboard
         nsView.onPreviewArrow = onPreviewArrow
         nsView.onActivate = onActivate
@@ -430,6 +457,9 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         if event.keyCode == 109, modifiers.contains(.shift) {
             _ = accessibilityPerformShowMenu(); return
         }
+        if !modifiers.contains(.command), event.keyCode == 49, let onSpace {
+            onSpace(); return
+        }
         if !modifiers.contains(.command), [36, 49, 76].contains(event.keyCode), let onActivate {
             onActivate(); return
         }
@@ -471,6 +501,9 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     var onCopy: () -> Void = {}
     var onShare: (NSView) -> Void = { _ in }
     var onAddToCompareTray: () -> Void = {}
+    var onRename: (() -> Void)?
+    var onQuickLook: (() -> Void)?
+    var onSpace: (() -> Void)?
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard isInteractionEnabled else {
@@ -646,12 +679,25 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         }
         menu.addItem(openWithItem)
 
+        if onQuickLook != nil {
+            let quickLookItem = actionItem(title: menuTitles.quickLook, action: #selector(quickLookAsset))
+            quickLookItem.isEnabled = assetURL != nil
+            menu.addItem(quickLookItem)
+        }
+
+        if !isDeleted, onRename != nil {
+            let renameItem = actionItem(title: menuTitles.rename, action: #selector(renameAsset))
+            renameItem.isEnabled = assetURL != nil
+            menu.addItem(renameItem)
+        }
+
         menu.addItem(.separator())
         if isDeleted {
             menu.addItem(actionItem(title: menuTitles.restore, action: #selector(restore)))
         } else {
             let compareItem = actionItem(title: compareMenuTitle, action: #selector(addToCompareTray))
-            compareItem.isEnabled = assetURL != nil
+            // Only images compare.
+            compareItem.isEnabled = assetURL.map { LightboxAsset.isImageName($0.lastPathComponent) } ?? false
             menu.addItem(compareItem)
 
         }
@@ -755,6 +801,16 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         onRevealInFinder()
     }
 
+    @objc private func renameAsset() {
+        guard isInteractionEnabled else { return }
+        onRename?()
+    }
+
+    @objc private func quickLookAsset() {
+        guard isInteractionEnabled else { return }
+        onQuickLook?()
+    }
+
     @objc private func openWithSelectedApplication(_ item: NSMenuItem) {
         guard isInteractionEnabled else { return }
         onOpenWith(item.representedObject as? URL)
@@ -796,6 +852,25 @@ private struct CompareTrayMembershipBadge: View {
             }
             .shadow(color: .black.opacity(0.16), radius: 4, y: 2)
             .allowsHitTesting(false)
+    }
+}
+
+/// Camera Raw has develop settings for the image (Bridge marks the same).
+/// The thumbnail itself still shows the unedited original.
+private struct CameraRawSettingsBadge: View {
+    var body: some View {
+        Image(systemName: "slider.horizontal.3")
+            .font(.system(size: 8.5, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.94))
+            .frame(width: 18, height: 18)
+            .background(.black.opacity(0.34), in: Circle())
+            .overlay {
+                Circle()
+                    .stroke(.white.opacity(0.42), lineWidth: 0.6)
+            }
+            .shadow(color: .black.opacity(0.22), radius: 2, y: 1)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -961,6 +1036,74 @@ private final class ColorTagMenuView: NSView {
         let index = MacColorTag.all.firstIndex(of: tag) ?? 0
         let x = MacTagDotMetrics.menuHorizontalInset + CGFloat(index) * MacTagDotMetrics.menuHitDiameter
         return NSRect(x: x, y: 0, width: MacTagDotMetrics.menuHitDiameter, height: bounds.height)
+    }
+}
+
+/// The card's hover-driven chrome under one pointer tracker: the outline
+/// (hover, keyboard focus, selection) and the selection checkbox. Selected
+/// cards always show their checkbox; while a selection is active, others show
+/// an empty one only under the pointer or keyboard focus, so the grid stays
+/// quiet. The checkbox is built only while shown: most cards never show one,
+/// and every mounted card pays for what it builds. Hover lives here so it
+/// re-renders only this chrome, not the card.
+private struct CardHoverChrome: ViewModifier {
+    var isEnabled: Bool
+    var isFocused: Bool
+    /// Selected or otherwise highlighted (the accent outline).
+    var isHighlighted: Bool
+    var isExplicitlySelected: Bool
+    var isSelecting: Bool
+    var reduceMotion: Bool
+    @Environment(\.colorScheme) private var colorScheme
+    @LightboxViewState private var isHovering = false
+
+    private var showsOutline: Bool {
+        isEnabled && (isFocused || isHighlighted || isHovering)
+    }
+
+    private var showsCheckbox: Bool {
+        isExplicitlySelected || (isSelecting && (isHovering || isFocused))
+    }
+
+    private var outlineAnimation: Animation {
+        isFocused ? MotionTokens.chromeReveal : MotionTokens.feedback
+    }
+
+    /// Focus without selection sits further out, so a gap separates it from the
+    /// graphite selection ring that hugs the card at the same tone.
+    private var outlineOffset: CGFloat {
+        isFocused && !isHighlighted ? 4 : 2
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .topLeading) {
+                ZStack {
+                    if showsCheckbox {
+                        SelectionCheckbox(isSelected: isExplicitlySelected)
+                            .accessibilityHidden(true)
+                            .padding(8)
+                            .transition(.opacity)
+                    }
+                }
+                .allowsHitTesting(false)
+                .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: showsCheckbox)
+                .animation(MotionTokens.ifAllowed(MotionTokens.feedback, reduceMotion: reduceMotion), value: isExplicitlySelected)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: RadiusTokens.card + outlineOffset, style: .continuous)
+                    .stroke(isHighlighted ? LightboxColorTokens.accent : LightboxColorTokens.secondaryText.opacity(isFocused ? 1 : (colorScheme == .light ? 0.42 : 0.35)), lineWidth: isFocused ? 2 : (isHighlighted ? LightboxControlMetrics.focusLineWidth : 1))
+                    .padding(-outlineOffset)
+                    .opacity(showsOutline ? 1 : 0)
+                    // Keep one resident outline through selection and focus handoff.
+                    // Scope feedback to the outline so the returning image stays solid.
+                    .animation(MotionTokens.ifAllowed(outlineAnimation, reduceMotion: reduceMotion), value: showsOutline)
+                    .animation(MotionTokens.ifAllowed(outlineAnimation, reduceMotion: reduceMotion), value: isFocused)
+                    .animation(MotionTokens.ifAllowed(outlineAnimation, reduceMotion: reduceMotion), value: isHighlighted)
+                    .allowsHitTesting(false)
+            }
+            .onHover { isHovering = $0 }
+            .onChange(of: isEnabled) { if !$0 { isHovering = false } }
     }
 }
 
@@ -1140,7 +1283,7 @@ struct AssetImageView: View {
         switch quality {
         case .preview, .comparison:
             return .high
-        case .thumbnail, .thumbnailBalanced, .thumbnailFast:
+        case .thumbnail, .thumbnailBalanced, .thumbnailFast, .thumbnailEmbedded:
             return .medium
         }
     }

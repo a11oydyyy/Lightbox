@@ -2,21 +2,54 @@ import AppKit
 import CoreText
 import SwiftUI
 
+/// The image grid's column lines. Folder cells span whole image columns so
+/// both grids share one set of vertical edges.
+struct FolderColumnGuide: Equatable {
+    var count: Int
+    var width: CGFloat
+    var spacing: CGFloat
+}
+
 struct FolderGridPlacement {
+    static let minimumCellWidth: CGFloat = 180
+    /// A folder tile: a cover thumbnail, then name and image count, on a faint
+    /// fill. Shared with the section header so its chevron centers on the
+    /// thumbnail column and its title lines up with the folder names.
+    static let tileHeight: CGFloat = 48
+    static let contentInset: CGFloat = 6
+    static let thumbnailSize = CGSize(width: 48, height: 36)
+    static let thumbnailRadius: CGFloat = 6
+    static let iconTextGap: CGFloat = 10
+    static let restFillOpacity: CGFloat = 0.045
+    static let hoverFillOpacity = CGFloat(LightboxControlMetrics.hoverOpacity)
+    @MainActor static let iconConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+
     let count: Int
     let width: CGFloat
     let columns: Int
     let rowHeight: CGFloat
     let cellWidth: CGFloat
-    private let columnSpacing: CGFloat = 16
-    private let rowSpacing: CGFloat = 2
+    let columnSpacing: CGFloat
+    let rowSpacing: CGFloat
 
-    init(count: Int, width: CGFloat, showsRelativePath: Bool) {
+    init(count: Int, width: CGFloat, showsRelativePath: Bool, columnGuide: FolderColumnGuide? = nil) {
         self.count = max(0, count)
         self.width = max(0, width)
-        columns = max(1, Int((max(0, width) + 16) / 196))
-        rowHeight = showsRelativePath ? 44 : 36
-        cellWidth = max(0, (max(0, width) - CGFloat(columns - 1) * 16) / CGFloat(columns))
+        // Tiles hold two text lines either way: the image count, or the
+        // relative path in search results.
+        rowHeight = Self.tileHeight
+        rowSpacing = columnGuide?.spacing ?? 2
+        if let guide = columnGuide, guide.count > 0, guide.width > 0 {
+            // Fewest image columns per folder that still fit a readable name.
+            let span = max(1, Int(ceil((Self.minimumCellWidth + guide.spacing) / (guide.width + guide.spacing))))
+            columns = max(1, guide.count / span)
+            cellWidth = CGFloat(span) * guide.width + CGFloat(span - 1) * guide.spacing
+            columnSpacing = guide.spacing
+        } else {
+            columnSpacing = 16
+            columns = max(1, Int((max(0, width) + columnSpacing) / (Self.minimumCellWidth + columnSpacing)))
+            cellWidth = max(0, (max(0, width) - CGFloat(columns - 1) * columnSpacing) / CGFloat(columns))
+        }
     }
 
     var rows: Int { (count + columns - 1) / columns }
@@ -60,14 +93,20 @@ struct FolderGridPlacement {
 struct NativeFolderGrid: NSViewRepresentable {
     var folders: [LibraryFolderEntry]
     var availableWidth: CGFloat
+    var columnGuide: FolderColumnGuide? = nil
     var showsRelativePath: Bool
     var selectedFolderID: LibraryFolderEntry.ID?
     var showInFinderTitle: String
     var openInNewTabTitle: String
+    var renameTitle: String = ""
     var clearSelection: () -> Void
     var open: (LibraryFolderEntry) -> Void
     var openInNewTab: (LibraryFolderEntry) -> Void
+    /// Nil for a folder that cannot be renamed.
+    var rename: ((LibraryFolderEntry) -> Void)? = nil
     var reveal: (LibraryFolderEntry) -> Void
+    var summaries: FolderSummaryService? = nil
+    var imageCountText: (Int) -> String = { "\($0)" }
 
     func makeNSView(context: Context) -> NativeFolderGridView { NativeFolderGridView() }
     func updateNSView(_ view: NativeFolderGridView, context: Context) { view.configure(self) }
@@ -125,6 +164,14 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
     private var tracking: NSTrackingArea?
     private var tagTask: Task<Void, Never>?
     nonisolated(unsafe) private var focusMonitor: Any?
+    private var summariesByID: [String: FolderImageSummary] = [:]
+    private var summaryRequestedIDs: Set<String> = []
+    private var covers: [String: NSImage] = [:]
+    private var coverRequests: [String: ImageCacheRequest] = [:]
+    private var coverRequestedIDs: Set<String> = []
+    /// Covers that arrived after their tile was drawn fade in from the placeholder.
+    private var coverFadeStarts: [String: CFTimeInterval] = [:]
+    private var coverFadeScheduled = false
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -140,11 +187,12 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
 
     func configure(_ next: NativeFolderGrid) {
         let foldersChanged = configuration?.folders != next.folders
-        if foldersChanged || configuration?.availableWidth != next.availableWidth { textLines.removeAll(keepingCapacity: true) }
+        if foldersChanged || configuration?.availableWidth != next.availableWidth
+            || configuration?.columnGuide != next.columnGuide { textLines.removeAll(keepingCapacity: true) }
         let selectedChanged = configuration?.selectedFolderID != next.selectedFolderID
         configuration = next
         placement = FolderGridPlacement(count: next.folders.count, width: next.availableWidth,
-                                        showsRelativePath: next.showsRelativePath)
+                                        showsRelativePath: next.showsRelativePath, columnGuide: next.columnGuide)
         if foldersChanged {
             // URL-derived identity and labels are invariant between content
             // updates; resolving them for every draw dominated tab-switch work.
@@ -160,6 +208,7 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
             hoveredIndex = nil
             if let focusedID, indicesByID[focusedID] == nil { self.focusedID = nil }
             loadTags(next.folders)
+            resetSummaries(for: next)
             NSAccessibility.post(element: self, notification: .layoutChanged)
         }
         if selectedChanged, let id = next.selectedFolderID { focus(id: id) }
@@ -170,6 +219,59 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
         tagTask?.cancel()
         tagTask = nil
         stopFocusMonitor()
+        coverRequests.values.forEach { $0.cancel() }
+        coverRequests.removeAll()
+    }
+
+    /// Keeps covers for folders still listed, starts from the service's last
+    /// known summaries, and re-checks these folders against disk lazily.
+    private func resetSummaries(for next: NativeFolderGrid) {
+        let ids = Set(displayFolders.map(\.id))
+        for (id, request) in coverRequests where !ids.contains(id) { request.cancel() }
+        coverRequests = coverRequests.filter { ids.contains($0.key) }
+        covers = covers.filter { ids.contains($0.key) }
+        coverRequestedIDs = coverRequestedIDs.intersection(covers.keys)
+        summaryRequestedIDs = []
+        summariesByID = [:]
+        for folder in next.folders {
+            if let known = next.summaries?.summary(for: folder.url) { summariesByID[folder.id] = known }
+        }
+        next.summaries?.reset(keeping: next.folders.map(\.url))
+    }
+
+    /// Requests summaries and covers for folders drawn on screen. Called after
+    /// drawing, never during it.
+    private func loadVisible(summaryIndices: [Int], coverIndices: [Int]) {
+        guard let configuration else { return }
+        if let service = configuration.summaries, !summaryIndices.isEmpty {
+            let folders = summaryIndices.map { configuration.folders[$0] }
+            service.request(folders.map(\.url)) { [weak self] url, summary in
+                guard let self, let id = folders.first(where: { $0.url == url })?.id,
+                      let index = self.indicesByID[id] else { return }
+                let coverChanged = self.summariesByID[id]?.coverURL != summary.coverURL
+                self.summariesByID[id] = summary
+                if coverChanged {
+                    self.coverRequests.removeValue(forKey: id)?.cancel()
+                    self.covers.removeValue(forKey: id)
+                    self.coverRequestedIDs.remove(id)
+                }
+                self.setNeedsDisplay(self.placement.frame(at: index))
+            }
+        }
+        for index in coverIndices {
+            let id = displayFolders[index].id
+            guard let coverURL = summariesByID[id]?.coverURL else { continue }
+            coverRequests[id] = ImageCache.shared.image(for: coverURL, quality: .thumbnailFast, priority: .low) { [weak self] image in
+                guard let self, self.summariesByID[id]?.coverURL == coverURL else { return }
+                self.coverRequests.removeValue(forKey: id)
+                guard let image, let index = self.indicesByID[id] else { return }
+                self.covers[id] = Self.tileCover(image, scale: self.window?.backingScaleFactor ?? 2) ?? image
+                if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    self.coverFadeStarts[id] = CACurrentMediaTime()
+                }
+                self.setNeedsDisplay(self.placement.frame(at: index))
+            }
+        }
     }
 
     private func loadTags(_ folders: [LibraryFolderEntry]) {
@@ -199,53 +301,60 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let configuration else { return }
+        var missingSummaries: [Int] = []
+        var missingCovers: [Int] = []
+        let primary = NSColor(LightboxColorTokens.primaryText)
         for index in placement.indices(intersecting: dirtyRect) {
             let folder = displayFolders[index]
             let rect = placement.frame(at: index)
             let tags = folder.colorTags
             let selected = configuration.selectedFolderID == folder.id
             let focused = focusedID == folder.id && window?.firstResponder === self
-            let shape = NSBezierPath(roundedRect: rect, xRadius: LightboxControlMetrics.cornerRadius,
-                                     yRadius: LightboxControlMetrics.cornerRadius)
-            if selected || hoveredIndex == index {
-                (selected ? NSColor(LightboxColorTokens.navigationSelection)
-                    : NSColor(LightboxColorTokens.primaryText).withAlphaComponent(LightboxControlMetrics.hoverOpacity)).setFill()
-                shape.fill()
+            let summary = summariesByID[folder.id]
+            if !summaryRequestedIDs.contains(folder.id) {
+                summaryRequestedIDs.insert(folder.id)
+                missingSummaries.append(index)
             }
+            if summary?.coverURL != nil, covers[folder.id] == nil, !coverRequestedIDs.contains(folder.id) {
+                coverRequestedIDs.insert(folder.id)
+                missingCovers.append(index)
+            }
+
+            // Tile: a faint resting fill makes each folder a clear target even
+            // when only a few sit in a wide row.
+            let radius = RadiusTokens.card
+            let shape = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+            (selected ? NSColor(LightboxColorTokens.navigationSelection)
+                : primary.withAlphaComponent(hoveredIndex == index
+                    ? FolderGridPlacement.hoverFillOpacity : FolderGridPlacement.restFillOpacity)).setFill()
+            shape.fill()
             if focused && !selected {
-                let inset: CGFloat = 0.5
-                let ring = NSBezierPath(roundedRect: rect.insetBy(dx: inset, dy: inset),
-                    xRadius: LightboxControlMetrics.cornerRadius, yRadius: LightboxControlMetrics.cornerRadius)
+                let ring = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
                 ring.lineWidth = 1
                 // A quiet ring: the grid takes focus on any gallery click, so
                 // the marker must not read heavier than selection.
                 NSColor(LightboxColorTokens.secondaryText).withAlphaComponent(0.45).setStroke()
                 ring.stroke()
             }
-            let iconKey = tags.first?.name ?? ""
-            if icons[iconKey] == nil {
-                let color = NSColor(tags.first?.color ?? LightboxColorTokens.glyph)
-                icons[iconKey] = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)?
-                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-                        .applying(.init(hierarchicalColor: color)))
-            }
-            let icon = icons[iconKey]
-            let iconSize = icon?.size ?? CGSize(width: 17, height: 15)
-            icon?.draw(in: CGRect(x: rect.minX + 8, y: rect.midY - iconSize.height / 2,
-                                 width: iconSize.width, height: iconSize.height),
-                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+
+            let thumbRect = thumbnailRect(in: rect)
+            drawThumbnail(in: thumbRect, cover: covers[folder.id], coverAlpha: coverAlpha(folder.id), tag: tags.first)
+
             let dot = MacTagDotMetrics.folderCardDotDiameter
             let gap = MacTagDotMetrics.sidebarSpacing
             let count = min(3, tags.count)
             let dotsWidth = CGFloat(count) * dot + CGFloat(max(0, count - 1)) * gap
-            let textX = rect.minX + 8 + iconSize.width + 8
+            let textX = thumbRect.maxX + FolderGridPlacement.iconTextGap
             let textWidth = max(0, rect.maxX - 8 - 4 - (count == 0 ? 0 : max(30, dotsWidth)) - textX)
-            let subtitle = configuration.showsRelativePath && !folder.relativePath.isEmpty && folder.relativePath != folder.name
-            drawText(folder.name, size: 12, weight: .semibold, color: NSColor(LightboxColorTokens.primaryText),
-                     rect: CGRect(x: textX, y: rect.midY - (subtitle ? 14 : 7.5), width: textWidth, height: 15))
-            if subtitle {
-                drawText(folder.relativePath, size: 10, weight: .medium, color: NSColor(LightboxColorTokens.mutedText),
-                         rect: CGRect(x: textX, y: rect.midY + 3, width: textWidth, height: 13))
+            let countText = summary.flatMap { $0.imageCount > 0 ? configuration.imageCountText($0.imageCount) : nil }
+            let path = configuration.showsRelativePath && !folder.relativePath.isEmpty && folder.relativePath != folder.name
+                ? folder.relativePath : nil
+            let subtitle = [path, countText].compactMap { $0 }.joined(separator: " · ")
+            drawText(folder.name, size: 12, weight: .semibold, color: primary,
+                     rect: CGRect(x: textX, y: rect.midY - (subtitle.isEmpty ? 7.5 : 15), width: textWidth, height: 15))
+            if !subtitle.isEmpty {
+                drawText(subtitle, size: 10.5, weight: .medium, color: NSColor(LightboxColorTokens.mutedText),
+                         rect: CGRect(x: textX, y: rect.midY + 2, width: textWidth, height: 13))
             }
             for (offset, tag) in tags.prefix(3).enumerated() {
                 let dotRect = CGRect(x: rect.maxX - 8 - dotsWidth + CGFloat(offset) * (dot + gap),
@@ -265,6 +374,109 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
                 circle.stroke()
             }
         }
+        scheduleCoverFadeFrameIfNeeded()
+        if !missingSummaries.isEmpty || !missingCovers.isEmpty {
+            DispatchQueue.main.async { [weak self] in
+                self?.loadVisible(summaryIndices: missingSummaries, coverIndices: missingCovers)
+            }
+        }
+    }
+
+    private func thumbnailRect(in tile: CGRect) -> CGRect {
+        let size = FolderGridPlacement.thumbnailSize
+        return CGRect(x: tile.minX + FolderGridPlacement.contentInset, y: tile.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    /// Ease-out opacity for a cover that is fading in; 1 once settled.
+    private func coverAlpha(_ id: String) -> CGFloat {
+        guard let start = coverFadeStarts[id] else { return 1 }
+        let progress = min(1, (CACurrentMediaTime() - start) / MotionTokens.chromeRevealDurationSeconds)
+        if progress >= 1 { coverFadeStarts.removeValue(forKey: id) }
+        return CGFloat(1 - (1 - progress) * (1 - progress))
+    }
+
+    /// Redraws fading tiles on the next frame until every fade has settled.
+    private func scheduleCoverFadeFrameIfNeeded() {
+        guard !coverFadeStarts.isEmpty, !coverFadeScheduled else { return }
+        coverFadeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60) { [weak self] in
+            guard let self else { return }
+            self.coverFadeScheduled = false
+            for id in self.coverFadeStarts.keys {
+                guard let index = self.indicesByID[id] else {
+                    self.coverFadeStarts.removeValue(forKey: id)
+                    continue
+                }
+                self.setNeedsDisplay(self.thumbnailRect(in: self.placement.frame(at: index)))
+            }
+        }
+    }
+
+    /// The cover, aspect-filled and clipped; before it loads (or for folders
+    /// without images) a folder symbol in the folder's tag color. A fading
+    /// cover is drawn over the placeholder.
+    /// `image` cropped to fill a cover thumbnail, at the screen's density:
+    /// scaling the decoded thumbnail (up to 360 px) at high quality on every
+    /// redraw of every tile was most of the grid's drawing time.
+    static func tileCover(_ image: NSImage, scale: CGFloat) -> NSImage? {
+        let size = FolderGridPlacement.thumbnailSize
+        guard image.size.width > 0, image.size.height > 0,
+              let source = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let pixelWidth = Int((size.width * scale).rounded()), pixelHeight = Int((size.height * scale).rounded())
+        guard let context = CGContext(data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let fill = max(CGFloat(pixelWidth) / CGFloat(source.width), CGFloat(pixelHeight) / CGFloat(source.height))
+        let drawn = CGSize(width: CGFloat(source.width) * fill, height: CGFloat(source.height) * fill)
+        context.interpolationQuality = .high
+        context.draw(source, in: CGRect(x: (CGFloat(pixelWidth) - drawn.width) / 2, y: (CGFloat(pixelHeight) - drawn.height) / 2,
+                                        width: drawn.width, height: drawn.height))
+        guard let tile = context.makeImage() else { return nil }
+        return NSImage(cgImage: tile, size: size)
+    }
+
+    private func drawThumbnail(in rect: CGRect, cover: NSImage?, coverAlpha: CGFloat = 1, tag: MacColorTag?) {
+        let radius = FolderGridPlacement.thumbnailRadius
+        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        let primary = NSColor(LightboxColorTokens.primaryText)
+        if cover == nil || coverAlpha < 1 {
+            drawPlaceholder(in: rect, path: path, tag: tag)
+        }
+        if let cover, cover.size.width > 0, cover.size.height > 0 {
+            let scale = max(rect.width / cover.size.width, rect.height / cover.size.height)
+            let size = CGSize(width: cover.size.width * scale, height: cover.size.height * scale)
+            NSGraphicsContext.saveGraphicsState()
+            path.addClip()
+            cover.draw(in: CGRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2,
+                                  width: size.width, height: size.height),
+                       from: .zero, operation: .sourceOver, fraction: coverAlpha, respectFlipped: true,
+                       hints: [.interpolation: NSImageInterpolation.high.rawValue])
+            NSGraphicsContext.restoreGraphicsState()
+            let edge = NSBezierPath(roundedRect: rect.insetBy(dx: 0.25, dy: 0.25), xRadius: radius, yRadius: radius)
+            edge.lineWidth = 0.5
+            primary.withAlphaComponent(0.10 * coverAlpha).setStroke()
+            edge.stroke()
+        }
+    }
+
+    private func drawPlaceholder(in rect: CGRect, path: NSBezierPath, tag: MacColorTag?) {
+        NSColor(LightboxColorTokens.primaryText).withAlphaComponent(0.06).setFill()
+        path.fill()
+        guard let icon = folderIcon(tag: tag) else { return }
+        icon.draw(in: CGRect(x: rect.midX - icon.size.width / 2, y: rect.midY - icon.size.height / 2,
+                             width: icon.size.width, height: icon.size.height),
+                  from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+
+    private func folderIcon(tag: MacColorTag?) -> NSImage? {
+        let key = tag?.name ?? ""
+        if icons[key] == nil {
+            let color = NSColor(tag?.color ?? LightboxColorTokens.glyph)
+            icons[key] = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(FolderGridPlacement.iconConfiguration.applying(.init(hierarchicalColor: color)))
+        }
+        return icons[key]
     }
 
     private func drawText(_ value: String, size: CGFloat, weight: NSFont.Weight, color: NSColor, rect: CGRect) {
@@ -342,12 +554,16 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
             let point = convert(next.locationInWindow, from: nil)
             if next.type == .leftMouseDragged, hypot(point.x - start.x, point.y - start.y) > 4 {
                 let item = NSDraggingItem(pasteboardWriter: folder.url as NSURL)
-                let tag = MacColorTag.all.first { (tagsByID[folder.id] ?? folder.tags).contains($0.name) }?.name ?? ""
-                let rect = placement.frame(at: index)
-                let icon = icons[tag]
-                let size = icon?.size ?? CGSize(width: 17, height: 15)
-                item.setDraggingFrame(CGRect(x: rect.minX + 8, y: rect.midY - size.height / 2,
-                    width: size.width, height: size.height), contents: icon)
+                let tag = MacColorTag.all.first { (tagsByID[folder.id] ?? folder.tags).contains($0.name) }
+                let thumb = thumbnailRect(in: placement.frame(at: index))
+                if let cover = covers[folder.id] {
+                    item.setDraggingFrame(thumb, contents: cover)
+                } else {
+                    let icon = folderIcon(tag: tag)
+                    let size = icon?.size ?? CGSize(width: 17, height: 15)
+                    item.setDraggingFrame(CGRect(x: thumb.midX - size.width / 2, y: thumb.midY - size.height / 2,
+                        width: size.width, height: size.height), contents: icon)
+                }
                 beginDraggingSession(with: [item], event: next, source: self)
                 return
             }
@@ -368,8 +584,10 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
         guard let configuration, let index = indicesByID[id] else { return }
         menuFolderID = id
         let menu = NSMenu()
-        for (title, action) in [(configuration.openInNewTabTitle, #selector(openMenuFolder)),
-                                (configuration.showInFinderTitle, #selector(revealMenuFolder))] {
+        var items = [(configuration.openInNewTabTitle, #selector(openMenuFolder))]
+        if configuration.rename != nil { items.append((configuration.renameTitle, #selector(renameMenuFolder))) }
+        items.append((configuration.showInFinderTitle, #selector(revealMenuFolder)))
+        for (title, action) in items {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
             menu.addItem(item)
@@ -380,6 +598,10 @@ final class NativeFolderGridView: NSView, NSDraggingSource {
     @objc private func openMenuFolder() {
         guard let id = menuFolderID, let index = indicesByID[id], let configuration else { return }
         configuration.openInNewTab(configuration.folders[index])
+    }
+    @objc private func renameMenuFolder() {
+        guard let id = menuFolderID, let index = indicesByID[id], let configuration else { return }
+        configuration.rename?(configuration.folders[index])
     }
     @objc private func revealMenuFolder() {
         guard let id = menuFolderID, let index = indicesByID[id], let configuration else { return }

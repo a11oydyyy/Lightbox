@@ -6,12 +6,14 @@ APP_NAME="LightboxNative"
 APP_BUNDLE_NAME="Lightbox"
 BUNDLE_ID="io.github.a11oydyyy.Lightbox"
 MIN_SYSTEM_VERSION="15.0"
-VERSION="2.0.9"
-BUILD_NUMBER="123"
+VERSION="2.4.2"
+BUILD_NUMBER="133"
 BUILD_ARCH_ARGS=()
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/script/build_toolchain.sh"
+# Record the source before building, so the app names what it was built from.
+while IFS='=' read -r key value; do export "$key=$value"; done < <("$ROOT_DIR/script/build_provenance.sh")
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_BUNDLE_NAME.app"
 INSTALL_APP_BUNDLE="/Applications/$APP_BUNDLE_NAME.app"
@@ -92,6 +94,14 @@ build_bundle() {
   <string>$VERSION</string>
   <key>CFBundleVersion</key>
   <string>$BUILD_NUMBER</string>
+  <key>LightboxGitCommit</key>
+  <string>$LIGHTBOX_GIT_COMMIT</string>
+  <key>LightboxGitDirty</key>
+  <$LIGHTBOX_GIT_DIRTY/>
+  <key>LightboxSourceDigest</key>
+  <string>$LIGHTBOX_SOURCE_DIGEST</string>
+  <key>LightboxBuildDate</key>
+  <string>$LIGHTBOX_BUILD_DATE</string>
   <key>CFBundleName</key>
   <string>Lightbox</string>
   <key>CFBundleIconFile</key>
@@ -108,16 +118,6 @@ build_bundle() {
   <string>NSApplication</string>
   <key>UTExportedTypeDeclarations</key>
   <array>
-    <dict>
-      <key>UTTypeIdentifier</key>
-      <string>io.github.a11oydyyy.lightbox.plugin-package</string>
-      <key>UTTypeDescription</key>
-      <string>Lightbox Plugin</string>
-      <key>UTTypeConformsTo</key>
-      <array><string>com.apple.package</string></array>
-      <key>UTTypeTagSpecification</key>
-      <dict><key>public.filename-extension</key><array><string>lightboxplugin</string></array></dict>
-    </dict>
     <dict>
       <key>UTTypeConformsTo</key>
       <array>
@@ -179,10 +179,16 @@ open_app() {
 }
 
 package_app() {
+  python3 "$ROOT_DIR/script/check_release_privacy.py" identity
   build_bundle release false
+  # 移除 Mach-O 除錯符號中的物件檔路徑；必須在簽署之前完成。
+  /usr/bin/strip -S "$APP_BINARY"
+  python3 "$ROOT_DIR/script/check_release_privacy.py" bundle "$APP_BUNDLE"
   sign_app_bundle "$APP_BUNDLE"
   rm -f "$PACKAGE_ZIP"
   (cd "$DIST_DIR" && /usr/bin/ditto -c -k --norsrc --keepParent "$APP_BUNDLE_NAME.app" "$PACKAGE_ZIP")
+  python3 "$ROOT_DIR/script/check_release_privacy.py" archive "$PACKAGE_ZIP"
+  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$PACKAGE_ZIP")" > "$(basename "$PACKAGE_ZIP").sha256")
   rm -rf "$APP_BUNDLE"
   echo "$PACKAGE_ZIP"
 }

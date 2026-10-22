@@ -12,7 +12,8 @@ enum FileTransferService {
         var successes: [FileTransferSuccess] = []
         var failures: [FileTransferFailure] = []
         var wasCancelled = false
-        let sourceURLs = deduplicatedURLs(request.sourceURLs)
+        // A RAW's `.xmp` sidecars go with it (`RawSidecar`), also when selected with it.
+        let sourceURLs = RawSidecar.withoutCompanions(deduplicatedURLs(request.sourceURLs))
 
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: destinationFolder.path, isDirectory: &isDirectory),
@@ -55,11 +56,18 @@ enum FileTransferService {
             }
 
             do {
+                let sidecars = RawSidecar.existing(for: source)
+                func sidecarDestinations(for destination: URL) -> [URL] {
+                    sidecars.map { destination.deletingLastPathComponent().appendingPathComponent(
+                        RawSidecar.name(of: $0, for: source, whenNamed: destination.lastPathComponent)) }
+                }
+                // A name free for the sidecars too, so they keep matching the RAW.
                 let preferredDestination = try availableDestinationURL(
                     for: source,
                     in: destinationFolder,
                     operation: request.operation,
-                    shouldCancel: shouldCancel
+                    shouldCancel: shouldCancel,
+                    alsoFree: sidecarDestinations
                 )
                 let outcome = try transferItem(
                     from: source,
@@ -78,6 +86,18 @@ enum FileTransferService {
                     )
                 } else {
                     successes.append(FileTransferSuccess(sourceURL: source, destinationURL: outcome.destinationURL))
+                    // Not counted as items of their own; only a sidecar left behind is reported.
+                    for (sidecar, destination) in zip(sidecars, sidecarDestinations(for: outcome.destinationURL)) {
+                        let sidecarOutcome = try? transferItem(from: sidecar, to: destination, operation: request.operation,
+                                                               fileManager: fileManager, shouldCancel: { false })
+                        if sidecarOutcome?.destinationURL != destination || sidecarOutcome?.failureMessage != nil {
+                            failures.append(FileTransferFailure(
+                                sourceURL: sidecar,
+                                message: "The photo was transferred, but its develop settings (.xmp) were not",
+                                committedDestinationURL: sidecarOutcome?.destinationURL
+                            ))
+                        }
+                    }
                 }
             } catch is CancellationError {
                 wasCancelled = true
@@ -262,7 +282,8 @@ enum FileTransferService {
         for sourceURL: URL,
         in destinationFolderURL: URL,
         operation: FileTransferOperation,
-        shouldCancel: @Sendable () -> Bool = { Task.isCancelled }
+        shouldCancel: @Sendable () -> Bool = { Task.isCancelled },
+        alsoFree: (URL) -> [URL] = { _ in [] }
     ) throws -> URL {
         guard !shouldCancel() else { throw CancellationError() }
         let source = sourceURL.standardizedFileURL
@@ -271,7 +292,10 @@ enum FileTransferService {
             source.lastPathComponent,
             isDirectory: source.hasDirectoryPath
         )
-        if try !destinationEntryExists(at: directDestination) {
+        func isFree(_ candidate: URL) throws -> Bool {
+            try !destinationEntryExists(at: candidate) && alsoFree(candidate).allSatisfy { try !destinationEntryExists(at: $0) }
+        }
+        if try isFree(directDestination) {
             return directDestination
         }
 
@@ -290,7 +314,7 @@ enum FileTransferService {
                 filename,
                 isDirectory: source.hasDirectoryPath
             )
-            if try !destinationEntryExists(at: candidate) {
+            if try isFree(candidate) {
                 return candidate
             }
             suffix = operation == .copy ? " copy \(index)" : " \(index + 1)"

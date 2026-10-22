@@ -2,11 +2,12 @@ import SwiftUI
 
 struct PreviewControls: View {
     @EnvironmentObject private var appState: AppState
-    @ObservedObject private var plugins = LightboxPluginHost.shared
     var asset: LightboxAsset
     @LightboxViewState private var metadata: PreviewMetadata?
     @LightboxViewState private var metadataID = ""
     @Binding var showsInfo: Bool
+    /// Shows the image at 100%; nil for files without full pixels to show.
+    var onZoom: (() -> Void)? = nil
 
     private var loadID: String { "\(asset.id)|\(asset.contentModifiedAt?.timeIntervalSince1970 ?? 0)|\(asset.fileSize ?? 0)" }
     private var details: PreviewMetadata? { metadataID == loadID ? metadata : nil }
@@ -34,17 +35,16 @@ struct PreviewControls: View {
                 .help(localized("Image information"))
                 .accessibilityLabel(localized("Image information"))
                 .popover(isPresented: $showsInfo, arrowEdge: .bottom) { informationPanel }
-                ForEach(plugins.plugins) { plugin in
-                    Button {
-                        plugins.open(plugin, images: [asset.sourceURL].compactMap { $0 })
-                    } label: {
-                        Image(systemName: plugin.manifest.symbol ?? "puzzlepiece.extension")
+                if let onZoom {
+                    Button(action: onZoom) {
+                        Image(systemName: "plus.magnifyingglass")
+                            .font(.system(size: LightboxControlMetrics.iconSize, weight: .medium))
                             .frame(width: LightboxControlMetrics.iconButtonSize, height: LightboxControlMetrics.iconButtonSize)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(LightboxButtonHoverStyle(shape: RoundedRectangle(cornerRadius: LightboxControlMetrics.cornerRadius)))
-                    .help(plugin.manifest.name)
-                    .accessibilityLabel(plugin.manifest.name)
-                    .disabled(asset.sourceURL == nil)
+                    .help(CullText(appState.appLanguage).zoomButton)
+                    .accessibilityLabel(CullText(appState.appLanguage).zoomButton)
                 }
             }
             if let camera = details?.capture.first(where: { $0.label == "Camera" })?.value {
@@ -67,6 +67,12 @@ struct PreviewControls: View {
                     .foregroundStyle(LightboxColorTokens.secondaryText)
                     .lineLimit(1)
             }
+            if details?.hasCameraRawSettings == true {
+                Label(localized("Edited in Camera Raw"), systemImage: "slider.horizontal.3")
+                    .font(.system(size: 11))
+                    .foregroundStyle(LightboxColorTokens.secondaryText)
+                    .lineLimit(1)
+            }
 
             if !colorTags.isEmpty {
                 HStack(spacing: MacTagDotMetrics.previewInfoSpacing) {
@@ -86,6 +92,14 @@ struct PreviewControls: View {
                 }
                 .padding(.top, 1)
             }
+
+            if asset.isImage, asset.sourceURL != nil, !asset.isDeleted {
+                Text(CullText(appState.appLanguage).keysHint)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(LightboxColorTokens.mutedText.opacity(0.8))
+                    .lineLimit(1)
+                    .padding(.top, 4)
+            }
         }
         .frame(minWidth: 188, maxWidth: 560, alignment: .center)
         .padding(.horizontal, 22)
@@ -104,12 +118,7 @@ struct PreviewControls: View {
         }
     }
 
-    private var summary: String {
-        var values = [dimensionsText]
-        if let ext = asset.sourceURL?.pathExtension, !ext.isEmpty { values.append(ext.uppercased()) }
-        if let size = asset.fileSize { values.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) }
-        return values.joined(separator: " · ")
-    }
+    private var summary: String { asset.fileSummaryText }
 
     private var informationPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -145,7 +154,7 @@ struct PreviewControls: View {
             ForEach(entries) { entry in
                 HStack(alignment: .top, spacing: 12) {
                     Text(localized(entry.label)).foregroundStyle(LightboxColorTokens.secondaryText).frame(width: 92, alignment: .leading)
-                    Text(entry.value).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(localized(entry.value)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .font(.system(size: 12))
                 .fixedSize(horizontal: false, vertical: true)
@@ -168,6 +177,8 @@ struct PreviewControls: View {
             "Created": ("创建时间", "作成日時", "建立時間"), "Modified": ("修改时间", "変更日時", "修改時間"),
             "Path": ("完整路径", "パス", "完整路徑"), "Dimensions": ("像素尺寸", "ピクセル寸法", "像素尺寸"),
             "Megapixels": ("像素总量", "画素数", "像素總量"), "Tags": ("标签", "タグ", "標籤"),
+            "Has develop settings": ("已调整", "現像設定あり", "已調整"),
+            "Edited in Camera Raw": ("已在 Camera Raw 中调整", "Camera Raw で調整済み", "已在 Camera Raw 中調整"),
             "No embedded image metadata available": ("未读取到内嵌图像元数据", "埋め込み画像メタデータを取得できません", "未讀取到內嵌圖像中繼資料")
         ]
         guard let value = labels[key] else { return key }
@@ -179,11 +190,21 @@ struct PreviewControls: View {
         }
     }
 
-    private var dimensionsText: String {
-        "\(formattedDimension(asset.width)) × \(formattedDimension(asset.height)) px"
+    private var dimensionsText: String { asset.dimensionsText }
+}
+
+extension LightboxAsset {
+    /// "6,000 × 4,000 px", as the preview and comparison show it.
+    var dimensionsText: String {
+        func formatted(_ value: CGFloat) -> String { Int(value).formatted(.number.grouping(.automatic)) }
+        return "\(formatted(width)) × \(formatted(height)) px"
     }
 
-    private func formattedDimension(_ value: CGFloat) -> String {
-        Int(value).formatted(.number.grouping(.automatic))
+    /// "6,000 × 4,000 px · JPG · 10.4 MB".
+    var fileSummaryText: String {
+        var values = [dimensionsText]
+        if let ext = sourceURL?.pathExtension, !ext.isEmpty { values.append(ext.uppercased()) }
+        if let fileSize { values.append(ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)) }
+        return values.joined(separator: " · ")
     }
 }

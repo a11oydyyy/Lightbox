@@ -13,6 +13,9 @@ final class DirectoryChangeMonitor: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "Lightbox.DirectoryChangeMonitor", qos: .utility)
     private var source: DispatchSourceFileSystemObject?
+    /// 遞迴監看一律回報圖片與 XMP 變動；其餘檔案依畫廊設定。
+    /// 此值須在 `start` 前設定。
+    var includesOtherFiles = false
 
     init(url: URL, recursive: Bool = false, openDirectory: @escaping @Sendable (URL) -> Int32 = { open($0.path, O_EVTONLY) }) {
         self.url = url
@@ -107,10 +110,13 @@ final class DirectoryChangeMonitor: @unchecked Sendable {
     private final class CallbackBox: @unchecked Sendable {
         let action: @MainActor @Sendable () -> Void
         let invalidated: @MainActor @Sendable () -> Void
+        let includesOtherFiles: Bool
         init(_ action: @escaping @MainActor @Sendable () -> Void,
-             invalidated: @escaping @MainActor @Sendable () -> Void) {
+             invalidated: @escaping @MainActor @Sendable () -> Void,
+             includesOtherFiles: Bool) {
             self.action = action
             self.invalidated = invalidated
+            self.includesOtherFiles = includesOtherFiles
         }
     }
 
@@ -119,7 +125,7 @@ final class DirectoryChangeMonitor: @unchecked Sendable {
         let box = CallbackBox({ [weak self] in
             guard self?.isCurrent(generation) == true else { return }
             onChange()
-        }, invalidated: { invalidate(true) })
+        }, invalidated: { invalidate(true) }, includesOtherFiles: includesOtherFiles)
         defer { withExtendedLifetime(box) {} }
         var context = FSEventStreamContext(version: 0,
             info: Unmanaged.passUnretained(box).toOpaque(),
@@ -135,6 +141,7 @@ final class DirectoryChangeMonitor: @unchecked Sendable {
         guard let stream = FSEventStreamCreate(nil, { _, info, count, paths, flags, _ in
             guard let info else { return }
             let changedPaths = Unmanaged<CFArray>.fromOpaque(paths).takeUnretainedValue() as! [String]
+            let includesOtherFiles = Unmanaged<CallbackBox>.fromOpaque(info).takeUnretainedValue().includesOtherFiles
             let needsRefresh = (0..<count).contains { index in
                 let flag = flags[index]
                 let rescanFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged)
@@ -143,7 +150,10 @@ final class DirectoryChangeMonitor: @unchecked Sendable {
                 if flag & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0 {
                     return flag & directoryChanges != 0
                 }
-                return LocalImageSource.isSupportedImageURL(URL(fileURLWithPath: changedPaths[index]))
+                let url = URL(fileURLWithPath: changedPaths[index])
+                // 隱藏的 XMP 仍影響 RAW 的調整標記與篩選結果。
+                return url.pathExtension.lowercased() == "xmp"
+                    || LocalImageSource.isListedFileURL(url, includesOtherFiles: includesOtherFiles)
             }
             guard needsRefresh else { return }
             let box = Unmanaged<CallbackBox>.fromOpaque(info).takeUnretainedValue()

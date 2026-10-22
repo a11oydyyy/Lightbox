@@ -9,7 +9,7 @@ import Testing
         #expect(last.maxX <= width + 0.01 && last.maxY == grid.height)
         #expect(grid.index(at: CGPoint(x: last.midX, y: last.midY)) == 448)
         #expect(grid.indices(intersecting: last).contains(448))
-        #expect(grid.index(at: CGPoint(x: 1, y: 37)) == nil)
+        #expect(grid.index(at: CGPoint(x: 1, y: grid.rowHeight + 1)) == nil)
         #expect(grid.neighbor(of: 0, key: 123) == nil)
         #expect(grid.neighbor(of: 448, key: 124) == nil)
         #expect(grid.neighbor(of: 448, key: 125) == nil)
@@ -96,4 +96,45 @@ import Testing
     #expect(view.focusedID == model.folders[447].id)
     try press(53)
     #expect(cleared && view.focusedID == nil)
+}
+
+@MainActor
+@Test func folderCellsSpanWholeImageColumns() {
+    for (count, width) in [(5, CGFloat(223)), (9, 110), (3, 380), (2, 150)] {
+        let spacing: CGFloat = 12
+        let guide = FolderColumnGuide(count: count, width: width, spacing: spacing)
+        let usedWidth = CGFloat(count) * width + CGFloat(count - 1) * spacing
+        let grid = FolderGridPlacement(count: 40, width: usedWidth, showsRelativePath: false, columnGuide: guide)
+        // Every image column line, left and right edges.
+        let edges = Set((0..<count).flatMap { column -> [CGFloat] in
+            let x = CGFloat(column) * (width + spacing)
+            return [x, x + width]
+        })
+        for index in 0..<grid.columns {
+            let frame = grid.frame(at: index)
+            #expect(edges.contains(frame.minX) && edges.contains(frame.maxX), "count=\(count) width=\(width)")
+            #expect(frame.maxX <= usedWidth + 0.01)
+        }
+        #expect(grid.cellWidth >= FolderGridPlacement.minimumCellWidth || grid.columns == 1)
+    }
+}
+
+// Covers are cropped to the tile once, at the screen's density, so redraws
+// only copy pixels; both orientations fill the tile edge to edge.
+@MainActor
+@Test func folderCoversAreRenderedOnceAtTileSize() throws {
+    for (width, height) in [(360, 240), (240, 360)] {
+        let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
+            NSColor.systemRed.setFill(); rect.fill(); return true
+        }
+        let tile = try #require(NativeFolderGridView.tileCover(image, scale: 2))
+        #expect(tile.size == FolderGridPlacement.thumbnailSize)
+        let bitmap = try #require(tile.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        #expect(bitmap.width == Int(FolderGridPlacement.thumbnailSize.width * 2))
+        #expect(bitmap.height == Int(FolderGridPlacement.thumbnailSize.height * 2))
+        let rep = NSBitmapImageRep(cgImage: bitmap)
+        for (x, y) in [(0, 0), (bitmap.width - 1, bitmap.height - 1)] {
+            #expect((rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.99)
+        }
+    }
 }

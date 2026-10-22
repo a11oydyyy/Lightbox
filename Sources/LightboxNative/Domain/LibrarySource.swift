@@ -91,7 +91,7 @@ enum LibraryFolderEntrySorter {
             switch field {
             case .tag:
                 compareTag(lhs, rhs, direction: direction) ?? tieBreak(lhs, rhs, direction: direction)
-            case .time, .size, .fileName, .type:
+            case .time, .size, .fileName, .type, .dimensions:
                 tieBreak(lhs, rhs, direction: direction)
             }
         }

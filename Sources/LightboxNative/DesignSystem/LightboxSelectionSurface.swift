@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum LightboxSelectionTokens {
-    /// Graphite needs a wider step than hover (6%) to read as selected.
+    /// Graphite needs a wider step than hover (8%) to read as selected.
     static let controlFillOpacity: Double = 0.14
     static let hoverFillOpacity = LightboxControlMetrics.hoverOpacity
     static let dropFillOpacity: Double = 0.14

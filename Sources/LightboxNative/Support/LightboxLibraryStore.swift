@@ -2,12 +2,28 @@ import Darwin
 import Foundation
 import OSLog
 
+/// Finder 的「放回原處」不提供結果路徑；這種結果不能猜測重做目標。
+enum TrashRestoreResult: Sendable {
+    case restored(URL)
+    case restoredByFinder
+    case failed
+
+    var succeeded: Bool {
+        if case .failed = self { return false }
+        return true
+    }
+}
+
 enum LightboxLibraryStore {
     private static let logger = Logger(subsystem: "io.github.a11oydyyy.Lightbox", category: "LibraryStore")
     private static let trashRestoreDestinationsKey = "Lightbox.trashRestoreDestinations"
 
     static var cacheFolder: URL {
-        FileManager.default
+        // Measurements and tests point this elsewhere, away from the app's own cache.
+        if let override = ProcessInfo.processInfo.environment["LIGHTBOX_CACHE_FOLDER"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(
                 LightboxRuntime.cacheDirectoryName(for: Bundle.main.bundleIdentifier),
@@ -45,10 +61,11 @@ enum LightboxLibraryStore {
         cacheFolder.appendingPathComponent("Lightbox.sqlite", isDirectory: false)
     }
 
-    static func moveToSystemTrash(_ sourceURL: URL) -> Bool {
+    /// Where the item landed in the Trash, or nil when it was not moved.
+    static func moveToSystemTrash(_ sourceURL: URL) -> URL? {
         let source = sourceURL.standardizedFileURL
         guard FileManager.default.fileExists(atPath: source.path) else {
-            return false
+            return nil
         }
 
         let didAccess = source.startAccessingSecurityScopedResource()
@@ -61,12 +78,11 @@ enum LightboxLibraryStore {
         do {
             var resultingURL: NSURL?
             try FileManager.default.trashItem(at: source, resultingItemURL: &resultingURL)
-            if let resultingURL {
-                recordRestoreDestination(originalURL: source, trashURL: resultingURL as URL)
-            }
-            return true
+            guard let resultingURL else { return source }
+            recordRestoreDestination(originalURL: source, trashURL: resultingURL as URL)
+            return resultingURL as URL
         } catch {
-            return false
+            return nil
         }
     }
 
@@ -77,12 +93,12 @@ enum LightboxLibraryStore {
         }
     }
 
-    static func restoreFromSystemTrash(_ sourceURL: URL) async -> Bool {
+    static func restoreFromSystemTrash(_ sourceURL: URL) async -> TrashRestoreResult {
         let source = sourceURL.standardizedFileURL
         guard FileManager.default.fileExists(atPath: source.path),
               isSystemTrashURL(source)
         else {
-            return false
+            return .failed
         }
 
         return await Task.detached(priority: .userInitiated) {
@@ -90,16 +106,16 @@ enum LightboxLibraryStore {
         }.value
     }
 
-    private static func restoreFromSystemTrashSynchronously(_ source: URL) -> Bool {
-        if restoreFromRecordedDestination(source) {
-            return true
+    private static func restoreFromSystemTrashSynchronously(_ source: URL) -> TrashRestoreResult {
+        if let destination = restoreFromRecordedDestination(source) {
+            return .restored(destination)
         }
 
         let restored = restoreWithFinder(source)
         if restored {
             clearRestoreDestination(forTrashURL: source)
         }
-        return restored
+        return restored ? .restoredByFinder : .failed
     }
 
     static func restoreDestination(forTrashURL trashURL: URL, defaults: UserDefaults = .standard) -> URL? {
@@ -126,15 +142,15 @@ enum LightboxLibraryStore {
         defaults.set(map, forKey: trashRestoreDestinationsKey)
     }
 
-    static func restoreFromRecordedDestination(_ source: URL, defaults: UserDefaults = .standard) -> Bool {
+    static func restoreFromRecordedDestination(_ source: URL, defaults: UserDefaults = .standard) -> URL? {
         let source = source.standardizedFileURL
         guard let destination = restoreDestination(forTrashURL: source, defaults: defaults) else {
-            return false
+            return nil
         }
 
         let parent = destination.deletingLastPathComponent().standardizedFileURL
         guard isExistingDirectory(parent) else {
-            return false
+            return nil
         }
 
         let didAccessSource = source.startAccessingSecurityScopedResource()
@@ -162,10 +178,10 @@ enum LightboxLibraryStore {
         do {
             try FileManager.default.moveItem(at: source, to: finalDestination)
             clearRestoreDestination(forTrashURL: source, defaults: defaults)
-            return true
+            return finalDestination
         } catch {
             logger.error("recorded trash restore failed source=\(source.path, privacy: .public) destination=\(finalDestination.path, privacy: .public) error=\(String(describing: error), privacy: .public)")
-            return false
+            return nil
         }
     }
 

@@ -46,10 +46,12 @@ private func placementAsset(_ index: Int) -> LightboxAsset {
     #expect(placement(3).frames == reordered.frames)
 }
 
-// Hidden native window: verify the real ScrollViewReader/keyboard path reaches
+// Hidden native window: verify the real keyboard reveal path reaches
 // an offscreen target while mounting only a viewport-sized portion of 2000 cards.
-@Test
-@MainActor func virtualMasonryKeyboardReachesOffscreenCardAndPreservesPreviewGeometry() async throws {
+// Wide cards push the content past ~110k pt, where ScrollViewProxy.scrollTo
+// used to land near the top instead of on the target.
+@Test(arguments: [CGFloat(206), 400])
+@MainActor func virtualMasonryKeyboardReachesOffscreenCardAndPreservesPreviewGeometry(thumbnailWidth: CGFloat) async throws {
     let work = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxMasonry-\(UUID())")
     try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
     let suite = "LightboxMasonry-\(UUID())"
@@ -59,9 +61,9 @@ private func placementAsset(_ index: Int) -> LightboxAsset {
     let tab = LightboxTab(source: source, folderURL: work)
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
-    for _ in 0..<100 where state.libraryLoadingStatus != nil { try await Task.sleep(for: .milliseconds(10)) }
+    await waitWhile { state.libraryLoadingStatus != nil }
     state.assets = (0..<2_000).map(placementAsset)
-    state.thumbnailWidth = 206
+    state.thumbnailWidth = thumbnailWidth
     let host = NSHostingView(rootView: GalleryView().environmentObject(state).coordinateSpace(name: "PreviewSpace"))
     let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 1200, height: 800),
         styleMask: .borderless, backing: .buffered, defer: false)
@@ -84,6 +86,45 @@ private func placementAsset(_ index: Int) -> LightboxAsset {
     #expect(cards(host).count < 100)
 }
 
+// The thumbnail size lives outside `AppState` and never republishes it, so the
+// gallery must observe it directly: during a drag and after release.
+@Test @MainActor func galleryRelayoutsWhenOnlyTheThumbnailScaleChanges() async throws {
+    let work = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxMasonryScale-\(UUID())")
+    try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+    let suite = "LightboxMasonryScale-\(UUID())"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: work) }
+    let source = LibrarySource(id: "masonry-scale", name: "Scale", rootURL: work, kind: .external)
+    let tab = LightboxTab(source: source, folderURL: work)
+    LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
+    let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
+    await waitWhile { state.libraryLoadingStatus != nil }
+    state.assets = (0..<60).map(placementAsset)
+    let host = NSHostingView(rootView: GalleryView().environmentObject(state).coordinateSpace(name: "PreviewSpace"))
+    let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 1200, height: 800),
+        styleMask: .borderless, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = host
+    defer { window.close() }
+    func settle() async throws {
+        for _ in 0..<20 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(10)) }
+    }
+    try await settle()
+    let first = try #require(state.activeAssets.first)
+    let restingWidth = try #require(state.previewSpaceFrame(for: first.id)).width
+
+    state.isScalingThumbnails = true
+    state.thumbnailWidth = 400
+    try await settle()
+    let draggedWidth = try #require(state.previewSpaceFrame(for: first.id)).width
+    #expect(draggedWidth > restingWidth + 100)
+
+    state.isScalingThumbnails = false
+    state.thumbnailWidth = 160
+    try await settle()
+    #expect(try #require(state.previewSpaceFrame(for: first.id)).width < draggedWidth - 100)
+}
+
 @Test @MainActor func virtualMasonryKeyboardReachesOffscreenSearchGroup() async throws {
     let work = FileManager.default.temporaryDirectory.appendingPathComponent("LightboxMasonryGroups-\(UUID())")
     try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
@@ -100,9 +141,7 @@ private func placementAsset(_ index: Int) -> LightboxAsset {
     LightboxTabStore.save(tabs: [tab], activeTabID: tab.id, defaults: defaults)
     let state = AppState(indexDatabaseURL: work.appendingPathComponent("index.sqlite"), libraryDefaults: defaults)
     state.galleryLayoutMode = .recursive
-    for _ in 0..<500 where state.activeAssets.count != 160 || state.searchStatus?.isSearching == true {
-        try await Task.sleep(for: .milliseconds(10))
-    }
+    await waitWhile { state.activeAssets.count != 160 || state.searchStatus?.isSearching == true }
     #expect(state.activeAssets.count == 160 && state.searchAssetGroups.count == 2)
     let host = NSHostingView(rootView: GalleryView().environmentObject(state).coordinateSpace(name: "PreviewSpace"))
     let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 1200, height: 800),

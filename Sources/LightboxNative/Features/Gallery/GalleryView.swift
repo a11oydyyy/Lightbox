@@ -18,6 +18,28 @@ struct GalleryImagePriorityPlanner {
         isSettledVisible: Bool = false,
         requiredPixelSize: CGFloat = .infinity
     ) -> ImageCacheQuality {
+        let quality = sharpQuality(
+            baseQuality: baseQuality, isPrioritized: isPrioritized,
+            prefersFastRawThumbnails: prefersFastRawThumbnails,
+            permitsFullThumbnailPromotion: permitsFullThumbnailPromotion,
+            isSettledVisible: isSettledVisible, requiredPixelSize: requiredPixelSize
+        )
+        // Cards scrolling past or waiting offscreen show whatever preview the
+        // file embeds (cheap, even over a network share); visible cards get a
+        // sharp image once scrolling settles. A sharper image already decoded
+        // keeps showing, since the cache serves the best tier it has.
+        guard !isSettledVisible, quality == .thumbnailFast || quality == .thumbnailBalanced else { return quality }
+        return .thumbnailEmbedded
+    }
+
+    private static func sharpQuality(
+        baseQuality: ImageCacheQuality,
+        isPrioritized: Bool,
+        prefersFastRawThumbnails: Bool,
+        permitsFullThumbnailPromotion: Bool,
+        isSettledVisible: Bool,
+        requiredPixelSize: CGFloat
+    ) -> ImageCacheQuality {
         // Storage and library size limit work while moving, not final on-screen quality.
         // Keep sufficient decoded pixels while moving and at rest. Small cards
         // must not repeatedly alternate between 480- and 1024-pixel requests.
@@ -29,7 +51,7 @@ struct GalleryImagePriorityPlanner {
         guard isPrioritized else { return baseQuality }
         guard permitsFullThumbnailPromotion else {
             switch baseQuality {
-            case .thumbnailFast:
+            case .thumbnailEmbedded, .thumbnailFast:
                 return .thumbnailBalanced
             case .thumbnailBalanced:
                 return .thumbnailBalanced
@@ -40,7 +62,7 @@ struct GalleryImagePriorityPlanner {
         guard prefersFastRawThumbnails else { return .thumbnail }
 
         switch baseQuality {
-        case .thumbnailFast:
+        case .thumbnailEmbedded, .thumbnailFast:
             return .thumbnailBalanced
         case .thumbnailBalanced:
             return .thumbnailBalanced
@@ -349,27 +371,69 @@ private struct GalleryPendingGroupScroll {
     var navigationToken: String
 }
 
+/// Thumbnail size, selection, keyboard focus and the preview's image publish
+/// on their own objects, not on `AppState`, so the gallery observes them
+/// directly. They are handed to `GalleryContentView` as observed objects
+/// (rather than observed from a wrapper around its body) so that each change
+/// invalidates the whole gallery view: the masonry grid only rebuilds its
+/// cards when its parent does.
 struct GalleryView: View {
     var isResizingSidebar = false
+
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        GalleryContentView(
+            isResizingSidebar: isResizingSidebar,
+            thumbnailScale: appState.thumbnailScale,
+            selection: appState.selection,
+            keyboardFocus: appState.keyboardFocus,
+            preview: appState.preview
+        )
+    }
+}
+
+private struct GalleryContentView: View {
+    var isResizingSidebar: Bool
+    @ObservedObject var thumbnailScale: ThumbnailScaleState
+    @ObservedObject var selection: GallerySelectionState
+    @ObservedObject var keyboardFocus: GalleryKeyboardFocusState
+    @ObservedObject var preview: PreviewPresentationState
 
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @LightboxViewState private var frozenColumns: Int?
     @LightboxViewState private var lastViewportWidth: CGFloat = 0
+    /// Keyboard and tab-restore targets for the virtual grid, which scrolls by
+    /// its own known card rects instead of `ScrollViewProxy.scrollTo`.
+    @LightboxViewState private var masonryReveal: GalleryRevealRequest?
+    @LightboxViewState private var revealGeneration = 0
     @LightboxViewState private var lastViewportHeight: CGFloat = 0
     @LightboxViewState private var scrollGeometry = GalleryScrollGeometry()
     @LightboxViewState private var selectionRect: CGRect?
     @LightboxViewState private var contentVisible = true
     @LightboxViewState private var restoredScrollGeneration = -1
+    /// A tab's saved position being scrolled back to: the anchor is not
+    /// recorded until it lands, or the top of the new scroll view would
+    /// overwrite it.
+    @LightboxViewState private var pendingRestoreReveal: Int?
     @LightboxViewState private var frameUpdateCoordinator = GalleryFrameUpdateCoordinator()
     @LightboxViewState private var masonryColumnCache = GalleryMasonryColumnCache()
     @LightboxViewState private var masonryPlacementCache = GalleryMasonryPlacementCache()
     @LightboxViewState private var storagePerformanceCache = GalleryStoragePerformanceCache()
-    @LightboxViewState private var collapsedSearchGroupIDs: Set<String> = []
     @LightboxViewState private var pendingGroupScroll: GalleryPendingGroupScroll?
 
     private let horizontalPadding = GalleryThumbnailSizing.horizontalPadding
+    /// With the sidebar open, its resize strip already separates the panel from
+    /// the gallery. Trimming the leading gutter by that strip makes the gap from
+    /// the panel to the first image equal the right-hand gutter.
+    private var leadingPadding: CGFloat {
+        appState.sidebarCollapsed ? horizontalPadding : horizontalPadding - SidebarMetrics.resizeHandleWidth
+    }
+    /// First row of images (or the search hint) when no folder section sits
+    /// above it: the 52pt header plus the same gutter as the sides.
+    private var imagesTopInset: CGFloat { 52 + horizontalPadding }
 
     // Changes only on real navigation (source / folder / filter), not when the
     // asset array mutates during metadata streaming — so the entrance plays on
@@ -404,6 +468,7 @@ struct GalleryView: View {
             && !(appState.searchStatus?.isLoadingMetadata == true && appState.selectedFilter != .all)
             && appState.activeAssets.isEmpty
             && visibleFolderEntries.isEmpty
+            && !(appState.attributeFilter.needsMetadataPass && appState.isReadingImageSizes)
     }
 
     private var hasSearchQuery: Bool {
@@ -416,11 +481,13 @@ struct GalleryView: View {
     }
 
     private var emptyStateSymbol: String {
-        hasSearchQuery ? "magnifyingglass" : "photo.on.rectangle.angled"
+        if appState.attributeFilter.isActive { return "line.3.horizontal.decrease" }
+        return hasSearchQuery ? "magnifyingglass" : "photo.on.rectangle.angled"
     }
 
     private var emptyStateTitle: String {
-        appState.localized(hasSearchQuery ? .noMatches : .noImagesHere)
+        if appState.attributeFilter.isActive { return FilterText(appState.appLanguage).noMatches }
+        return appState.localized(hasSearchQuery ? .noMatches : .noImagesHere)
     }
 
     var body: some View {
@@ -429,7 +496,8 @@ struct GalleryView: View {
             // Reset before constructing cells so the first geometry callback
             // cannot discard their freshly registered image-loading states.
             let _ = prepareGeometry(for: geometryNavigationToken)
-            let folderHorizontalPadding = horizontalPadding
+            let folderHorizontalPadding = leadingPadding
+            let folderGridMetrics = galleryMetrics(viewportWidth: viewport.size.width)
             let activeAssets = appState.activeAssets
             let activeAssetIDs = appState.activeAssetIDs
             let performanceProfile = GalleryPerformanceProfile.current
@@ -447,9 +515,7 @@ struct GalleryView: View {
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
             let searchGroups = appState.usesRecursiveResults ? appState.searchAssetGroups : []
-            let shouldGroupSearchAssets = !activeAssets.isEmpty
-                && appState.usesRecursiveResults
-                && (appState.includesSubfolders || searchGroups.count > 1)
+            let shouldGroupSearchAssets = groupsSearchAssets
             let showsSearchLimitHint = appState.searchStatus?.limitReached == true
 
             ZStack(alignment: .trailing) {
@@ -460,13 +526,18 @@ struct GalleryView: View {
                         if !visibleFolders.isEmpty {
                             FolderRowView(
                                 folders: visibleFolders,
-                                availableWidth: max(0, viewport.size.width - 2 * folderHorizontalPadding),
+                                availableWidth: folderGridMetrics.usedWidth,
+                                columnGuide: FolderColumnGuide(count: folderGridMetrics.columns,
+                                    width: folderGridMetrics.itemWidth, spacing: SpacingTokens.regular),
                                 title: appState.localized(.folders),
                                 showInFinderTitle: appState.localized(.showInFinder),
                                 openInNewTabTitle: appState.localized(.openInNewTab),
+                                renameTitle: appState.renameText.menuItem,
                                 expandedTitle: appState.localized(.expandedState),
                                 collapsedTitle: appState.localized(.collapsedState),
                                 selectedFolderID: appState.selectedGalleryFolderID,
+                                summaries: appState.folderSummaries,
+                                imageCountText: { appState.folderImageCountText($0) },
                                 clearSelection: { appState.clearSelection() },
                                 showsRelativePath: appState.hasSearchQuery
                             ) { folder in
@@ -477,21 +548,25 @@ struct GalleryView: View {
                                 }
                             } openInNewTab: { folder in
                                 appState.openFolderInNewTab(folder)
+                            } rename: { folder in
+                                appState.beginRename(folder)
                             } reveal: { folder in
                                 appState.revealFolderInFinder(folder)
                             }
                             .equatable()
                             .padding(.top, 58)
-                            .padding(.horizontal, folderHorizontalPadding)
-                            .padding(.bottom, 16)
+                            .padding(.leading, folderHorizontalPadding + folderGridMetrics.leadingInset)
+                            .padding(.trailing, horizontalPadding)
+                            // Same 18pt as the gutters between the folder section and the images.
+                            .padding(.bottom, horizontalPadding)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(FolderRowFrameProbe())
                         }
 
                         if showsSearchLimitHint {
                             SearchLimitHint(message: appState.localized(appState.includesSubfolders ? .recursiveResultsIncomplete : .searchResultsLimited))
-                                .padding(.top, visibleFolders.isEmpty ? 58 : 0)
-                                .padding(.horizontal, horizontalPadding)
+                                .padding(.top, visibleFolders.isEmpty ? imagesTopInset : 0)
+                                .padding(.leading, leadingPadding).padding(.trailing, horizontalPadding)
                                 .padding(.bottom, 14)
                         }
 
@@ -503,12 +578,12 @@ struct GalleryView: View {
                                             SearchGroupHeader(
                                                 title: group.title,
                                                 count: group.assets.count,
-                                                isExpanded: !collapsedSearchGroupIDs.contains(group.id)
+                                                isExpanded: !appState.isGroupCollapsed(group.id)
                                             ) {
-                                                if collapsedSearchGroupIDs.contains(group.id) {
-                                                    collapsedSearchGroupIDs.remove(group.id)
+                                                if appState.isGroupCollapsed(group.id) {
+                                                    appState.setGroup(group.id, collapsed: false)
                                                 } else {
-                                                    collapsedSearchGroupIDs.insert(group.id)
+                                                    appState.setGroup(group.id, collapsed: true)
                                                     for asset in group.assets { scrollGeometry.remove(asset.id) }
                                                     refreshRenderPlan(viewportHeight: viewport.size.height)
                                                     if group.assets.contains(where: { $0.id == appState.galleryKeyboardFocusID }) {
@@ -516,15 +591,14 @@ struct GalleryView: View {
                                                     }
                                                 }
                                             }
-                                            .frame(width: galleryMetrics(
+                                            .modifier(GalleryColumnFrame(metrics: galleryMetrics(
                                                 viewportWidth: viewport.size.width,
                                                 minimumColumns: min(GalleryThumbnailSizing.maximumZoomColumnCount, max(1, group.assets.count))
-                                            ).usedWidth)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .padding(.horizontal, horizontalPadding)
+                                            )))
+                                            .padding(.leading, leadingPadding).padding(.trailing, horizontalPadding)
                                             .background(SearchGroupHeaderFrameProbe(id: group.id))
 
-                                            if !collapsedSearchGroupIDs.contains(group.id) {
+                                            if !appState.isGroupCollapsed(group.id) {
                                                 assetGrid(
                                                     activeAssets: group.assets,
                                                     activeAssetIDs: activeAssetIDs,
@@ -540,7 +614,7 @@ struct GalleryView: View {
                                                     performanceProfile: performanceProfile,
                                                     menuTitles: assetMenuTitles
                                                 )
-                                                .padding(.horizontal, horizontalPadding)
+                                                .padding(.leading, leadingPadding).padding(.trailing, horizontalPadding)
                                             }
                                         }
                                         .id(group.id)
@@ -551,6 +625,7 @@ struct GalleryView: View {
                                     activeAssets: activeAssets,
                                     activeAssetIDs: activeAssetIDs,
                                     cacheIdentity: "active",
+                                    reportsScrollAnchor: true,
                                     viewportWidth: viewport.size.width,
                                     loadableAssetIDs: loadableAssetIDs,
                                     prioritizedAssetIDs: prioritizedAssetIDs,
@@ -562,10 +637,10 @@ struct GalleryView: View {
                                     performanceProfile: performanceProfile,
                                     menuTitles: assetMenuTitles
                                 )
-                                .padding(.horizontal, horizontalPadding)
+                                .padding(.leading, leadingPadding).padding(.trailing, horizontalPadding)
                             }
                         }
-                        .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? 58 : 0)
+                        .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? imagesTopInset : 0)
                         .padding(.bottom, 92)
                         .opacity(contentVisible ? 1 : 0)
                         .offset(y: contentVisible ? 0 : 8)
@@ -609,7 +684,6 @@ struct GalleryView: View {
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
                     .onChange(of: navigationToken) { _ in
-                        collapsedSearchGroupIDs.removeAll()
                         pendingGroupScroll = nil
                         _ = prepareGeometry(for: navigationToken)
                         selectionRect = nil
@@ -627,7 +701,9 @@ struct GalleryView: View {
                         refreshRenderPlan(viewportHeight: viewport.size.height)
                     }
                     .onChange(of: appState.galleryKeyboardScrollGeneration) { _ in
-                        guard !appState.hasActiveOverlay, let id = appState.galleryKeyboardFocusID else { return }
+                        // A preview stepping to another image keeps that image's
+                        // card in view underneath, so closing lands on it.
+                        guard !appState.isComparing, let id = appState.galleryKeyboardFocusID else { return }
                         if let frame = appState.previewSpaceFrame(for: id),
                            frame.minY >= 52, frame.maxY <= viewport.size.height - 55 { return }
                         requestScroll(to: id, anchor: .center, using: scrollProxy)
@@ -638,8 +714,20 @@ struct GalleryView: View {
                     .onChange(of: viewport.size.width) { width in
                         lastViewportWidth = width
                     }
-                    .onChange(of: appState.isScalingThumbnails) { _ in
+                    .onChange(of: appState.isScalingThumbnails) { scaling in
                         refreshRenderPlan(viewportHeight: viewport.size.height)
+                        // Land the slider on the width the filled grid shows, so the
+                        // next drag starts from what is on screen instead of jumping.
+                        if !scaling {
+                            let settledWidth = galleryMetrics(viewportWidth: viewport.size.width).itemWidth
+                            appState.thumbnailWidth = GalleryThumbnailSizing.clampedStoredWidth(settledWidth)
+                        }
+                    }
+                    .onChange(of: thumbnailScale.columnStepAnchor) { step in
+                        // Keep the image that was at the top there once the
+                        // new columns have laid out.
+                        guard let step, appState.activeAssetIDs.contains(step.assetID) else { return }
+                        DispatchQueue.main.async { requestScroll(to: step.assetID, anchor: .top, using: scrollProxy) }
                     }
                     .onChange(of: isResizingSidebar) { resizing in
                         if resizing {
@@ -696,8 +784,11 @@ struct GalleryView: View {
                 if showsEmptyState {
                     GalleryEmptyState(
                         symbol: emptyStateSymbol,
-                        title: emptyStateTitle
-                    )
+                        title: emptyStateTitle,
+                        actionTitle: appState.attributeFilter.isActive ? FilterText(appState.appLanguage).clear : nil
+                    ) {
+                        appState.attributeFilter = GalleryAttributeFilter()
+                    }
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                         .padding(.top, 58)
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
@@ -771,14 +862,14 @@ struct GalleryView: View {
         }
         let frames = scrollGeometry.selectionFrames
         refreshRenderPlan(viewportHeight: viewportHeight, assetFrames: frames)
-        updateScrollAnchor(using: frames)
+        updateScrollAnchor()
     }
 
     private func flushPendingFrames() {
         frameUpdateCoordinator.flush { _, _ in
             let frames = scrollGeometry.selectionFrames
             refreshRenderPlan(viewportHeight: lastViewportHeight, assetFrames: frames)
-            updateScrollAnchor(using: frames)
+            updateScrollAnchor()
         }
     }
 
@@ -822,15 +913,46 @@ struct GalleryView: View {
         )
     }
 
-    private func updateScrollAnchor(using frames: [LightboxAsset.ID: CGRect]) {
+    /// The virtual masonry grid reports its own anchor when it is the only
+    /// grid; grouped results and the VoiceOver grid derive it from card frames.
+    private var masonryReportsScrollAnchor: Bool {
+        !voiceOverEnabled && !groupsSearchAssets
+    }
+
+    private var groupsSearchAssets: Bool {
+        !appState.activeAssets.isEmpty && appState.usesRecursiveResults
+            && (appState.includesSubfolders || appState.searchAssetGroups.count > 1)
+    }
+
+    /// Until the tab's saved position is restored the grid sits at the top;
+    /// recording that would overwrite the position being restored.
+    private var mayRecordScrollAnchor: Bool {
+        restoredScrollGeneration == appState.scrollRestoreGeneration && pendingRestoreReveal == nil
+    }
+
+    private func recordScrollAnchor(_ assetID: LightboxAsset.ID?, scrollOffset: CGFloat) {
+        guard mayRecordScrollAnchor else { return }
+        let anchor = scrollOffset > 40 ? assetID : nil
+        if anchor != appState.activeTabScrollAnchorAssetID {
+            scrollRestoreLogger.info("anchor recorded offset=\(Int(scrollOffset)) anchor=\(anchor.map { String($0.suffix(24)) } ?? "nil", privacy: .public)")
+        }
+        appState.updateActiveTabScrollAnchor(anchor)
+    }
+
+    private func updateScrollAnchor() {
+        // After a geometry reset the origin reads zero until the next report.
+        guard !masonryReportsScrollAnchor, mayRecordScrollAnchor, scrollGeometry.hasOrigin else { return }
         guard scrollGeometry.origin.scrollOffset > 40 else {
             appState.updateActiveTabScrollAnchor(nil)
             return
         }
 
-        let anchorID = frames
-            .filter { $0.value.maxY >= 0 }
-            .min { abs($0.value.minY) < abs($1.value.minY) }?
+        // The card whose top is nearest the top of the scroll view: restoring
+        // scrolls that same top back there, so the position does not creep.
+        let offset = scrollGeometry.origin.scrollOffset
+        let anchorID = scrollGeometry.contentFrames
+            .filter { $0.value.maxY - offset >= 0 }
+            .min { abs($0.value.minY - offset) < abs($1.value.minY - offset) }?
             .key
         appState.updateActiveTabScrollAnchor(anchorID)
     }
@@ -840,12 +962,25 @@ struct GalleryView: View {
         guard restoredScrollGeneration != generation else { return }
         guard let anchorID = appState.activeTabScrollAnchorAssetID else {
             restoredScrollGeneration = generation
+            masonryReveal = nil
             return
         }
-        guard appState.activeAssetIDs.contains(anchorID) else { return }
+        guard appState.activeAssetIDs.contains(anchorID) else {
+            scrollRestoreLogger.info("restore waiting generation=\(generation) anchor=\(String(anchorID.suffix(24)), privacy: .public) unavailable")
+            return
+        }
+        scrollRestoreLogger.info("restore requested generation=\(generation) anchor=\(String(anchorID.suffix(24)), privacy: .public)")
 
         restoredScrollGeneration = generation
+        let previousReveal = masonryReveal?.generation
         requestScroll(to: anchorID, anchor: .top, using: proxy)
+        if let reveal = masonryReveal?.generation, reveal != previousReveal {
+            pendingRestoreReveal = reveal
+            // Release the anchor even if the reveal never reports back.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                if pendingRestoreReveal == reveal { pendingRestoreReveal = nil }
+            }
+        }
     }
 
     private func requestScroll(to id: LightboxAsset.ID, anchor: UnitPoint, using proxy: ScrollViewProxy) {
@@ -853,10 +988,18 @@ struct GalleryView: View {
         guard appState.usesRecursiveResults,
               let group = appState.searchAssetGroups.first(where: { $0.assets.contains { $0.id == id } }),
               appState.includesSubfolders || appState.searchAssetGroups.count > 1 else {
-            DispatchQueue.main.async { proxy.scrollTo(id, anchor: anchor) }
+            if voiceOverEnabled {
+                DispatchQueue.main.async { proxy.scrollTo(id, anchor: anchor) }
+            } else {
+                // Never reuse a generation: the grid ignores one it has
+                // already revealed, and the request is cleared between tabs.
+                revealGeneration &+= 1
+                masonryReveal = GalleryRevealRequest(assetID: id, anchor: anchor, generation: revealGeneration)
+            }
             return
         }
-        collapsedSearchGroupIDs.remove(group.id)
+        // Showing an image inside a collapsed folder opens the folder for good.
+        appState.setGroup(group.id, collapsed: false)
         let request = GalleryPendingGroupScroll(assetID: id, groupID: group.id,
             anchor: anchor, navigationToken: navigationToken)
         pendingGroupScroll = request
@@ -921,6 +1064,7 @@ struct GalleryView: View {
         activeAssets: [LightboxAsset],
         activeAssetIDs: Set<LightboxAsset.ID>,
         cacheIdentity: String,
+        reportsScrollAnchor: Bool = false,
         viewportWidth: CGFloat,
         loadableAssetIDs: Set<LightboxAsset.ID>,
         prioritizedAssetIDs: Set<LightboxAsset.ID>,
@@ -958,6 +1102,16 @@ struct GalleryView: View {
             GalleryVirtualMasonryGrid(placement: placement, width: metrics.usedWidth,
                 viewportHeight: lastViewportHeight, isScaling: appState.isScalingThumbnails,
                 revealAssetIDs: Set([appState.galleryKeyboardFocusID, appState.activeTabScrollAnchorAssetID].compactMap { $0 }),
+                revealRequest: masonryReveal,
+                revealLanded: { generation in
+                    if pendingRestoreReveal == generation {
+                        scrollRestoreLogger.info("restore landed reveal=\(generation)")
+                        pendingRestoreReveal = nil
+                    }
+                },
+                topAssetChanged: reportsScrollAnchor ? { assetID, scrollOffset in
+                    recordScrollAnchor(assetID, scrollOffset: scrollOffset)
+                } : nil,
                 framesChanged: { frames, removed, added, owner in
                     guard prepareGeometry(for: geometryNavigationToken) else { return }
                     for id in removed { _ = scrollGeometry.remove(id, owner: owner) }
@@ -966,6 +1120,9 @@ struct GalleryView: View {
                     }
                     frameUpdateCoordinator.submit(.init(selectionFrames: frames), activeAssetIDs: activeAssetIDs) { _, _ in
                         refreshRenderPlan(viewportHeight: lastViewportHeight)
+                        // Cards mount after the scroll that brought them in;
+                        // the anchor must come from them, not the cards above.
+                        updateScrollAnchor()
                     }
                 }) { asset in
                 assetCard(asset, itemWidth: metrics.itemWidth,
@@ -977,6 +1134,7 @@ struct GalleryView: View {
                     performanceProfile: performanceProfile, menuTitles: menuTitles, reportsOwnFrame: false)
             }
             .frame(width: metrics.usedWidth)
+            .padding(.leading, metrics.leadingInset)
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
         HStack(alignment: .top, spacing: SpacingTokens.regular) {
@@ -1004,6 +1162,7 @@ struct GalleryView: View {
             }
         }
         .frame(width: metrics.usedWidth)
+        .padding(.leading, metrics.leadingInset)
         .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -1103,6 +1262,16 @@ struct GalleryView: View {
             },
             onAddToCompareTray: {
                 appState.addSelectedToCompareTray(fallback: asset)
+            },
+            onRename: {
+                appState.beginRename(fallback: asset)
+            },
+            onQuickLook: {
+                appState.showQuickLook(appState.operationTargetAssets(fallback: asset))
+            },
+            onSpace: {
+                flushPendingFrames()
+                appState.handleSpace(on: asset)
             }
         )
         .equatable()
@@ -1157,8 +1326,9 @@ struct GalleryView: View {
     private func galleryMetrics(
         viewportWidth: CGFloat,
         minimumColumns: Int = GalleryThumbnailSizing.maximumZoomColumnCount
-    ) -> (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat) {
-        let availableWidth = max(1, viewportWidth - horizontalPadding * 2)
+    ) -> (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat, leadingInset: CGFloat) {
+        let availableWidth = max(1, viewportWidth - leadingPadding - horizontalPadding)
+        appState.thumbnailScale.galleryAvailableWidth = availableWidth
         let spacing = SpacingTokens.regular
         let minimumColumns = max(1, minimumColumns)
         let effectiveThumbnailWidth = min(
@@ -1168,23 +1338,37 @@ struct GalleryView: View {
                 columnCount: minimumColumns
             )
         )
+        // Dragging the slider scales cards continuously at the slider's width
+        // (whole columns that fit, leading-aligned). At rest the grid takes the
+        // nearest column count and its columns share the full width, so both
+        // edges line up; releasing the slider animates between the two.
+        let fittingColumns = (availableWidth + spacing) / (effectiveThumbnailWidth + spacing)
+        let isScaling = appState.isScalingThumbnails
         let computedColumns = max(
             minimumColumns,
-            Int((availableWidth + spacing) / (effectiveThumbnailWidth + spacing))
+            isScaling ? Int(fittingColumns) : Int(fittingColumns.rounded())
         )
         // While resizing the sidebar, hold the column count steady (only itemWidth
-        // shrinks) so images don't jump between columns every frame; re-column on release.
+        // changes) so images don't jump between columns every frame; re-column on release.
         let columns = isResizingSidebar ? (frozenColumns ?? computedColumns) : computedColumns
         let maxItemWidth = floor((availableWidth - CGFloat(columns - 1) * spacing) / CGFloat(columns))
-        let itemWidth = min(effectiveThumbnailWidth, maxItemWidth)
+        let itemWidth = isScaling ? min(effectiveThumbnailWidth, maxItemWidth) : maxItemWidth
         let usedWidth = CGFloat(columns) * itemWidth + CGFloat(columns - 1) * spacing
-        // Callers align the grid leading so its edge lines up with the header
-        // and folders; the slider keeps scaling continuously.
-        return (columns, itemWidth, usedWidth)
+        // Whole-point card widths leave up to a point per column over; split it
+        // so the left and right gutters match at rest.
+        let leadingInset = isScaling ? 0 : floor((availableWidth - usedWidth) / 2)
+        return (columns, itemWidth, usedWidth, leadingInset)
     }
 
     @ViewBuilder
     private var backgroundContextMenu: some View {
+        Button {
+            appState.beginNewFolder()
+        } label: {
+            Text(appState.renameText.newFolderMenuItem)
+        }
+        .disabled(!appState.canCreateFolder)
+        Divider()
         Button {
             appState.revealCurrentFolderInFinder()
         } label: {
@@ -1242,6 +1426,8 @@ private struct TrashAccessHint: View {
 private struct GalleryEmptyState: View {
     var symbol: String
     var title: String
+    var actionTitle: String? = nil
+    var action: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 10) {
@@ -1253,8 +1439,14 @@ private struct GalleryEmptyState: View {
             Text(title)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(LightboxColorTokens.mutedText)
+
+            if let actionTitle {
+                Button(actionTitle, action: action)
+                    .controlSize(.small)
+                    .padding(.top, 2)
+            }
         }
-        .allowsHitTesting(false)
+        .allowsHitTesting(actionTitle != nil)
     }
 }
 
@@ -1286,12 +1478,11 @@ private struct SearchGroupHeader: View {
                     .fill(.secondary.opacity(0.16))
                     .frame(height: 1)
             }
-            .foregroundStyle(LightboxColorTokens.secondaryText)
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: 28)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(LightboxTextHoverStyle(rest: LightboxColorTokens.secondaryText))
         .accessibilityValue(appState.localized(isExpanded ? .expandedState : .collapsedState))
     }
 }
@@ -1341,22 +1532,29 @@ private struct FolderRowView: View, Equatable {
 
     var folders: [LibraryFolderEntry]
     var availableWidth: CGFloat
+    var columnGuide: FolderColumnGuide? = nil
     var title: String
     var showInFinderTitle: String
     var openInNewTabTitle: String
+    var renameTitle: String
     var expandedTitle: String
     var collapsedTitle: String
     var selectedFolderID: LibraryFolderEntry.ID?
+    var summaries: FolderSummaryService? = nil
+    var imageCountText: (Int) -> String = { "\($0)" }
     var clearSelection: () -> Void
     var showsRelativePath = false
     var open: (LibraryFolderEntry) -> Void
     var openInNewTab: (LibraryFolderEntry) -> Void
+    var rename: ((LibraryFolderEntry) -> Void)?
     var reveal: (LibraryFolderEntry) -> Void
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.folders == rhs.folders && lhs.title == rhs.title && lhs.availableWidth == rhs.availableWidth
+            && lhs.columnGuide == rhs.columnGuide
             && lhs.showInFinderTitle == rhs.showInFinderTitle
-            && lhs.openInNewTabTitle == rhs.openInNewTabTitle
+            && lhs.openInNewTabTitle == rhs.openInNewTabTitle && lhs.renameTitle == rhs.renameTitle
+            && (lhs.rename == nil) == (rhs.rename == nil)
             && lhs.expandedTitle == rhs.expandedTitle && lhs.collapsedTitle == rhs.collapsedTitle
             && lhs.selectedFolderID == rhs.selectedFolderID && lhs.showsRelativePath == rhs.showsRelativePath
     }
@@ -1364,30 +1562,34 @@ private struct FolderRowView: View, Equatable {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button { isExpanded.toggle() } label: {
-                HStack(spacing: 6) {
+                // Chevron centered on the cover column; title on the names' edge.
+                HStack(spacing: FolderGridPlacement.iconTextGap) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 9, weight: .semibold))
-                        .frame(width: 12)
+                        .frame(width: FolderGridPlacement.thumbnailSize.width)
                     Text("\(title) · \(folders.count)")
                         .font(.system(size: 11, weight: .medium))
                 }
-                .foregroundStyle(LightboxColorTokens.mutedText)
+                .padding(.leading, FolderGridPlacement.contentInset)
                 .frame(height: 26)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(LightboxTextHoverStyle(rest: LightboxColorTokens.mutedText))
             .accessibilityValue(isExpanded ? expandedTitle : collapsedTitle)
 
             if isExpanded {
                 NativeFolderGrid(
-                    folders: folders, availableWidth: availableWidth,
+                    folders: folders, availableWidth: availableWidth, columnGuide: columnGuide,
                     showsRelativePath: showsRelativePath,
                     selectedFolderID: selectedFolderID,
                     showInFinderTitle: showInFinderTitle, openInNewTabTitle: openInNewTabTitle,
-                    clearSelection: clearSelection, open: open, openInNewTab: openInNewTab, reveal: reveal
+                    renameTitle: renameTitle,
+                    clearSelection: clearSelection, open: open, openInNewTab: openInNewTab,
+                    rename: rename, reveal: reveal,
+                    summaries: summaries, imageCountText: imageCountText
                 )
                 .frame(height: FolderGridPlacement(count: folders.count, width: availableWidth,
-                                                  showsRelativePath: showsRelativePath).height)
+                                                  showsRelativePath: showsRelativePath, columnGuide: columnGuide).height)
             }
         }
     }
@@ -1484,15 +1686,15 @@ private struct RubberBandSelectionRect: View {
     }
 }
 
-private struct SelectionCounterText: View {
-    @Environment(\.colorScheme) private var colorScheme
-    var count: Int
+/// Sizes a header row to its grid's columns and applies the same centering
+/// inset, so it starts exactly where the grid's first column does.
+private struct GalleryColumnFrame: ViewModifier {
+    var metrics: (columns: Int, itemWidth: CGFloat, usedWidth: CGFloat, leadingInset: CGFloat)
 
-    var body: some View {
-        Text("\(count) selected")
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.primary)
-            .shadow(color: colorScheme == .dark ? .black.opacity(0.62) : .white.opacity(0.86), radius: 5, y: 1)
-            .shadow(color: colorScheme == .dark ? .white.opacity(0.10) : .black.opacity(0.18), radius: 1.5, y: 1)
+    func body(content: Content) -> some View {
+        content
+            .frame(width: metrics.usedWidth)
+            .padding(.leading, metrics.leadingInset)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

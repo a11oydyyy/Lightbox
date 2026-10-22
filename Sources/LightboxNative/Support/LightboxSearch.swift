@@ -97,7 +97,11 @@ struct LightboxSearchQuery: Equatable, Sendable {
     }
 
     private static func normalized(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ASCII (most camera file names) has no diacritics to fold; folding
+        // looks the locale up per call, once per image on every keystroke.
+        if trimmed.utf8.allSatisfy({ $0 < 0x80 }) { return trimmed.lowercased() }
+        return trimmed
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
     }

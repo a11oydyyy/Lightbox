@@ -4,6 +4,10 @@
 lightbox_configure_toolchain() {
   local root_dir="$1"
   local package_args=(--package-path "$root_dir")
+  # 外層沙箱已限制檔案存取；避免 SwiftPM 再套用不相容的巢狀沙箱。
+  if [[ "${SANDBOX_RUNTIME:-0}" = "1" ]]; then
+    package_args+=(--disable-sandbox)
+  fi
   if [[ -n "${LIGHTBOX_BUILD_CACHE_DIR:-}" ]]; then
     package_args+=(--scratch-path "$LIGHTBOX_BUILD_CACHE_DIR")
   fi
@@ -26,6 +30,12 @@ print(next(p["version"] for p in json.load(sys.stdin)["platforms"] if p["platfor
   # Supply both real values to the linker so AppKit enables current SDK behavior.
   LIGHTBOX_SWIFT_BUILD_ARGS=(
     "${package_args[@]}" --sdk "$LIGHTBOX_SDK"
+    -Xswiftc -debug-prefix-map -Xswiftc "$root_dir=/Lightbox"
+    -Xswiftc -file-prefix-map -Xswiftc "$root_dir=/Lightbox"
+    -Xswiftc -debug-prefix-map -Xswiftc "$HOME=/BuildHome"
+    -Xswiftc -file-prefix-map -Xswiftc "$HOME=/BuildHome"
+    -Xcc "-fdebug-prefix-map=$root_dir=/Lightbox"
+    -Xcc "-ffile-prefix-map=$root_dir=/Lightbox"
     -Xlinker -platform_version -Xlinker macos
     -Xlinker "$LIGHTBOX_DEPLOYMENT_VERSION" -Xlinker "$LIGHTBOX_SDK_VERSION"
   )

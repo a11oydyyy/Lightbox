@@ -24,6 +24,9 @@ final class GalleryScrollGeometry {
     var folderFrame: CGRect?
     var groupHeaderFrames: [String: CGRect] = [:]
     private(set) var origin = GalleryContentOrigin(selection: .zero, preview: .zero, scrollOffset: 0)
+    /// Whether `origin` was reported since the last reset; until then it reads
+    /// zero whatever the scroll view shows.
+    private(set) var hasOrigin = false
     private(set) var renderPlan: GalleryRenderPlan?
     private var settleTask: Task<Void, Never>?
 
@@ -62,6 +65,7 @@ final class GalleryScrollGeometry {
 
     func updateOrigin(_ origin: GalleryContentOrigin) {
         self.origin = origin
+        hasOrigin = true
     }
 
     var selectionFrames: [LightboxAsset.ID: CGRect] {
@@ -108,6 +112,7 @@ final class GalleryScrollGeometry {
         folderFrame = nil
         groupHeaderFrames.removeAll()
         origin = GalleryContentOrigin(selection: .zero, preview: .zero, scrollOffset: 0)
+        hasOrigin = false
         renderPlan = nil
         navigationToken = nil
     }

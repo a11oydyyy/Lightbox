@@ -213,7 +213,18 @@ private struct GalleryNativeGeometryFixture: View {
         scroll.contentView.scroll(to: CGPoint(x: 0, y: offset))
         scroll.reflectScrolledClipView(scroll.contentView)
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(20))
+        // Wait for the geometry reports rather than a fixed 20ms: under a
+        // parallel run they can arrive later.
+        func settled() -> Bool {
+            guard let origin = measurements.origin else { return false }
+            return abs(origin.selection.y + CGFloat(offset)) < 0.5
+                && measurements.selectionFrame == initial.offsetBy(dx: origin.selection.x, dy: origin.selection.y)
+                && measurements.previewFrame == initial.offsetBy(dx: origin.preview.x, dy: origin.preview.y)
+        }
+        for _ in 0..<100 where !settled() {
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let origin = try #require(measurements.origin)
         #expect(abs(origin.selection.y + CGFloat(offset)) < 0.5)
         #expect(measurements.contentFrame == initial)

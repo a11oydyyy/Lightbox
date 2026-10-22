@@ -528,7 +528,7 @@ final class ImageCache: @unchecked Sendable {
         }
     }
 
-    private static func downsampledImage(for url: URL, quality: ImageCacheQuality) -> NSImage? {
+    static func downsampledImage(for url: URL, quality: ImageCacheQuality) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, imageSourceOptions() as CFDictionary) else {
             return nil
         }
@@ -538,14 +538,51 @@ final class ImageCache: @unchecked Sendable {
             prefersEmbeddedPreview: quality.prefersEmbeddedPreview
         ) as CFDictionary
 
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
+        guard var image = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
             return nil
+        }
+        if quality.prefersEmbeddedPreview, !quality.acceptsAnyEmbeddedPreview,
+           !embeddedPreviewIsUsable(
+               CGSize(width: image.width, height: image.height),
+               sourceSize: orientedPixelSize(of: source),
+               maxPixelSize: quality.maxPixelSize
+           ) {
+            let fullOptions = thumbnailCreationOptions(maxPixelSize: quality.maxPixelSize, prefersEmbeddedPreview: false)
+            if let decoded = CGImageSourceCreateThumbnailAtIndex(source, 0, fullOptions as CFDictionary) {
+                image = decoded
+            }
         }
 
         return NSImage(
             cgImage: image,
             size: NSSize(width: image.width, height: image.height)
         )
+    }
+
+    /// Camera JPEGs often embed a 160 × 120 thumbnail, letterboxed to 4:3 with
+    /// black bars. Using it for a gallery card looks blurry and leaves a dark
+    /// edge, so it only stands in for the image when it is close to the size
+    /// asked for (or the image itself) and has the image's proportions. RAW
+    /// previews are usually large and pass.
+    static func embeddedPreviewIsUsable(_ preview: CGSize, sourceSize: CGSize?, maxPixelSize: Int) -> Bool {
+        guard preview.width > 0, preview.height > 0 else { return false }
+        let longest = max(preview.width, preview.height)
+        let sourceLongest = sourceSize.map { max($0.width, $0.height) } ?? .infinity
+        guard longest >= min(CGFloat(maxPixelSize), sourceLongest) * 0.75 else { return false }
+        guard let sourceSize, sourceSize.width > 0, sourceSize.height > 0 else { return true }
+        let previewRatio = preview.width / preview.height
+        let sourceRatio = sourceSize.width / sourceSize.height
+        return abs(previewRatio - sourceRatio) / sourceRatio <= 0.03
+    }
+
+    /// The image's pixel size as displayed, after its EXIF orientation.
+    private static func orientedPixelSize(of source: CGImageSource) -> CGSize? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat
+        else { return nil }
+        let orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
+        return (5...8).contains(orientation) ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
     }
 
     static func imageSourceOptions() -> [CFString: Any] {
@@ -835,12 +872,16 @@ final class ThumbnailDiskCache: @unchecked Sendable {
         quality: ImageCacheQuality,
         signature: FileContentSignature
     ) -> String {
-        let rawKey = [
+        var components = [
             quality.rawValue,
             String(quality.maxPixelSize),
             url.standardizedFileURL.path,
             signature.cacheKeyComponent
-        ].joined(separator: "|")
+        ]
+        // Embedded-preview tiers cached before tiny camera thumbnails were
+        // rejected must be decoded again.
+        if quality.prefersEmbeddedPreview { components.append("embedded-v2") }
+        let rawKey = components.joined(separator: "|")
 
         return SHA256.hash(data: Data(rawKey.utf8)).map {
             String(format: "%02x", $0)
@@ -1005,6 +1046,10 @@ enum ImageDecodePriority: Equatable {
 }
 
 enum ImageCacheQuality: String {
+    /// Whatever preview the file embeds, however small: a camera JPEG's
+    /// 160-pixel thumbnail, a RAW file's large one. For cards that are moving
+    /// past or not yet on screen; they get a sharp tier once they settle.
+    case thumbnailEmbedded
     case thumbnailFast
     case thumbnailBalanced
     case thumbnail
@@ -1013,7 +1058,7 @@ enum ImageCacheQuality: String {
 
     var maxPixelSize: Int {
         switch self {
-        case .thumbnailFast:
+        case .thumbnailEmbedded, .thumbnailFast:
             360
         case .thumbnailBalanced:
             480
@@ -1028,25 +1073,27 @@ enum ImageCacheQuality: String {
 
     var prefersEmbeddedPreview: Bool {
         switch self {
-        case .thumbnailFast, .thumbnailBalanced:
+        case .thumbnailEmbedded, .thumbnailFast, .thumbnailBalanced:
             true
         case .thumbnail, .preview, .comparison:
             false
         }
     }
 
+    /// Only the embedded tier keeps a preview that is too small or
+    /// letterboxed; the others decode the image instead.
+    var acceptsAnyEmbeddedPreview: Bool {
+        self == .thumbnailEmbedded
+    }
+
     var cacheLookupOrder: [ImageCacheQuality] {
         switch self {
-        case .thumbnailFast:
-            [.thumbnail, .thumbnailBalanced, .thumbnailFast]
-        case .thumbnailBalanced:
-            [.thumbnail, .thumbnailBalanced, .thumbnailFast]
-        case .thumbnail:
-            [.thumbnail, .thumbnailBalanced, .thumbnailFast]
+        case .thumbnailEmbedded, .thumbnailFast, .thumbnailBalanced, .thumbnail:
+            [.thumbnail, .thumbnailBalanced, .thumbnailFast, .thumbnailEmbedded]
         case .preview:
-            [.preview, .thumbnail, .thumbnailBalanced, .thumbnailFast, .comparison]
+            [.preview, .thumbnail, .thumbnailBalanced, .thumbnailFast, .thumbnailEmbedded, .comparison]
         case .comparison:
-            [.comparison, .preview, .thumbnail, .thumbnailBalanced, .thumbnailFast]
+            [.comparison, .preview, .thumbnail, .thumbnailBalanced, .thumbnailFast, .thumbnailEmbedded]
         }
     }
 
@@ -1057,7 +1104,7 @@ enum ImageCacheQuality: String {
 
     var usesDiskCache: Bool {
         switch self {
-        case .thumbnailFast, .thumbnailBalanced, .thumbnail:
+        case .thumbnailEmbedded, .thumbnailFast, .thumbnailBalanced, .thumbnail:
             true
         case .preview, .comparison:
             false
@@ -1066,6 +1113,8 @@ enum ImageCacheQuality: String {
 
     var thumbnailRank: Int? {
         switch self {
+        case .thumbnailEmbedded:
+            0
         case .thumbnailFast:
             1
         case .thumbnailBalanced:

@@ -20,4 +20,22 @@ enum GalleryThumbnailSizing {
     static func clampedStoredWidth(_ width: CGFloat) -> CGFloat {
         min(maximumStoredWidth, max(minimumWidth, width))
     }
+
+    /// Columns the grid shows at rest for `width` across `availableWidth`
+    /// (the nearest whole count, as the gallery lays out).
+    static func columns(forWidth width: CGFloat, availableWidth: CGFloat) -> Int {
+        let spacing = SpacingTokens.regular
+        return max(maximumZoomColumnCount, Int(((availableWidth + spacing) / (width + spacing)).rounded()))
+    }
+
+    /// A thumbnail width that gives exactly `columns` at rest, or nil when no
+    /// allowed width does (fewer than two columns, or smaller than the minimum).
+    static func width(forColumns columns: Int, availableWidth: CGFloat) -> CGFloat? {
+        guard columns >= maximumZoomColumnCount, availableWidth > 0 else { return nil }
+        let spacing = SpacingTokens.regular
+        // Just under the exact width, so rounding lands on `columns`.
+        let width = floor((availableWidth + spacing) / CGFloat(columns) - spacing)
+        guard width >= minimumWidth, width <= maximumStoredWidth else { return nil }
+        return width
+    }
 }

@@ -2,7 +2,18 @@ import CoreGraphics
 
 enum PreviewGeometry {
     static let horizontalMargin: CGFloat = 88
-    static let verticalMargin: CGFloat = 132
+    static let verticalMargin: CGFloat = 144
+    /// Gap from the image to the file name and details below it.
+    static let controlsGap: CGFloat = 24
+    /// The details never sit closer than this to the window's bottom edge.
+    static let controlsBottomMargin: CGFloat = 28
+
+    /// Top edge of the details block: just below the image, lifted only as far
+    /// as needed to keep the bottom margin. Anchored by its top so details that
+    /// load later (camera, exposure) grow downward instead of shifting it.
+    static func controlsTop(imageBottom: CGFloat, controlsHeight: CGFloat, viewportHeight: CGFloat) -> CGFloat {
+        min(imageBottom + controlsGap, viewportHeight - controlsBottomMargin - controlsHeight)
+    }
 
     static func previewSize(assetSize: CGSize, viewport: CGSize) -> CGSize {
         // Fill the window: side margins leave room for the step buttons, and the

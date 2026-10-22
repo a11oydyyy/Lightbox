@@ -4,7 +4,8 @@ import Testing
 
 @Test @MainActor func galleryScrollLoadingPublishesOnlyChangedImages() {
     let coordinator = GalleryImageLoadingCoordinator()
-    let initial = GalleryImageLoadingConfiguration(loadsImage: true, priority: .low, quality: .thumbnailBalanced)
+    // While scrolling, cards show embedded previews.
+    let initial = GalleryImageLoadingConfiguration(loadsImage: true, priority: .low, quality: .thumbnailEmbedded)
     let stable = coordinator.state(for: "stable", requiredPixelSize: 412, initial: initial)
     let entering = coordinator.state(for: "entering", requiredPixelSize: 412, initial: initial)
     var stableUpdates = 0
@@ -19,18 +20,22 @@ import Testing
     }
     #expect(stableUpdates == 0)
     #expect(enteringUpdates == 1)
+    #expect(stable.configuration.quality == .thumbnailEmbedded)
+    // Settling swaps both to the sharp tier, once each.
     coordinator.update(plan: GalleryRenderPlan(loadableAssetIDs: ["stable", "entering"],
         prioritizedAssetIDs: ["entering"], settledVisibleAssetIDs: ["stable", "entering"]),
         baseQuality: .thumbnailBalanced, prefersFastRawThumbnails: false, permitsFullThumbnailPromotion: false)
-    #expect(stableUpdates == 0)
-    #expect(enteringUpdates == 1)
+    #expect(stableUpdates == 1)
+    #expect(enteringUpdates == 2)
     #expect(stable.configuration.quality == .thumbnailBalanced)
 }
 
 @Test func galleryThumbnailQualityRetainsEnoughPixelsAtRest() {
+    // Moving: the embedded preview; settled: a sharp tier with enough pixels.
     for settled in [false, true] {
         #expect(GalleryImagePriorityPlanner.displayQuality(baseQuality: .thumbnailBalanced, isPrioritized: true,
-            permitsFullThumbnailPromotion: false, isSettledVisible: settled, requiredPixelSize: 412) == .thumbnailBalanced)
+            permitsFullThumbnailPromotion: false, isSettledVisible: settled, requiredPixelSize: 412)
+            == (settled ? .thumbnailBalanced : .thumbnailEmbedded))
     }
     #expect(GalleryImagePriorityPlanner.displayQuality(baseQuality: .thumbnailBalanced, isPrioritized: true,
         permitsFullThumbnailPromotion: false, isSettledVisible: true, requiredPixelSize: 820) == .thumbnail)

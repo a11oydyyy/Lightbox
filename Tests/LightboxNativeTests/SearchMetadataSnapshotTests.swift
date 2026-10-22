@@ -35,3 +35,20 @@ import Testing
         #expect(SearchMetadataSnapshot([invalid]).mergingDimensions(into: [scan]) == [scan])
     }
 }
+
+@Test func recursiveRefreshKeepsKnownTagsUntilTheMetadataPassRereadsThem() {
+    let url = URL(fileURLWithPath: "/tmp/tagged.jpg")
+    let old = LightboxAsset(originalName: "tagged.jpg", width: 40, height: 60,
+        tags: ["Red"], sourceURL: url, addedAt: .distantPast,
+        contentModifiedAt: Date(timeIntervalSince1970: 100), fileSize: 3, palette: MockPalette.imported[0])
+    var scan = old
+    scan.tags = []; scan.metadataLoaded = false; scan.fileSize = 4
+    let snapshot = SearchMetadataSnapshot([old])
+    // A changed file loses its dimensions but not its tags.
+    let kept = snapshot.mergingDimensions(into: [scan], keepingTags: true)[0]
+    #expect(kept.tags == ["Red"] && !kept.metadataLoaded)
+    #expect(snapshot.mergingDimensions(into: [scan])[0].tags.isEmpty)
+    var moved = scan
+    moved.sourceURL = URL(fileURLWithPath: "/tmp/elsewhere/tagged.jpg")
+    #expect(snapshot.mergingDimensions(into: [moved], keepingTags: true)[0].tags.isEmpty)
+}
