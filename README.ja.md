@@ -1,6 +1,6 @@
 # Lightbox
 
-[English](README.en.md) · [简体中文](README.md) · [繁體中文](README.zh-Hant.md) · **日本語**
+[English](README.md) · [繁體中文](README.zh-Hant.md) · **日本語**
 
 Lightbox は、macOS 向けの軽量な画像ブラウザ・整理ツールです。専用ライブラリに画像を読み込むことなく、既存のフォルダを直接閲覧できます。
 
