@@ -412,7 +412,6 @@ private struct GalleryContentView: View {
     @LightboxViewState private var lastViewportHeight: CGFloat = 0
     @LightboxViewState private var scrollGeometry = GalleryScrollGeometry()
     @LightboxViewState private var selectionRect: CGRect?
-    @LightboxViewState private var contentVisible = true
     @LightboxViewState private var restoredScrollGeneration = -1
     /// A tab's saved position being scrolled back to: the anchor is not
     /// recorded until it lands, or the top of the new scroll view would
@@ -423,6 +422,9 @@ private struct GalleryContentView: View {
     @LightboxViewState private var masonryPlacementCache = GalleryMasonryPlacementCache()
     @LightboxViewState private var storagePerformanceCache = GalleryStoragePerformanceCache()
     @LightboxViewState private var pendingGroupScroll: GalleryPendingGroupScroll?
+    /// Set only by the pull gesture: ordinary folder loads report progress in
+    /// the header title and must not open the refresh spinner above the grid.
+    @LightboxViewState private var isPullRefreshing = false
 
     private let horizontalPadding = GalleryThumbnailSizing.horizontalPadding
     /// With the sidebar open, its resize strip already separates the panel from
@@ -436,8 +438,8 @@ private struct GalleryContentView: View {
     private var imagesTopInset: CGFloat { 52 + horizontalPadding }
 
     // Changes only on real navigation (source / folder / filter), not when the
-    // asset array mutates during metadata streaming — so the entrance plays on
-    // navigation, never on every background metadata batch.
+    // asset array mutates during metadata streaming — so the scroll view resets
+    // on navigation, never on every background metadata batch.
     private var navigationToken: String {
         "\(appState.activeTabID.uuidString)|\(appState.selectedSourceID)|\(appState.currentFolderURL.path)|\(appState.selectedFilter.identityKey)"
     }
@@ -446,17 +448,6 @@ private struct GalleryContentView: View {
         let anchorID = appState.activeTabScrollAnchorAssetID
         let isAvailable = anchorID.map { id in appState.activeAssetIDs.contains(id) } ?? true
         return "\(appState.scrollRestoreGeneration)|\(isAvailable)"
-    }
-
-    // Container-level entrance: a single gentle fade + settle for the whole grid,
-    // instead of a per-card cascade that would replay as cells scroll into a lazy stack.
-    private func playContentEntrance() {
-        contentVisible = false
-        DispatchQueue.main.async {
-            withAnimation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)) {
-                contentVisible = true
-            }
-        }
     }
 
     // Quiet empty state for a folder with nothing to show. Shown only
@@ -642,8 +633,6 @@ private struct GalleryContentView: View {
                         }
                         .padding(.top, visibleFolders.isEmpty && !showsSearchLimitHint ? imagesTopInset : 0)
                         .padding(.bottom, 92)
-                        .opacity(contentVisible ? 1 : 0)
-                        .offset(y: contentVisible ? 0 : 8)
                         .animation(MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion), value: appState.galleryLayoutMode)
                     }
                     .coordinateSpace(name: "GalleryContent")
@@ -653,11 +642,14 @@ private struct GalleryContentView: View {
                             noteContentOrigin(origin, viewportHeight: viewport.size.height)
                         }
                     }
-                    .background(GalleryScrollBarConfigurator())
+                    .background(GalleryScrollBarConfigurator { scrollGeometry.scrollView = $0 })
                     .background(GalleryRefreshControl(
-                        isRefreshing: appState.isRefreshingGallery,
+                        isRefreshing: isPullRefreshing && appState.isRefreshingGallery,
                         isEnabled: !appState.hasActiveOverlay,
-                        refresh: appState.refreshGalleryFromGesture
+                        refresh: {
+                            isPullRefreshing = true
+                            appState.refreshGalleryFromGesture()
+                        }
                     ))
                     }
                     .scrollIndicators(.automatic)
@@ -677,7 +669,6 @@ private struct GalleryContentView: View {
                     }
                     .onAppear {
                         guard prepareGeometry(for: geometryNavigationToken) else { return }
-                        playContentEntrance()
                         lastViewportWidth = viewport.size.width
                         lastViewportHeight = viewport.size.height
                         refreshRenderPlan(viewportHeight: viewport.size.height)
@@ -687,7 +678,6 @@ private struct GalleryContentView: View {
                         pendingGroupScroll = nil
                         _ = prepareGeometry(for: navigationToken)
                         selectionRect = nil
-                        playContentEntrance()
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
                     .onChange(of: appState.activeAssetsRevision) { _ in
@@ -707,6 +697,9 @@ private struct GalleryContentView: View {
                         if let frame = appState.previewSpaceFrame(for: id),
                            frame.minY >= 52, frame.maxY <= viewport.size.height - 55 { return }
                         requestScroll(to: id, anchor: .center, using: scrollProxy)
+                    }
+                    .onChange(of: appState.isRefreshingGallery) { refreshing in
+                        if !refreshing { isPullRefreshing = false }
                     }
                     .onChange(of: scrollRestoreAvailabilityToken) { _ in
                         restoreScrollIfNeeded(using: scrollProxy)
@@ -744,6 +737,9 @@ private struct GalleryContentView: View {
                     RubberBandSelectionLayer(
                         assetFrames: [:],
                         frameProvider: { scrollGeometry.selectionFrames },
+                        contentFrameProvider: { scrollGeometry.contentFrames },
+                        contentOriginProvider: { scrollGeometry.origin.selection },
+                        scrollViewProvider: { scrollGeometry.scrollView },
                         excludedFrameProvider: { scrollGeometry.exclusionFrames },
                         excludedFrames: [CGRect(
                             x: viewport.size.width - 16, y: 0,
@@ -1265,6 +1261,9 @@ private struct GalleryContentView: View {
             },
             onRename: {
                 appState.beginRename(fallback: asset)
+            },
+            onExportJPEG: {
+                appState.beginJPEGExport(fallback: asset)
             },
             onQuickLook: {
                 appState.showQuickLook(appState.operationTargetAssets(fallback: asset))

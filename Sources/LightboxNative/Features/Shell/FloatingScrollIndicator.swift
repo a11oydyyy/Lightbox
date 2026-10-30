@@ -3,11 +3,15 @@ import SwiftUI
 
 /// Uses AppKit's overlay scroller for native fade timing, dragging and accessibility.
 struct GalleryScrollBarConfigurator: NSViewRepresentable {
+    /// Hands over the scroll view once found, for scrolling it from AppKit.
+    var onScrollView: ((NSScrollView) -> Void)? = nil
+
     func makeNSView(context: Context) -> GalleryScrollBarConfigurationView {
         GalleryScrollBarConfigurationView()
     }
 
     func updateNSView(_ nsView: GalleryScrollBarConfigurationView, context: Context) {
+        nsView.onScrollView = onScrollView
         nsView.configureScrollView()
         // SwiftUI may attach the hosting hierarchy after this update.
         DispatchQueue.main.async { [weak nsView] in
@@ -17,6 +21,7 @@ struct GalleryScrollBarConfigurator: NSViewRepresentable {
 }
 
 final class GalleryScrollBarConfigurationView: NSView {
+    var onScrollView: ((NSScrollView) -> Void)?
     private weak var configuredScrollView: NSScrollView?
     private var scrollerInsetsObservation: NSKeyValueObservation?
 
@@ -40,6 +45,7 @@ final class GalleryScrollBarConfigurationView: NSView {
         }
         if configuredScrollView !== scrollView {
             configuredScrollView = scrollView
+            onScrollView?(scrollView)
             scrollerInsetsObservation = scrollView.observe(\.scrollerInsets, options: [.new]) { [weak self] scrollView, _ in
                 MainActor.assumeIsolated {
                     self?.applyScrollerInsets(to: scrollView)

@@ -444,6 +444,11 @@ final class AppState: ObservableObject {
     var compareTrayPulseID: LightboxAsset.ID? { compareTray.pulseID }
     var compareTrayRejectGeneration: Int { compareTray.rejectGeneration }
     @Published var previewPhase: PreviewPhase = .closed
+    /// The preview's keyboard layer has focus in the key window, so no text
+    /// field does: the bare-key P, X, U and Z menu items are on only then.
+    @Published var previewKeysActive = false
+    /// Bumped by Image › Actual Size; the preview owns its zoom and toggles it.
+    @Published var previewZoomRequest = 0
     /// Scan and transfer progress, observed by the header alone (see
     /// `BackgroundActivityState`).
     let activity = BackgroundActivityState()
@@ -506,6 +511,7 @@ final class AppState: ObservableObject {
     var renameTask: Task<Void, Never>?
     /// The files the rename sheet is open for.
     @Published var renameRequest: RenameRequest?
+    @Published var jpegExportRequest: JPEGExportRequest?
     /// The folder the New Folder sheet creates in.
     @Published var folderRenameRequest: FolderRenameRequest?
     @Published var newFolderRequest: NewFolderRequest?
@@ -630,7 +636,9 @@ final class AppState: ObservableObject {
             FileTransferRequest,
             @escaping @Sendable (FileTransferProgressUpdate) -> Void
         ) -> FileTransferResult = { request, progress in
-            FileTransferService.perform(request, progress: progress)
+            request.operation == .exportJPEG
+                ? PhotoshopJPEGExport.perform(request, progress: progress)
+                : FileTransferService.perform(request, progress: progress)
         },
         defaultApplicationOpener: @escaping @MainActor ([URL]) -> Void = { urls in
             for url in urls { NSWorkspace.shared.open(url) }

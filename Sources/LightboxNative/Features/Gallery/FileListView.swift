@@ -241,13 +241,28 @@ final class FileListCoordinator: NSObject, NSTableViewDataSource, NSTableViewDel
             case .location: 180
             }
         }
+
+        /// Narrow enough to give the name room, wide enough that values
+        /// never truncate. Autosaved widths come back no narrower, so a
+        /// table once fitted while it was still small recovers too.
+        var minimumWidth: CGFloat {
+            switch self {
+            case .name: 160
+            case .date: 128
+            case .size: 64
+            case .kind: 96
+            case .dimensions: 88
+            case .tags: 48
+            case .location: 120
+            }
+        }
     }
 
     func makeColumns() -> [NSTableColumn] {
         Column.allCases.map { column in
             let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
             tableColumn.width = column.width
-            tableColumn.minWidth = column == .name ? 160 : 44
+            tableColumn.minWidth = column.minimumWidth
             if let field = column.sortField {
                 tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: field.rawValue, ascending: true)
             }
@@ -418,24 +433,31 @@ final class FileListCoordinator: NSObject, NSTableViewDataSource, NSTableViewDel
     }
 
     /// Numeric, so the day survives the column's default width
-    /// ("2026/10/17 10:22"); the cell's tooltip spells the date out.
-    private static let dateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.setLocalizedDateFormatFromTemplate("yMdjmm")
-        return formatter
-    }()
-    private static let fullDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .full
-        formatter.timeStyle = .short
-        return formatter
-    }()
+    /// ("2026/10/17 10:22"); the cell's tooltip spells the date out. In the
+    /// app's language, not the system's: an English list read "凌晨 1:03".
+    private var dateFormatters: (locale: Locale, short: DateFormatter, full: DateFormatter)?
+    private var dateFormatter: DateFormatter { localizedDateFormatters().short }
+    private var fullDateFormatter: DateFormatter { localizedDateFormatters().full }
+
+    private func localizedDateFormatters() -> (locale: Locale, short: DateFormatter, full: DateFormatter) {
+        let locale = appState.appLanguage.locale
+        if let dateFormatters, dateFormatters.locale == locale { return dateFormatters }
+        let short = DateFormatter()
+        short.locale = locale
+        short.setLocalizedDateFormatFromTemplate("yMdjmm")
+        let full = DateFormatter()
+        full.locale = locale
+        full.dateStyle = .full
+        full.timeStyle = .short
+        dateFormatters = (locale, short, full)
+        return (locale, short, full)
+    }
     private static var kindByExtension: [String: String] = [:]
 
     private func value(for column: Column, of row: FileListRow) -> String? {
         switch (column, row) {
         case (.date, .asset(let asset)):
-            return asset.addedAt == .distantPast ? nil : Self.dateFormatter.string(from: asset.addedAt)
+            return asset.addedAt == .distantPast ? nil : dateFormatter.string(from: asset.addedAt)
         case (.size, .asset(let asset)):
             return asset.fileSize.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }
         case (.kind, .folder):
@@ -463,7 +485,7 @@ final class FileListCoordinator: NSObject, NSTableViewDataSource, NSTableViewDel
 
     private func toolTip(for column: Column, of row: FileListRow) -> String? {
         guard column == .date, let asset = row.asset, asset.addedAt != .distantPast else { return nil }
-        return Self.fullDateFormatter.string(from: asset.addedAt)
+        return fullDateFormatter.string(from: asset.addedAt)
     }
 
     func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
@@ -567,6 +589,11 @@ final class FileListCoordinator: NSObject, NSTableViewDataSource, NSTableViewDel
                 menu.addItem(ClosureMenuItem(titles.rename) { [weak self] in self?.appState.beginRename(fallback: asset) })
             }
             menu.addItem(ClosureMenuItem(titles.copy) { [weak self] in self?.appState.copyToClipboard(asset) })
+            if !asset.isDeleted, asset.isImage, PhotoshopJPEGExport.applicationURL != nil {
+                menu.addItem(.separator())
+                menu.addItem(ClosureMenuItem(titles.openInPhotoshop) { [weak self] in self?.appState.openInPhotoshop(fallback: asset) })
+                menu.addItem(ClosureMenuItem(titles.exportJPEG) { [weak self] in self?.appState.beginJPEGExport(fallback: asset) })
+            }
             menu.addItem(.separator())
             if asset.isDeleted {
                 menu.addItem(ClosureMenuItem(titles.restore) { [weak self] in self?.appState.restore(asset) })

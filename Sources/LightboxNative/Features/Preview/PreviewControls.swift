@@ -18,6 +18,8 @@ struct PreviewControls: View {
     }
 
     var body: some View {
+        // Three lines at most (name, capture, file) so the block fits the
+        // space PreviewGeometry leaves below the image and never rides up onto it.
         VStack(spacing: 3) {
             HStack(spacing: 8) {
                 Text(asset.originalName)
@@ -25,6 +27,25 @@ struct PreviewControls: View {
                     .foregroundStyle(LightboxColorTokens.primaryText)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .layoutPriority(1)
+                if !colorTags.isEmpty {
+                    HStack(spacing: MacTagDotMetrics.previewInfoSpacing) {
+                        ForEach(colorTags) { tag in
+                            Circle()
+                                .fill(tag.color.opacity(0.94))
+                                .frame(
+                                    width: MacTagDotMetrics.previewInfoDotDiameter,
+                                    height: MacTagDotMetrics.previewInfoDotDiameter
+                                )
+                                .overlay {
+                                    Circle()
+                                        .stroke(.white.opacity(0.48), lineWidth: MacTagDotMetrics.previewInfoStrokeWidth)
+                                }
+                                .accessibilityLabel(tag.name)
+                        }
+                    }
+                    .fixedSize()
+                }
                 Button { showsInfo.toggle() } label: {
                     Image(systemName: "info.circle")
                         .font(.system(size: LightboxControlMetrics.iconSize, weight: .medium))
@@ -47,59 +68,29 @@ struct PreviewControls: View {
                     .accessibilityLabel(CullText(appState.appLanguage).zoomButton)
                 }
             }
-            if let camera = details?.capture.first(where: { $0.label == "Camera" })?.value {
-                Text(camera)
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(LightboxColorTokens.primaryText)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .padding(.vertical, 5)
+            if let captureLine {
+                HStack(spacing: 6) {
+                    captureLine
+                        .font(.system(size: 11))
+                        .monospacedDigit()
+                        .foregroundStyle(LightboxColorTokens.secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if details?.hasCameraRawSettings == true {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(LightboxColorTokens.secondaryText)
+                            .help(localized("Edited in Camera Raw"))
+                            .accessibilityLabel(localized("Edited in Camera Raw"))
+                    }
+                }
             }
             Text(summary)
                 .font(.system(size: 11))
                 .monospacedDigit()
                 .foregroundStyle(LightboxColorTokens.secondaryText)
                 .lineLimit(1)
-            if let exposure = details?.exposureSummary, !exposure.isEmpty {
-                Text(exposure)
-                    .font(.system(size: 11))
-                    .monospacedDigit()
-                    .foregroundStyle(LightboxColorTokens.secondaryText)
-                    .lineLimit(1)
-            }
-            if details?.hasCameraRawSettings == true {
-                Label(localized("Edited in Camera Raw"), systemImage: "slider.horizontal.3")
-                    .font(.system(size: 11))
-                    .foregroundStyle(LightboxColorTokens.secondaryText)
-                    .lineLimit(1)
-            }
-
-            if !colorTags.isEmpty {
-                HStack(spacing: MacTagDotMetrics.previewInfoSpacing) {
-                    ForEach(colorTags) { tag in
-                        Circle()
-                            .fill(tag.color.opacity(0.94))
-                            .frame(
-                                width: MacTagDotMetrics.previewInfoDotDiameter,
-                                height: MacTagDotMetrics.previewInfoDotDiameter
-                            )
-                            .overlay {
-                                Circle()
-                                    .stroke(.white.opacity(0.48), lineWidth: MacTagDotMetrics.previewInfoStrokeWidth)
-                            }
-                            .accessibilityLabel(tag.name)
-                    }
-                }
-                .padding(.top, 1)
-            }
-
-            if asset.isImage, asset.sourceURL != nil, !asset.isDeleted {
-                Text(CullText(appState.appLanguage).keysHint)
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(LightboxColorTokens.mutedText.opacity(0.8))
-                    .lineLimit(1)
-                    .padding(.top, 4)
-            }
+                .truncationMode(.middle)
         }
         .frame(minWidth: 188, maxWidth: 560, alignment: .center)
         .padding(.horizontal, 22)
@@ -119,6 +110,20 @@ struct PreviewControls: View {
     }
 
     private var summary: String { asset.fileSummaryText }
+
+    /// "Sony ILCE-7CM2 · ƒ/4 · 1/1250 s · ISO 250 · 44 mm", camera in bold.
+    /// A line of its own made the block too tall for the space below the image.
+    private var captureLine: Text? {
+        let camera = details?.capture.first(where: { $0.label == "Camera" })?.value ?? ""
+        let exposure = details?.exposureSummary ?? ""
+        let showsCameraRaw = details?.hasCameraRawSettings == true
+        guard !camera.isEmpty || !exposure.isEmpty || showsCameraRaw else { return nil }
+        var line = Text(camera).fontWeight(.semibold).foregroundColor(LightboxColorTokens.primaryText)
+        if !camera.isEmpty, !exposure.isEmpty { line = line + Text(" · ") }
+        line = line + Text(exposure)
+        if camera.isEmpty, exposure.isEmpty { line = Text(localized("Edited in Camera Raw")) }
+        return line
+    }
 
     private var informationPanel: some View {
         VStack(alignment: .leading, spacing: 12) {

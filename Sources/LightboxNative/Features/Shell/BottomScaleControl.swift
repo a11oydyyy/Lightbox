@@ -159,8 +159,7 @@ private struct ViewModeToggle: View {
     }
 }
 
-/// Include subfolders, on or off: an icon with the filter button's selected
-/// capsule while on.
+/// Include subfolders, on or off: its name, in a filled capsule while on.
 private struct SubfolderScopeButton: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -172,17 +171,30 @@ private struct SubfolderScopeButton: View {
                 appState.galleryLayoutMode = appState.galleryLayoutMode.next
             }
         } label: {
-            // The same width on or off: the bar must not move.
-            Image(systemName: "square.stack.3d.up")
-                .font(.system(size: 11, weight: isOn ? .semibold : .medium))
-                .frame(width: 30, height: 24)
-                .bottomSelection(isOn)
+            // The same width on or off (sized by the bolder weight): the bar
+            // must not move.
+            ZStack {
+                title.fontWeight(.semibold).hidden()
+                title.fontWeight(isOn ? .semibold : .medium)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 24)
+            // Words need more than a weight change to read as on: a filled
+            // capsule, and secondary (not the icons' tertiary) when off.
+            .foregroundStyle(isOn ? HierarchicalShapeStyle.primary : .secondary)
+            .background {
+                if isOn { Capsule(style: .continuous).fill(Color.primary.opacity(0.1)) }
+            }
                 .contentShape(Capsule(style: .continuous))
         }
         .buttonStyle(LightboxButtonHoverStyle(shape: Capsule(style: .continuous)))
         .help(appState.localized(.includeSubfoldersHelp))
         .accessibilityLabel(appState.localized(.includeSubfolders))
         .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+
+    private var title: Text {
+        Text(appState.localized(.includeSubfolders)).font(.system(size: 11.5))
     }
 }
 
@@ -265,6 +277,7 @@ private struct SortFilterButton: View {
     }
 
     private func label(_ field: String) -> some View {
+        // The sort and its direction alone; hover shows it is a button.
         HStack(spacing: 4) {
             Text(field)
                 .font(.system(size: 11.5, weight: .medium))
@@ -272,10 +285,6 @@ private struct SortFilterButton: View {
                 .fixedSize()
             Image(systemName: appState.sortDirectionIcon)
                 .font(.system(size: 9.5, weight: .semibold))
-            Image(systemName: "chevron.down")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.leading, 1)
         }
     }
 }

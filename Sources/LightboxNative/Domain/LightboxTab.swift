@@ -18,7 +18,6 @@ struct LightboxTab: Identifiable, Equatable, Sendable {
     var attributeFilter: GalleryAttributeFilter
     var isStartPage: Bool = false
     var sortField: GallerySortField
-    var isPinned: Bool
     var sortDirection: GallerySortDirection
     var layoutMode: GalleryLayoutMode
     var thumbnailWidth: CGFloat
@@ -33,7 +32,6 @@ struct LightboxTab: Identifiable, Equatable, Sendable {
         source: LibrarySource,
         folderURL: URL,
         isStartPage: Bool = false,
-        isPinned: Bool = false,
         backHistory: [LightboxTabLocation] = [],
         forwardHistory: [LightboxTabLocation] = [],
         searchText: String = "",
@@ -50,7 +48,6 @@ struct LightboxTab: Identifiable, Equatable, Sendable {
         preservesUnavailableFolder: Bool = false
     ) {
         self.isStartPage = isStartPage
-        self.isPinned = isPinned
         self.id = id
         self.source = source
         self.folderURL = folderURL.standardizedFileURL

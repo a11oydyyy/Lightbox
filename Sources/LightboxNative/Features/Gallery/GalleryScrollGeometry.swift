@@ -22,6 +22,8 @@ final class GalleryScrollGeometry {
     private(set) var contentFrames: [LightboxAsset.ID: CGRect] = [:]
     private var frameOwners: [LightboxAsset.ID: UUID] = [:]
     var folderFrame: CGRect?
+    /// The gallery's scroll view, for scrolling while a selection is dragged.
+    weak var scrollView: NSScrollView?
     var groupHeaderFrames: [String: CGRect] = [:]
     private(set) var origin = GalleryContentOrigin(selection: .zero, preview: .zero, scrollOffset: 0)
     /// Whether `origin` was reported since the last reset; until then it reads

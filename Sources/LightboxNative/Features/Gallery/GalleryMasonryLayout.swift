@@ -232,6 +232,7 @@ private final class GalleryMasonryViewportView: NSView {
     var revealLanded: ((Int) -> Void)?
     private weak var clip: NSClipView?
     private var token: NSObjectProtocol?
+    private var contentToken: NSObjectProtocol?
     private var pending = false
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -245,6 +246,15 @@ private final class GalleryMasonryViewportView: NSView {
                 object: clip, queue: .main) { [weak self] _ in
                     MainActor.assumeIsolated { self?.scheduleUpdate() }
                 }
+            // A group or the folder row collapsing above moves this grid
+            // without scrolling or resizing it; the content's height changes.
+            if let content = enclosingScrollView?.documentView {
+                content.postsFrameChangedNotifications = true
+                contentToken = NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification,
+                    object: content, queue: .main) { [weak self] _ in
+                        MainActor.assumeIsolated { self?.scheduleUpdate() }
+                    }
+            }
         }
         scheduleUpdate()
     }
@@ -261,7 +271,9 @@ private final class GalleryMasonryViewportView: NSView {
     }
     func detach() {
         if let token { NotificationCenter.default.removeObserver(token) }
+        if let contentToken { NotificationCenter.default.removeObserver(contentToken) }
         token = nil
+        contentToken = nil
         clip = nil
     }
 

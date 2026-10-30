@@ -82,7 +82,9 @@ extension AppState {
     func fileTransferStatusText(_ progress: FileTransferProgress) -> String {
         switch progress.phase {
         case .active:
-            let action = localized(progress.operation == .copy ? .copyingFiles : .movingFiles)
+            let action = progress.operation == .exportJPEG
+                ? exportText.exporting
+                : localized(progress.operation == .copy ? .copyingFiles : .movingFiles)
             return "\(action) \(min(progress.completedCount, progress.totalCount))/\(progress.totalCount)"
         case .completed:
             return localized(.fileTransferComplete)
@@ -98,6 +100,10 @@ extension AppState {
     }
 
     func applyFileTransferResult(_ result: FileTransferResult) {
+        if result.operation == .exportJPEG,
+           result.failures.contains(where: { $0.message.contains(PhotoshopJPEGExport.notPermittedMessage) }) {
+            presentPhotoshopPermissionAlert()
+        }
         let committedFailureDestinations = result.failures.compactMap(\.committedDestinationURL)
         guard !result.successes.isEmpty || !committedFailureDestinations.isEmpty else { return }
         let effectiveMoves = result.operation == .move
@@ -113,6 +119,11 @@ extension AppState {
                 var paths = [success.destinationURL.deletingLastPathComponent().standardizedFileURL.path]
                 if result.operation == .move {
                     paths.append(success.sourceURL.deletingLastPathComponent().standardizedFileURL.path)
+                }
+                // An export may have made its folder inside the one shown.
+                if result.operation == .exportJPEG {
+                    paths.append(success.destinationURL.deletingLastPathComponent()
+                        .deletingLastPathComponent().standardizedFileURL.path)
                 }
                 return paths
             } + committedFailureDestinations.map {

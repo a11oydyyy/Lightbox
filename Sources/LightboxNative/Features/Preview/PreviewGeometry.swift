@@ -7,12 +7,19 @@ enum PreviewGeometry {
     static let controlsGap: CGFloat = 24
     /// The details never sit closer than this to the window's bottom edge.
     static let controlsBottomMargin: CGFloat = 28
+    /// The details never ride up closer than this to the image.
+    static let controlsMinimumGap: CGFloat = 8
 
     /// Top edge of the details block: just below the image, lifted only as far
     /// as needed to keep the bottom margin. Anchored by its top so details that
     /// load later (camera, exposure) grow downward instead of shifting it.
+    /// When the block is too tall for both, it gives up bottom margin rather
+    /// than covering the image.
     static func controlsTop(imageBottom: CGFloat, controlsHeight: CGFloat, viewportHeight: CGFloat) -> CGFloat {
-        min(imageBottom + controlsGap, viewportHeight - controlsBottomMargin - controlsHeight)
+        max(
+            imageBottom + controlsMinimumGap,
+            min(imageBottom + controlsGap, viewportHeight - controlsBottomMargin - controlsHeight)
+        )
     }
 
     static func previewSize(assetSize: CGSize, viewport: CGSize) -> CGSize {

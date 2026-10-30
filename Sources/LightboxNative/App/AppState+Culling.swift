@@ -1,8 +1,9 @@
 import AppKit
 import Foundation
+import SwiftUI
 
 /// A culling decision, stored as a Finder color tag so other apps see it.
-enum CullMark: Equatable, Sendable {
+enum CullMark: Hashable, Sendable {
     case keep
     case reject
     /// Neither: removes both tags.
@@ -16,6 +17,15 @@ enum CullMark: Equatable, Sendable {
         case .keep: Self.keepTag
         case .reject: Self.rejectTag
         case .clear: nil
+        }
+    }
+
+    /// The key in the preview and beside the Image menu item, as Lightroom's.
+    var keyEquivalent: KeyEquivalent {
+        switch self {
+        case .keep: "p"
+        case .reject: "x"
+        case .clear: "u"
         }
     }
 
@@ -66,6 +76,19 @@ extension AppState {
         if let index = images.firstIndex(where: { $0.id == asset.id }), index < images.count - 1 {
             stepPreview(.next)
         }
+    }
+
+    /// Whether the preview's P, X, U and Z apply: an image file in the
+    /// preview, with the keys going to it rather than to a text field.
+    var canUsePreviewKeys: Bool {
+        guard previewKeysActive, previewPhase == .opening || previewPhase == .open,
+              let asset = previewAsset else { return false }
+        return asset.isImage && asset.sourceURL != nil && !asset.isDeleted
+    }
+
+    func requestPreviewZoom() {
+        guard canUsePreviewKeys else { return }
+        previewZoomRequest &+= 1
     }
 
     func registerTagUndo(actionName: String) -> TagUndoStep? {

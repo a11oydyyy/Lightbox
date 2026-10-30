@@ -6,8 +6,8 @@ APP_NAME="LightboxNative"
 APP_BUNDLE_NAME="Lightbox"
 BUNDLE_ID="io.github.a11oydyyy.Lightbox"
 MIN_SYSTEM_VERSION="15.0"
-VERSION="2.4.2"
-BUILD_NUMBER="133"
+VERSION="2.4.6"
+BUILD_NUMBER="137"
 BUILD_ARCH_ARGS=()
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -113,7 +113,7 @@ build_bundle() {
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSAppleEventsUsageDescription</key>
-  <string>Lightbox asks Finder to restore images from the system Trash.</string>
+  <string>Lightbox asks Finder to restore images from the system Trash, and Photoshop to export JPEGs.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>UTExportedTypeDeclarations</key>

@@ -209,54 +209,6 @@ private func makeTestAppState(
     #expect(state.searchText == "active search")
 }
 
-@Test @MainActor func pinnedTabsStayFirstAndSurviveBulkClosingAndRestore() {
-    let defaults = LightboxTestUserDefaults()!
-    let state = makeTestAppState(libraryDefaults: defaults)
-    let firstID = state.activeTabID
-    state.newTab()
-    let pinnedID = state.activeTabID
-    state.newTab()
-    let lastID = state.activeTabID
-    state.toggleTabPinned(pinnedID)
-    #expect(state.tabs.map(\.id) == [pinnedID, firstID, lastID])
-    #expect(state.activeTabID == lastID)
-    #expect(state.tabs[0].isPinned)
-    let restored = LightboxTabStore.load(sources: state.sources, defaults: defaults)
-    #expect(restored?.tabs.first?.isPinned == true)
-    #expect(restored?.tabs.first?.id == pinnedID)
-
-    state.closeOtherTabs(keeping: firstID)
-    #expect(state.tabs.map(\.id) == [pinnedID, firstID])
-    #expect(state.activeTabID == firstID)
-    #expect(!state.canCloseOtherTabs(keeping: firstID))
-    state.toggleTabPinned(pinnedID)
-    #expect(state.tabs.first?.isPinned == false)
-    #expect(state.canCloseOtherTabs(keeping: firstID))
-}
-
-@Test @MainActor func newAndDuplicateTabsRemainOutsidePinnedGroup() {
-    let state = makeTestAppState()
-    let firstID = state.activeTabID
-    state.newTab()
-    let secondID = state.activeTabID
-    state.toggleTabPinned(firstID)
-    state.toggleTabPinned(secondID)
-    state.selectTab(firstID)
-    state.newTab()
-    #expect(state.tabs.prefix(2).allSatisfy { $0.isPinned })
-    #expect(!state.tabs[2].isPinned)
-    let newID = state.activeTabID
-    // The sidebar's reorder keeps an unpinned tab out of the pinned group.
-    state.reorderTabs([newID], before: firstID)
-    #expect(state.tabs[2].id == newID)
-    state.duplicateTab(firstID)
-    #expect(state.tabs.prefix(2).allSatisfy { $0.isPinned })
-    #expect(!state.tabs[2].isPinned)
-    #expect(state.tabs[2].id == state.activeTabID)
-    state.closeTabsAfter(firstID)
-    #expect(state.tabs.map(\.id) == [firstID, secondID])
-}
-
 @Test func previewTargetFrameIsCenteredInViewport() async throws {
     let viewport = CGSize(width: 1600, height: 1000)
     let assetSize = CGSize(width: 750, height: 909)
@@ -6067,7 +6019,7 @@ private actor UpdateRequestCounter {
     state.galleryLayoutMode = .masonry
 }
 
-@Test @MainActor func nativeTabReorderKeepsPinnedGroupAndActiveSelection() {
+@Test @MainActor func nativeTabReorderKeepsActiveSelection() {
     let appState = makeTestAppState()
     appState.newTab()
     appState.newTab()
@@ -6075,10 +6027,6 @@ private actor UpdateRequestCounter {
     let active = appState.activeTabID
     appState.reorderTabs([initial[0]], before: nil)
     #expect(appState.tabs.map(\.id) == Array(initial.dropFirst()) + [initial[0]])
-    #expect(appState.activeTabID == active)
-    appState.toggleTabPinned(initial[0])
-    appState.reorderTabs([initial[0]], before: nil)
-    #expect(appState.tabs.first?.id == initial[0])
     #expect(appState.activeTabID == active)
 }
 

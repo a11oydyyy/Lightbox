@@ -74,6 +74,9 @@ struct PreviewOverlay: View {
                 PreviewKeyboardLayer(
                     requestsFocus: !showsInformation,
                     onFocusAcquired: { appState.markPreviewKeyboardFocusAcquired(sessionID: keyboardSessionID) },
+                    onKeysActiveChanged: { active in
+                        if appState.previewKeysActive != active { appState.previewKeysActive = active }
+                    },
                     onInformation: { showsInformation = true },
                     onPrevious: {
                         appState.stepPreview(.previous)
@@ -274,6 +277,7 @@ struct PreviewOverlay: View {
             .onDisappear {
                 previewOverlayLogger.info("preview overlay disappear asset=\(asset.originalName, privacy: .public) isPresented=\(isPresented, privacy: .public) isClosing=\(isClosing, privacy: .public)")
                 appState.markPreviewInteractionLayerReady(false)
+                appState.previewKeysActive = false
                 presentationTask?.cancel()
                 highResolutionTask?.cancel()
             }
@@ -304,6 +308,7 @@ struct PreviewOverlay: View {
                     lockGeometry(for: current, viewport: proxy.size)
                 }
             }
+            .onChange(of: appState.previewZoomRequest) { _ in toggleZoom() }
             .onChange(of: appState.isPreviewClosing) { closing in
                 if closing {
                     closeFromExternalRoute()
@@ -499,6 +504,7 @@ struct PreviewOverlay: View {
 private struct PreviewKeyboardLayer: NSViewRepresentable {
     var requestsFocus: Bool
     var onFocusAcquired: () -> Void
+    var onKeysActiveChanged: (Bool) -> Void
     var onInformation: () -> Void
     var onPrevious: () -> Void
     var onNext: () -> Void
@@ -509,6 +515,7 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
     func makeNSView(context: Context) -> PreviewKeyboardView {
         let view = PreviewKeyboardView()
         view.onFocusAcquired = onFocusAcquired
+        view.onKeysActiveChanged = onKeysActiveChanged
         view.onPrevious = onPrevious
         view.onNext = onNext
         view.onCull = onCull
@@ -519,6 +526,7 @@ private struct PreviewKeyboardLayer: NSViewRepresentable {
 
     func updateNSView(_ nsView: PreviewKeyboardView, context: Context) {
         nsView.onFocusAcquired = onFocusAcquired
+        nsView.onKeysActiveChanged = onKeysActiveChanged
         nsView.onInformation = onInformation
         nsView.onPrevious = onPrevious
         nsView.onNext = onNext
@@ -534,9 +542,47 @@ final class PreviewKeyboardView: NSView {
         didSet { if requestedFocus && !oldValue { requestFocusWhenAttached() } }
     }
 
+    nonisolated(unsafe) private var keyWindowObservers: [NSObjectProtocol] = []
+
+    deinit {
+        keyWindowObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        keyWindowObservers.forEach(NotificationCenter.default.removeObserver)
+        keyWindowObservers = []
+        if let window {
+            // A sheet or another window taking the keys turns the menu's P, X, U, Z off.
+            keyWindowObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map {
+                NotificationCenter.default.addObserver(forName: $0, object: window, queue: .main) { [weak self] _ in
+                    self?.reportKeysActive()
+                }
+            }
+        }
         requestFocusWhenAttached()
+        reportKeysActive()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        reportKeysActive()
+        return became
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        reportKeysActive()
+        return resigned
+    }
+
+    /// After the responder change settles, and outside SwiftUI's view update.
+    private func reportKeysActive() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let window = self.window
+            self.onKeysActiveChanged(window?.isKeyWindow == true && window?.firstResponder === self)
+        }
     }
 
     private func requestFocusWhenAttached() {
@@ -553,6 +599,7 @@ final class PreviewKeyboardView: NSView {
     }
     var onInformation: () -> Void = {}
     var onFocusAcquired: () -> Void = {}
+    var onKeysActiveChanged: (Bool) -> Void = { _ in }
     var onPrevious: () -> Void = {}
     var onNext: () -> Void = {}
     var onCull: (CullMark) -> Void = { _ in }
@@ -624,7 +671,7 @@ private struct CullFeedbackBadge: View {
     }
 }
 
-/// Says the preview is at 100% and how to leave it.
+/// Says the preview is at 100%.
 private struct PreviewZoomBadge: View {
     @EnvironmentObject private var appState: AppState
 

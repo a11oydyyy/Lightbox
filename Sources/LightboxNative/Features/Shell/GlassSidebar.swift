@@ -304,6 +304,8 @@ private struct SidebarSection<Content: View>: View {
                 Text(title)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(LightboxColorTokens.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: 0)
                 if let accessory {
@@ -900,12 +902,6 @@ private struct SidebarTabRow: View {
                         .font(.system(size: 13, weight: active ? .semibold : .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if tab.isPinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(LightboxColorTokens.secondaryText)
-                            .accessibilityLabel(appState.localized(.pinTab))
-                    }
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)

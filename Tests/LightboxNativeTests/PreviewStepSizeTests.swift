@@ -126,3 +126,15 @@ import Testing
         }
     }
 }
+
+// A details block taller than the space below the image (camera, exposure,
+// Camera Raw and keys all present) must never be lifted onto the image.
+@Test func tallPreviewDetailsNeverCoverTheImage() {
+    let viewport = CGSize(width: 980, height: 680)
+    let size = PreviewGeometry.previewSize(assetSize: CGSize(width: 2250, height: 3000), viewport: viewport)
+    let imageBottom = (viewport.height + size.height) / 2
+    for height in [CGFloat(120), 150, 180] {
+        let top = PreviewGeometry.controlsTop(imageBottom: imageBottom, controlsHeight: height, viewportHeight: viewport.height)
+        #expect(top >= imageBottom + PreviewGeometry.controlsMinimumGap, "height \(height): top \(top), image bottom \(imageBottom)")
+    }
+}

@@ -8,9 +8,6 @@ struct TabContextMenu: View {
         Button(appState.localized(.duplicateTab)) {
             appState.duplicateTab(tab.id)
         }
-        Button(appState.localized(tab.isPinned ? .unpinTab : .pinTab)) {
-            appState.toggleTabPinned(tab.id)
-        }
 
         if !tab.isStartPage {
             Divider()

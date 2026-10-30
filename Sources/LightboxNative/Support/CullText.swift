@@ -35,16 +35,12 @@ struct CullText {
         }
     }
 
-    /// The preview's hint for the keys.
-    var keysHint: String {
-        pick("P Keep · X Reject · U Clear · Z 100%", "P 保留 · X 淘汰 · U 取消 · Z 100%",
-             "P 保留 · X 淘汰 · U 取消 · Z 100%", "P 採用 · X 除外 · U 解除 · Z 100%")
-    }
-
     /// Shown while the preview is at 100%.
-    var zoomBadge: String {
-        pick("100% · Drag to move · Z or click to fit", "100% · 拖动查看 · Z 或点按返回",
-             "100% · 拖動查看 · Z 或點按返回", "100% · ドラッグで移動 · Z かクリックで戻る")
+    var zoomBadge: String { "100%" }
+
+    /// Image › Actual Size, Z beside it.
+    var zoomMenuItem: String {
+        pick("Actual Size", "实际大小", "實際大小", "実際のサイズ")
     }
 
     /// The preview's zoom button.

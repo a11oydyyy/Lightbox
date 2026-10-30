@@ -61,6 +61,22 @@ struct LightboxCommands: Commands {
             }
             .keyboardShortcut("f", modifiers: [.command])
             .disabled(appState.isShowingStartPage)
+
+            // Photoshop, for finishing Camera Raw edits and exporting them.
+            if PhotoshopJPEGExport.applicationURL != nil {
+                Divider()
+                Button(appState.exportText.openInPhotoshop) {
+                    appState.openSelectionInPhotoshop()
+                }
+                .keyboardShortcut("o", modifiers: [.command, .option])
+                .disabled(!appState.canSendSelectionToPhotoshop)
+
+                Button(appState.exportText.exportMenuItem) {
+                    appState.exportSelectionAsJPEG()
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(!appState.canSendSelectionToPhotoshop)
+            }
         }
 
         // View: how the folder is shown, as Finder's View menu.
@@ -262,6 +278,24 @@ struct LightboxCommands: Commands {
             }
             .keyboardShortcut(.escape, modifiers: [])
             .disabled(!appState.hasActiveOverlay)
+
+            Divider()
+
+            // Culling in the preview. Bare keys, so on only while the preview
+            // has the keyboard; a text field never loses them.
+            ForEach([CullMark.keep, .reject, .clear], id: \.self) { mark in
+                Button(CullText(appState.appLanguage).actionName(mark)) {
+                    appState.markPreviewAsset(mark)
+                }
+                .keyboardShortcut(mark.keyEquivalent, modifiers: [])
+                .disabled(!appState.canUsePreviewKeys)
+            }
+
+            Button(CullText(appState.appLanguage).zoomMenuItem) {
+                appState.requestPreviewZoom()
+            }
+            .keyboardShortcut("z", modifiers: [])
+            .disabled(!appState.canUsePreviewKeys)
 
             Divider()
 

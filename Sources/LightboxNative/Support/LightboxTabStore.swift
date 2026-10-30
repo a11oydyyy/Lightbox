@@ -46,7 +46,6 @@ private struct SavedTab: Codable {
     var source: LibrarySource
     var folderPath: String
     var isStartPage: Bool?
-    var isPinned: Bool?
     var backHistory: [TabLocationSession]
     var forwardHistory: [TabLocationSession]
     var searchText: String
@@ -62,7 +61,6 @@ private struct SavedTab: Codable {
         id = tab.id
         source = tab.source
         isStartPage = tab.isStartPage
-        isPinned = tab.isPinned
         folderPath = tab.folderURL.standardizedFileURL.path
         backHistory = tab.backHistory.map(TabLocationSession.init)
         forwardHistory = tab.forwardHistory.map(TabLocationSession.init)
@@ -85,7 +83,6 @@ private struct SavedTab: Codable {
             source: resolvedSource,
             folderURL: URL(fileURLWithPath: folderPath, isDirectory: true),
             isStartPage: isStartPage ?? false,
-            isPinned: isPinned ?? false,
             backHistory: backHistory.map { $0.makeLocation(resolvingAgainst: sources) },
             forwardHistory: forwardHistory.map { $0.makeLocation(resolvingAgainst: sources) },
             searchText: searchText,

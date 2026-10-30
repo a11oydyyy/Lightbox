@@ -3,11 +3,11 @@ import Testing
 @testable import LightboxNative
 
 @MainActor
-private func makeSession(_ names: [String], pinned: Int = 0) throws -> (TabSession, [LightboxTab], UserDefaults) {
+private func makeSession(_ names: [String]) throws -> (TabSession, [LightboxTab], UserDefaults) {
     let defaults = try #require(UserDefaults(suiteName: "LightboxTabSession-\(UUID())"))
     let source = LibrarySource.favorites(rootURL: URL(fileURLWithPath: "/tmp/tabs"))
-    let tabs = names.enumerated().map { index, name in
-        LightboxTab(source: source, folderURL: URL(fileURLWithPath: "/tmp/tabs/\(name)"), isPinned: index < pinned)
+    let tabs = names.map { name in
+        LightboxTab(source: source, folderURL: URL(fileURLWithPath: "/tmp/tabs/\(name)"))
     }
     let session = TabSession(defaults: defaults)
     session.restore(tabs, activeTabID: tabs[0].id)
@@ -19,15 +19,16 @@ private func names(_ session: TabSession) -> [String] {
     session.tabs.map(\.folderURL.lastPathComponent)
 }
 
-@Test @MainActor func tabSessionKeepsPinnedTabsAsALeadingGroup() throws {
-    let (session, tabs, _) = try makeSession(["p1", "p2", "a", "b"], pinned: 2)
+@Test @MainActor func tabSessionInsertsAndReordersTabs() throws {
+    let (session, tabs, _) = try makeSession(["a", "b", "c"])
     let source = tabs[0].source
     session.insert(LightboxTab(source: source, folderURL: URL(fileURLWithPath: "/tmp/tabs/new")), after: 0)
-    #expect(names(session) == ["p1", "p2", "new", "a", "b"])
-    session.togglePinned(tabs[3].id)   // pin "b"
-    #expect(names(session) == ["p1", "p2", "b", "new", "a"])
-    session.togglePinned(tabs[0].id)   // unpin "p1"
-    #expect(names(session) == ["p2", "b", "p1", "new", "a"])
+    #expect(names(session) == ["a", "new", "b", "c"])
+    session.insert(LightboxTab(source: source, folderURL: URL(fileURLWithPath: "/tmp/tabs/end")), after: nil)
+    #expect(names(session) == ["a", "new", "b", "c", "end"])
+    #expect(session.reorder([tabs[2].id], before: tabs[0].id))
+    #expect(names(session) == ["c", "a", "new", "b", "end"])
+    #expect(!session.reorder([tabs[2].id], before: tabs[0].id))
 }
 
 @Test @MainActor func tabSessionStepsThroughHistory() throws {

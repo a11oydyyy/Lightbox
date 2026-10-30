@@ -113,6 +113,17 @@ extension AppState {
         galleryKeyboardScrollGeneration &+= 1
     }
 
+    /// Edit › Select All when neither a card nor a text field takes it, as
+    /// after a drag selection or a click on empty space: every file shown.
+    var canSelectAllInGallery: Bool {
+        !hasActiveOverlay && !isShowingStartPage && !activeAssetIDs.isEmpty
+    }
+
+    func selectAllInGallery() {
+        guard canSelectAllInGallery else { return }
+        replaceSelection(with: activeAssetIDs)
+    }
+
     func replaceSelection(with ids: Set<LightboxAsset.ID>) {
         let primary = firstVisibleID(in: ids)
         replaceSelection(with: ids, primary: primary, anchor: primary)

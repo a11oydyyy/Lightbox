@@ -86,7 +86,6 @@ extension AppState {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
         var duplicate = tabs[index]
         duplicate.id = UUID()
-        duplicate.isPinned = false
         duplicate.selectedAssetIDs = []
         duplicate.selectedAssetID = nil
         tabSession.insert(duplicate, after: index)
@@ -95,28 +94,21 @@ extension AppState {
 
     func canCloseTabsAfter(_ tabID: UUID) -> Bool {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return false }
-        return tabs.dropFirst(index + 1).contains { !$0.isPinned }
+        return index + 1 < tabs.count
     }
 
     func canCloseOtherTabs(keeping tabID: UUID) -> Bool {
-        tabs.contains { $0.id != tabID && !$0.isPinned }
-    }
-
-    func toggleTabPinned(_ tabID: UUID) {
-        guard tabs.contains(where: { $0.id == tabID }) else { return }
-        captureActiveTabState()
-        tabSession.togglePinned(tabID)
-        persistTabsImmediately()
+        tabs.contains { $0.id != tabID }
     }
 
     func closeOtherTabs(keeping tabID: UUID) {
         guard tabs.contains(where: { $0.id == tabID }) else { return }
-        closeTabs(Set(tabs.filter { $0.id != tabID && !$0.isPinned }.map(\.id)), keeping: tabID)
+        closeTabs(Set(tabs.filter { $0.id != tabID }.map(\.id)), keeping: tabID)
     }
 
     func closeTabsAfter(_ tabID: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
-        closeTabs(Set(tabs.dropFirst(index + 1).filter { !$0.isPinned }.map(\.id)), keeping: tabID)
+        closeTabs(Set(tabs.dropFirst(index + 1).map(\.id)), keeping: tabID)
     }
 
     private func closeTabs(_ tabIDs: Set<UUID>, keeping tabID: UUID) {

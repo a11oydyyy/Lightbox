@@ -3,6 +3,8 @@ import Foundation
 enum FileTransferOperation: String, Equatable, Sendable {
     case copy
     case move
+    /// JPEGs rendered by Photoshop (`PhotoshopJPEGExport`); the sources stay.
+    case exportJPEG
 }
 
 struct FileTransferRequest: Identifiable, Equatable, Sendable {
@@ -10,6 +12,8 @@ struct FileTransferRequest: Identifiable, Equatable, Sendable {
     var sourceURLs: [URL]
     var destinationFolderURL: URL
     var operation: FileTransferOperation
+    /// How to export, for `.exportJPEG`.
+    var jpegExport: JPEGExportOptions? = nil
 }
 
 struct FileTransferProgressUpdate: Equatable, Sendable {

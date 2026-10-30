@@ -198,6 +198,9 @@ struct RootShellView: View {
         .sheet(item: $appState.renameRequest) { request in
             RenameSheet(appState: appState, request: request)
         }
+        .sheet(item: $appState.jpegExportRequest) { request in
+            JPEGExportSheet(appState: appState, request: request)
+        }
         .sheet(item: $appState.folderRenameRequest) { request in
             RenameFolderSheet(appState: appState, request: request)
         }

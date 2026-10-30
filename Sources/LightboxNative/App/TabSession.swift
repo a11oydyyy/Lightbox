@@ -42,7 +42,6 @@ final class TabSession: ObservableObject {
     var activeTabIndex: Int? { tabs.firstIndex { $0.id == activeTabID } }
     var canGoBack: Bool { activeTab?.backHistory.isEmpty == false }
     var canGoForward: Bool { activeTab?.forwardHistory.isEmpty == false }
-    private var pinnedCount: Int { tabs.filter(\.isPinned).count }
 
     func tab(_ id: UUID) -> LightboxTab? { tabs.first { $0.id == id } }
 
@@ -67,12 +66,10 @@ final class TabSession: ObservableObject {
         activeTabID = id
     }
 
-    /// Inserts `tab` after `index` (the end when nil), never among the
-    /// pinned tabs unless it is pinned itself.
+    /// Inserts `tab` after `index` (the end when nil).
     func insert(_ tab: LightboxTab, after index: Int?) {
         let position = (index ?? tabs.count - 1) + 1
-        let lowerBound = tab.isPinned ? 0 : pinnedCount
-        tabs.insert(tab, at: min(max(position, lowerBound), tabs.count))
+        tabs.insert(tab, at: min(max(position, 0), tabs.count))
     }
 
     func update(_ id: UUID, _ body: (inout LightboxTab) -> Void) {
@@ -104,22 +101,13 @@ final class TabSession: ObservableObject {
         forgetContent(except: Set(tabs.map(\.id)))
     }
 
-    /// Pins or unpins a tab, moving it to the end of the pinned group.
-    func togglePinned(_ id: UUID) {
-        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        var tab = tabs.remove(at: index)
-        tab.isPinned.toggle()
-        tabs.insert(tab, at: pinnedCount)
-    }
-
-    /// Moves `ids` before `target` (to the end when nil), keeping pinned
-    /// tabs a leading group. Returns whether the order changed.
+    /// Moves `ids` before `target` (to the end when nil). Returns whether
+    /// the order changed.
     @discardableResult
     func reorder(_ ids: [UUID], before target: UUID?) -> Bool {
         let next = SidebarOrder.moving(ids, before: target, in: tabs)
-        let grouped = next.filter(\.isPinned) + next.filter { !$0.isPinned }
-        guard grouped.map(\.id) != tabs.map(\.id) else { return false }
-        tabs = grouped
+        guard next.map(\.id) != tabs.map(\.id) else { return false }
+        tabs = next
         return true
     }
 
