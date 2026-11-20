@@ -132,13 +132,19 @@ enum FileRenamer {
         let sourceKeys = Set(moves.map { key($0.from) })
         var done: [FileRenameMove] = []
         var pending: [(current: URL, move: FileRenameMove)] = []
+        // Marked in use, so a stale-item sweep never mistakes them for crash leftovers.
+        var inUse: [URL] = []
+        defer { inUse.forEach(StaleTemporaryItems.unregisterInUse) }
         for (index, move) in moves.enumerated() {
             guard sourceKeys.contains(key(move.to)) else {
                 pending.append((move.from, move))
                 continue
             }
             let temporary = move.from.deletingLastPathComponent()
-                .appendingPathComponent(".lightbox-rename-\(UUID().uuidString)-\(index)")
+                .appendingPathComponent(StaleTemporaryItems.renameTemporaryName(
+                    index: index, original: move.from.lastPathComponent))
+            StaleTemporaryItems.registerInUse(temporary)
+            inUse.append(temporary)
             if let error = rename(move.from, to: temporary) {
                 rollBack(done)
                 return .failure(issue(for: error, name: move.to.lastPathComponent))
@@ -181,12 +187,8 @@ enum FileRenamer {
 
     /// Never replaces an existing file.
     private static func rename(_ source: URL, to target: URL) -> Int32? {
-        let result = source.withUnsafeFileSystemRepresentation { from in
-            target.withUnsafeFileSystemRepresentation { to in
-                renamex_np(from, to, UInt32(RENAME_EXCL))
-            }
-        }
-        return result == 0 ? nil : errno
+        let error = ExclusiveRename.rename(source, to: target)
+        return error == 0 ? nil : error
     }
 
     private static func rollBack(_ done: [FileRenameMove]) {

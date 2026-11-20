@@ -215,6 +215,26 @@ func jpegExportScriptProtectsOpenDocuments(scenario: String) throws {
     }
 }
 
+@Test func jpegExportReplacementProtectsEverySourceInTheBatch() throws {
+    let folder = try makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let jpeg = folder.appendingPathComponent("photo.jpg")
+    let raw = folder.appendingPathComponent("photo.raw")
+    try Data([9]).write(to: jpeg)
+    try Data([8]).write(to: raw)
+    var options = JPEGExportOptions()
+    options.folderPath = folder.path
+    options.replacesExisting = true
+    let request = FileTransferRequest(sourceURLs: [raw, jpeg], destinationFolderURL: folder,
+                                      operation: .exportJPEG, jpegExport: options)
+    let result = PhotoshopJPEGExport.perform(request, progress: { _ in }, shouldCancel: { false },
+                                             permission: { nil }, runner: FakePhotoshop().runner)
+    #expect(result.failures.isEmpty && result.successes.count == 2)
+    #expect(try Data(contentsOf: jpeg) == Data([9]))
+    #expect(try Data(contentsOf: raw) == Data([8]))
+    #expect(result.successes.map(\.destinationURL.lastPathComponent) == ["photo 2.jpg", "photo 3.jpg"])
+}
+
 @Test func jpegExportOptionsAreRemembered() throws {
     let defaults = try #require(UserDefaults(suiteName: "JPEGExport-\(UUID())"))
     #expect(JPEGExportOptions.load(defaults: defaults) == JPEGExportOptions())
@@ -258,4 +278,37 @@ func jpegExportThroughPhotoshopAppliesCameraRawSettings() throws {
         .flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] })
     #expect(max(size[kCGImagePropertyPixelWidth] as? Int ?? 0, size[kCGImagePropertyPixelHeight] as? Int ?? 0) <= 1200)
     #expect(try meanBrightness(output) > meanBrightness(source) + 0.02)
+}
+
+// Asked to replace, an export takes the existing JPEG's place, but never the
+// source's, and two sources of one name still keep both of their JPEGs.
+@Test func jpegExportReplacesWhenAskedButNeverTheSource() throws {
+    let folder = try makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let jpeg = folder.appendingPathComponent("DSC1.JPG"), raw = folder.appendingPathComponent("DSC1.ARW")
+    let other = folder.appendingPathComponent("DSC2.ARW")
+    for url in [jpeg, raw, other] { FileManager.default.createFile(atPath: url.path, contents: Data([0])) }
+    let jpegFolder = folder.appendingPathComponent("JPEG")
+    try FileManager.default.createDirectory(at: jpegFolder, withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: jpegFolder.appendingPathComponent("DSC2.jpg").path, contents: Data([1]))
+
+    var options = JPEGExportOptions()
+    #expect(PhotoshopJPEGExport.conflicts([jpeg, raw, other], options: options) == [other])
+    options.replacesExisting = true
+    let request = FileTransferRequest(sourceURLs: [jpeg, raw, other], destinationFolderURL: jpegFolder,
+                                      operation: .exportJPEG, jpegExport: options)
+    let result = PhotoshopJPEGExport.perform(request, progress: { _ in }, shouldCancel: { false }, permission: { nil },
+                                             runner: FakePhotoshop().runner)
+    #expect(result.failures.isEmpty)
+    #expect(result.successes.map(\.destinationURL.lastPathComponent) == ["DSC1.jpg", "DSC1 2.jpg", "DSC2.jpg"])
+    #expect(try Data(contentsOf: jpegFolder.appendingPathComponent("DSC2.jpg")) == Data([0xFF]))
+
+    // Exported beside itself, a JPEG source is not a conflict and survives.
+    options.folderPath = folder.path
+    #expect(PhotoshopJPEGExport.conflicts([jpeg], options: options).isEmpty)
+    let beside = PhotoshopJPEGExport.perform(
+        FileTransferRequest(sourceURLs: [jpeg], destinationFolderURL: folder, operation: .exportJPEG, jpegExport: options),
+        progress: { _ in }, shouldCancel: { false }, permission: { nil }, runner: FakePhotoshop().runner)
+    #expect(beside.successes.map(\.destinationURL.lastPathComponent) == ["DSC1 2.jpg"])
+    #expect(try Data(contentsOf: jpeg) == Data([0]))
 }

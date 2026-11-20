@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **AI 開發聲明**<br>
+> 本專案之程式碼與文件主要由 AI Agent（Anthropic Claude 與 OpenAI Codex）完成，維護者僅負責制定產品的整體方向。我們認為，由 AI Agent 開發的軟體應予以明確標示，並與人類開發的軟體有所區分。
+
 <p align="center">
   <img src=".github/media/icon.png" width="128" height="128" alt="Lightbox App 圖示">
 </p>

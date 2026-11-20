@@ -50,6 +50,27 @@ struct ExportText {
 
     var exporting: String { pick("Exporting JPEGs", "正在导出 JPEG", "正在轉存 JPEG", "JPEG を書き出し中") }
 
+    // The title while an export runs and once it ends; numbers roll in place.
+    func progress(_ done: Int, of total: Int) -> String {
+        pick("Exporting \(done)/\(total)", "导出中 \(done)/\(total)", "轉存中 \(done)/\(total)", "書き出し中 \(done)/\(total)")
+    }
+    func exported(_ count: Int) -> String {
+        pick("Exported \(count)", "已导出 \(count) 张", "已轉存 \(count) 張", "\(count) 枚書き出し完了")
+    }
+    func notExported(_ count: Int) -> String {
+        pick("\(count) Not Exported", "\(count) 张未导出", "\(count) 張未轉存", "\(count) 枚書き出せず")
+    }
+    func existsTitle(count: Int, name: String) -> String {
+        count == 1
+            ? pick("“\(name)” already exists", "“\(name)”已存在", "「\(name)」已存在", "“\(name)”はすでにあります")
+            : pick("\(count) JPEGs already exist", "\(count) 个 JPEG 已存在", "\(count) 個 JPEG 已存在", "\(count) 個の JPEG がすでにあります")
+    }
+    var replace: String { pick("Replace", "替换", "取代", "置き換える") }
+    var keepBoth: String { pick("Keep Both", "保留两者", "保留兩者", "両方を残す") }
+    var cancelled: String { pick("Export Stopped", "已停止导出", "已停止轉存", "書き出しを中止") }
+    var stop: String { pick("Stop", "停止", "停止", "中止") }
+    var done: String { pick("Done", "完成", "完成", "完了") }
+
     var notPermittedTitle: String {
         pick("Lightbox can’t control Photoshop", "Lightbox 无法控制 Photoshop", "Lightbox 無法控制 Photoshop", "Lightbox が Photoshop を操作できません")
     }

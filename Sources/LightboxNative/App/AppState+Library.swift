@@ -129,6 +129,8 @@ extension AppState {
         let showsHiddenItems = showsHiddenItems
         let showsOtherFiles = showsOtherFiles
         let tabID = activeTabID
+        let trashMover = systemTrashMover
+        let language = appLanguage
         libraryLoadTask = Task.detached(priority: .userInitiated) { [weak self, source, showsHiddenItems, showsOtherFiles] in
             // SQLite reads and connection setup can wait on disk or another writer.
             // Never do them inside the main-actor tab activation path.
@@ -274,6 +276,23 @@ extension AppState {
                 self.scheduleSearch(preservingResults: preservingVisibleSnapshot, forceRefresh: !self.includesSubfolders)
                 self.captureActiveTabState()
                 Self.logger.info("refresh[\(refreshID)] apply complete applyTotal=\(Date().timeIntervalSince(applyStartedAt), format: .fixed(precision: 2))s folderEntries=\(self.folderEntries.count) storeAssets=\(self.assets.count) visibleSnapshotAssets=\(snapshot.count)")
+            }
+            // Only after the folder is on screen, and never awaited by the load.
+            let temporaryNames = directorySnapshot.temporaryNames
+            if !temporaryNames.isEmpty, !Task.isCancelled {
+                Task.detached(priority: .utility) { [weak self] in
+                    let outcome = StaleTemporaryItems.process(names: temporaryNames, in: folderURL, trash: trashMover)
+                    guard !outcome.renamedOriginals.isEmpty else { return }
+                    await MainActor.run {
+                        guard let self, let window = NSApp.mainWindow ?? NSApp.keyWindow,
+                              window.isVisible, window.attachedSheet == nil else { return }
+                        let announced = StaleTemporaryItems.unannounced(outcome.renamedOriginals)
+                        guard !announced.isEmpty else { return }
+                        StaleTemporaryItems.presentRenamedOriginalsAlert(
+                            announced, language: language, window: window
+                        ) { [weak self] in self?.scheduleLibraryRefresh() }
+                    }
+                }
             }
         }
     }

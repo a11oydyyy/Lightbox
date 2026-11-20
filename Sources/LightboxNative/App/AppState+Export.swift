@@ -45,12 +45,46 @@ extension AppState {
         options.save(defaults: libraryDefaults)
         let urls = request.assets.compactMap(\.sourceURL)
         guard let first = urls.first else { return }
+        var options = options
+        // Same name at the destination: replace, keep both (numbered), or stop.
+        let conflicts = PhotoshopJPEGExport.conflicts(urls, options: options)
+        if let conflict = conflicts.first {
+            let text = exportText
+            let alert = NSAlert()
+            alert.messageText = text.existsTitle(count: conflicts.count,
+                                                 name: options.destination(for: conflict).lastPathComponent)
+            alert.addButton(withTitle: text.keepBoth)
+            alert.addButton(withTitle: text.replace)
+            alert.addButton(withTitle: text.cancelButton)
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: break
+            case .alertSecondButtonReturn: options.replacesExisting = true
+            default: return
+            }
+        }
         fileTransfers.enqueue(FileTransferRequest(
             sourceURLs: urls,
             destinationFolderURL: options.destinationFolder(for: first),
             operation: .exportJPEG,
             jpegExport: options
         ))
+    }
+
+    /// The export the title shows, from its start until its status goes away
+    /// (failures stay until dismissed).
+    var titleExportProgress: FileTransferProgress? {
+        guard let progress = fileTransferProgress, progress.operation.isExport else { return nil }
+        return progress
+    }
+
+    func exportStatusText(_ progress: FileTransferProgress) -> String {
+        let text = exportText
+        switch progress.phase {
+        case .active: return text.progress(min(progress.completedCount, progress.totalCount), of: progress.totalCount)
+        case .completed: return text.exported(progress.completedCount)
+        case .failed: return text.notExported(progress.failedCount)
+        case .cancelled: return text.cancelled
+        }
     }
 
     /// Apple Events to Photoshop were refused: says where to allow them.

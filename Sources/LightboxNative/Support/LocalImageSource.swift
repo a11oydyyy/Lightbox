@@ -28,6 +28,8 @@ struct LocalFolderSnapshot: Sendable {
     var classificationSeconds: TimeInterval
     var metadataProbeSeconds: TimeInterval
     var sortSeconds: TimeInterval
+    /// Names of `.lightbox-*` temporary items seen by the directory read.
+    var temporaryNames: [String] = []
 }
 
 struct SystemTrashSnapshot: Sendable {
@@ -397,7 +399,8 @@ enum LocalImageSource {
             directoryReadSeconds: directoryReadSeconds,
             classificationSeconds: classificationSeconds,
             metadataProbeSeconds: metadataProbeSeconds,
-            sortSeconds: sortSeconds
+            sortSeconds: sortSeconds,
+            temporaryNames: posixResult.temporaryNames
         )
     }
 
@@ -749,6 +752,7 @@ enum LocalImageSource {
     private struct POSIXDirectoryEntriesResult {
         var urls: [POSIXDirectoryEntry]
         var availability: LocalFolderSnapshotAvailability
+        var temporaryNames: [String] = []
     }
 
     private static func directoryChildrenResult(
@@ -865,6 +869,7 @@ enum LocalImageSource {
         }
 
         var entries: [POSIXDirectoryEntry] = []
+        var temporaryNames: [String] = []
         while true {
             guard !Task.isCancelled else {
                 return POSIXDirectoryEntriesResult(
@@ -893,6 +898,9 @@ enum LocalImageSource {
             guard name != ".", name != ".." else {
                 continue
             }
+            if name.hasPrefix(".lightbox-"), StaleTemporaryItems.kind(ofName: name) != nil {
+                temporaryNames.append(name)
+            }
             guard !(options.contains(.skipsHiddenFiles) && name.hasPrefix(".")) else {
                 continue
             }
@@ -918,7 +926,7 @@ enum LocalImageSource {
             ))
         }
 
-        return POSIXDirectoryEntriesResult(urls: entries, availability: .available)
+        return POSIXDirectoryEntriesResult(urls: entries, availability: .available, temporaryNames: temporaryNames)
     }
 
     private static func unavailableReason(forPOSIXError errorCode: Int32) -> LocalFolderSnapshotUnavailableReason {

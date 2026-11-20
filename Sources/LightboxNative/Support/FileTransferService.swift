@@ -5,7 +5,8 @@ enum FileTransferService {
     static func perform(
         _ request: FileTransferRequest,
         progress: @escaping @Sendable (FileTransferProgressUpdate) -> Void,
-        shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled }
+        shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled },
+        flush: @escaping @Sendable (URL) -> Int32? = { ExclusiveRename.flushTree(at: $0) }
     ) -> FileTransferResult {
         let fileManager = FileManager.default
         let destinationFolder = request.destinationFolderURL.standardizedFileURL
@@ -74,7 +75,8 @@ enum FileTransferService {
                     to: preferredDestination,
                     operation: request.operation,
                     fileManager: fileManager,
-                    shouldCancel: shouldCancel
+                    shouldCancel: shouldCancel,
+                    flush: flush
                 )
                 if let failureMessage = outcome.failureMessage {
                     failures.append(
@@ -89,7 +91,7 @@ enum FileTransferService {
                     // Not counted as items of their own; only a sidecar left behind is reported.
                     for (sidecar, destination) in zip(sidecars, sidecarDestinations(for: outcome.destinationURL)) {
                         let sidecarOutcome = try? transferItem(from: sidecar, to: destination, operation: request.operation,
-                                                               fileManager: fileManager, shouldCancel: { false })
+                                                               fileManager: fileManager, shouldCancel: { false }, flush: flush)
                         if sidecarOutcome?.destinationURL != destination || sidecarOutcome?.failureMessage != nil {
                             failures.append(FileTransferFailure(
                                 sourceURL: sidecar,
@@ -129,17 +131,18 @@ enum FileTransferService {
         to destinationURL: URL,
         operation: FileTransferOperation,
         fileManager: FileManager,
-        shouldCancel: @escaping @Sendable () -> Bool
+        shouldCancel: @escaping @Sendable () -> Bool,
+        flush: @escaping @Sendable (URL) -> Int32?
     ) throws -> FileTransferItemOutcome {
         if operation == .move {
             var moveDestination = destinationURL
             while true {
                 guard !shouldCancel() else { throw CancellationError() }
-                let renameResult = renameExclusively(from: sourceURL, to: moveDestination)
-                if renameResult == 0 {
+                let renameError = ExclusiveRename.rename(sourceURL, to: moveDestination)
+                if renameError == 0 {
                     return FileTransferItemOutcome(destinationURL: moveDestination)
                 }
-                if errno == EEXIST {
+                if renameError == EEXIST {
                     moveDestination = try availableDestinationURL(
                         for: sourceURL,
                         in: destinationURL.deletingLastPathComponent(),
@@ -148,8 +151,8 @@ enum FileTransferService {
                     )
                     continue
                 }
-                guard errno == EXDEV else {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                guard renameError == EXDEV else {
+                    throw POSIXError(POSIXErrorCode(rawValue: renameError) ?? .EIO)
                 }
                 break
             }
@@ -160,6 +163,9 @@ enum FileTransferService {
             ".lightbox-transfer-\(UUID().uuidString)",
             isDirectory: sourceURL.hasDirectoryPath
         )
+        // A long copy keeps the folder's mtime old; say it is in use.
+        StaleTemporaryItems.registerInUse(temporaryURL)
+        defer { StaleTemporaryItems.unregisterInUse(temporaryURL) }
         do {
             try copyItemWithCancellation(
                 from: sourceURL,
@@ -172,10 +178,10 @@ enum FileTransferService {
             var committedDestination = destinationURL
             while true {
                 guard !shouldCancel() else { throw CancellationError() }
-                let renameResult = renameExclusively(from: temporaryURL, to: committedDestination)
-                if renameResult == 0 { break }
-                guard errno == EEXIST else {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                let renameError = ExclusiveRename.rename(temporaryURL, to: committedDestination)
+                if renameError == 0 { break }
+                guard renameError == EEXIST else {
+                    throw POSIXError(POSIXErrorCode(rawValue: renameError) ?? .EIO)
                 }
                 committedDestination = try availableDestinationURL(
                     for: sourceURL,
@@ -186,6 +192,13 @@ enum FileTransferService {
             }
 
             if operation == .move {
+                // 先把複本寫入磁碟，才移除來源；失敗則保留來源並回報。
+                if let flushError = flush(committedDestination) {
+                    return FileTransferItemOutcome(
+                        destinationURL: committedDestination,
+                        failureMessage: "Copied to destination, but it could not be flushed to disk, so the source item was kept: \(String(cString: strerror(flushError)))"
+                    )
+                }
                 do {
                     try fileManager.removeItem(at: sourceURL)
                 } catch {
@@ -263,18 +276,6 @@ enum FileTransferService {
                 throw CancellationError()
             }
             throw POSIXError(POSIXErrorCode(rawValue: copyError) ?? .EIO)
-        }
-    }
-
-    private static func renameExclusively(from sourceURL: URL, to destinationURL: URL) -> Int32 {
-        sourceURL.withUnsafeFileSystemRepresentation { sourcePath in
-            destinationURL.withUnsafeFileSystemRepresentation { destinationPath in
-                guard let sourcePath, let destinationPath else {
-                    errno = EINVAL
-                    return Int32(-1)
-                }
-                return renamex_np(sourcePath, destinationPath, UInt32(RENAME_EXCL))
-            }
         }
     }
 

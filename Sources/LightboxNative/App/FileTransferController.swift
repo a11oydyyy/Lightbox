@@ -26,8 +26,9 @@ final class FileTransferController {
     private var queue: [FileTransferRequest] = []
     private var task: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
-    private var failureCount = 0
-    private var firstFailureName: String?
+    private var failures: [FileTransferFailure] = []
+    private var failureCount: Int { failures.count }
+    private var firstFailureName: String? { failures.first?.sourceURL.lastPathComponent }
 
     init(executor: @escaping Executor) {
         self.executor = executor
@@ -42,8 +43,7 @@ final class FileTransferController {
         // A new batch starts counting failures afresh, unless the last one
         // failed and its status is still showing.
         if task == nil, queue.isEmpty, progress?.phase != .failed {
-            failureCount = 0
-            firstFailureName = nil
+            failures = []
         }
         dismissTask?.cancel()
         dismissTask = nil
@@ -62,8 +62,7 @@ final class FileTransferController {
         dismissTask?.cancel()
         dismissTask = nil
         progress = nil
-        failureCount = 0
-        firstFailureName = nil
+        failures = []
     }
 
     private func startNextIfNeeded() {
@@ -76,7 +75,8 @@ final class FileTransferController {
             completedCount: 0,
             totalCount: request.sourceURLs.count,
             failedCount: failureCount,
-            currentName: request.sourceURLs.first?.lastPathComponent ?? ""
+            currentName: request.sourceURLs.first?.lastPathComponent ?? "",
+            failures: failures
         )
 
         let executor = executor
@@ -108,12 +108,10 @@ final class FileTransferController {
         }
 
         onResult(result)
-        failureCount += result.failures.count
-        if firstFailureName == nil, let firstFailure = result.failures.first {
-            firstFailureName = firstFailure.sourceURL.lastPathComponent
-        }
+        failures += result.failures
         progress.completedCount = result.successes.count + result.failures.count
         progress.failedCount = failureCount
+        progress.failures = failures
         if result.wasCancelled {
             markFinished(&progress, cancelled: true)
         }
@@ -130,7 +128,8 @@ final class FileTransferController {
         }
         self.progress = progress
 
-        if failureCount == 0, !result.wasCancelled {
+        // Failures stay until dismissed; anything else goes away by itself.
+        if failureCount == 0 {
             let requestID = result.requestID
             dismissTask?.cancel()
             dismissTask = Task { @MainActor [weak self] in

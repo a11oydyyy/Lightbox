@@ -5,6 +5,9 @@ enum FileTransferOperation: String, Equatable, Sendable {
     case move
     /// JPEGs rendered by Photoshop (`PhotoshopJPEGExport`); the sources stay.
     case exportJPEG
+
+    /// Exports show their progress in the title instead of the transfer button.
+    var isExport: Bool { self == .exportJPEG }
 }
 
 struct FileTransferRequest: Identifiable, Equatable, Sendable {
@@ -62,6 +65,8 @@ struct FileTransferProgress: Equatable, Sendable {
     var totalCount: Int
     var failedCount: Int
     var currentName: String
+    /// The batch's failures so far, each with its reason.
+    var failures: [FileTransferFailure] = []
 
     var fractionCompleted: Double {
         guard totalCount > 0 else { return phase == .active ? 0 : 1 }

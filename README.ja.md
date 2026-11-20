@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **AI 開発に関する告知**<br>
+> 本プロジェクトのソースコードおよびドキュメントは、主に AI エージェント（Anthropic Claude および OpenAI Codex）によって作成されています。メンテナーは製品全体の方向性の策定のみを担当しています。AI エージェントが開発したソフトウェアはその旨を明示し、人が開発したソフトウェアと区別されるべきであると考えます。
+
 <p align="center">
   <img src=".github/media/icon.png" width="128" height="128" alt="Lightbox のアプリアイコン">
 </p>

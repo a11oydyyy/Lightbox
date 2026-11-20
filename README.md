@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **AI Development Disclosure**<br>
+> The source code and documentation of Lightbox are produced primarily by AI agents (Anthropic Claude and OpenAI Codex). The maintainer's role is limited to setting the product's overall direction. We believe software developed by AI agents should be clearly disclosed as such and distinguished from software developed by humans.
+
 <p align="center">
   <img src=".github/media/icon.png" width="128" height="128" alt="Lightbox app icon">
 </p>

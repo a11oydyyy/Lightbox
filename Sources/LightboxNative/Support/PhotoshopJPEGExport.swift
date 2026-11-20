@@ -17,6 +17,19 @@ struct JPEGExportOptions: Codable, Equatable, Sendable {
     /// chosen folder for all.
     var subfolderName = "JPEG"
     var folderPath: String? = nil
+    /// Replaces JPEGs already at the destination instead of numbering the new
+    /// ones; asked for each export, so not remembered.
+    var replacesExisting = false
+
+    private enum CodingKeys: String, CodingKey {
+        case quality, convertsToSRGB, longEdge, subfolderName, folderPath
+    }
+
+    /// Where `source` exports to when nothing is in the way.
+    func destination(for source: URL) -> URL {
+        destinationFolder(for: source)
+            .appendingPathComponent(source.deletingPathExtension().lastPathComponent + ".jpg")
+    }
 
     func destinationFolder(for source: URL) -> URL {
         if let folderPath { return URL(fileURLWithPath: folderPath, isDirectory: true) }
@@ -28,8 +41,8 @@ struct JPEGExportOptions: Codable, Equatable, Sendable {
 /// are only ever rendered by Adobe: a JPEG or RAW with saved settings opens
 /// through Camera Raw with them applied, as when Image Processor opens it.
 /// Each file is then flattened, made 8-bit, optionally converted to sRGB
-/// and shrunk, saved as a JPEG beside nothing it would overwrite, and closed.
-/// The sources are never changed.
+/// and shrunk, saved as a JPEG, and closed. An existing JPEG is replaced only
+/// when asked (`replacesExisting`); the sources are never changed.
 enum PhotoshopJPEGExport {
     static let bundleIdentifier = "com.adobe.Photoshop"
 
@@ -55,6 +68,8 @@ enum PhotoshopJPEGExport {
         let sources = request.sourceURLs.map(\.standardizedFileURL)
         var successes: [FileTransferSuccess] = []
         var failures: [FileTransferFailure] = []
+        // Two sources with one name (DSC1.JPG, DSC1.ARW) never replace each other's JPEG.
+        var written = Set<String>()
         var wasCancelled = false
 
         if let refusal = permission() {
@@ -76,6 +91,8 @@ enum PhotoshopJPEGExport {
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                 // Photoshop 只寫入本次專用的暫存目錄，完成後才發布到最終檔名。
                 let staging = folder.appendingPathComponent(".lightbox-export-\(UUID().uuidString)", isDirectory: true)
+                StaleTemporaryItems.registerInUse(staging)
+                defer { StaleTemporaryItems.unregisterInUse(staging) }
                 try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
                 defer { try? FileManager.default.removeItem(at: staging) }
                 let rendered = staging.appendingPathComponent(source.deletingPathExtension().lastPathComponent + ".jpg")
@@ -88,13 +105,18 @@ enum PhotoshopJPEGExport {
                         break
                     }
                 } else {
-                    let destination = try commitExport(at: rendered, for: source, in: folder, shouldCancel: shouldCancel)
+                    let replacing = options.replacesExisting && !written.contains(options.destination(for: source).path.lowercased())
+                    let destination = try commitExport(at: rendered, for: source, in: folder, replacing: replacing,
+                                                       protectedSources: sources,
+                                                       shouldCancel: shouldCancel)
+                    written.insert(destination.path.lowercased())
                     successes.append(FileTransferSuccess(sourceURL: source, destinationURL: destination))
                 }
             } catch is CancellationError {
                 wasCancelled = true
                 break
             } catch {
+                exportLogger.error("export failed \(source.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 failures.append(FileTransferFailure(sourceURL: source, message: error.localizedDescription))
             }
         }
@@ -113,25 +135,46 @@ enum PhotoshopJPEGExport {
         )
     }
 
-    private static func commitExport(at rendered: URL, for source: URL, in folder: URL,
+    private static func commitExport(at rendered: URL, for source: URL, in folder: URL, replacing: Bool,
+                                     protectedSources: [URL],
                                      shouldCancel: @Sendable () -> Bool) throws -> URL {
+        let direct = folder.appendingPathComponent(source.deletingPathExtension().lastPathComponent + ".jpg")
+        // Replacing never lands on the source itself (DSCF1.JPG exported beside itself).
+        if replacing, !protectedSources.contains(where: { isSameFile(direct, $0) }) {
+            guard !shouldCancel() else { throw CancellationError() }
+            let replaced = rendered.withUnsafeFileSystemRepresentation { from in
+                direct.withUnsafeFileSystemRepresentation { to in
+                    guard let from, let to else { return EINVAL }
+                    return Darwin.rename(from, to) == 0 ? 0 : errno
+                }
+            }
+            if replaced == 0 { return direct }
+            throw POSIXError(POSIXErrorCode(rawValue: replaced) ?? .EIO)
+        }
         while true {
             guard !shouldCancel() else { throw CancellationError() }
             let destination = try availableDestination(for: source, in: folder)
-            let result = rendered.withUnsafeFileSystemRepresentation { from in
-                destination.withUnsafeFileSystemRepresentation { to in
-                    guard let from, let to else {
-                        errno = EINVAL
-                        return Int32(-1)
-                    }
-                    return renamex_np(from, to, UInt32(RENAME_EXCL))
-                }
-            }
-            if result == 0 { return destination }
-            let error = errno
+            let error = ExclusiveRename.rename(rendered, to: destination)
+            if error == 0 { return destination }
             // 名稱檢查後仍可能被其他程式佔用；重新取名，絕不退回覆蓋寫入。
             if error == EEXIST { continue }
             throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+        }
+    }
+
+    private static func isSameFile(_ a: URL, _ b: URL) -> Bool {
+        var first = stat(), second = stat()
+        guard lstat(a.path, &first) == 0, lstat(b.path, &second) == 0 else { return false }
+        return first.st_dev == second.st_dev && first.st_ino == second.st_ino
+    }
+
+    /// The sources whose JPEG name is already taken at the destination.
+    static func conflicts(_ sources: [URL], options: JPEGExportOptions) -> [URL] {
+        var seen = Set<String>()
+        return sources.filter { source in
+            let destination = options.destination(for: source)
+            guard seen.insert(destination.path.lowercased()).inserted else { return false }
+            return FileManager.default.fileExists(atPath: destination.path) && !isSameFile(destination, source)
         }
     }
 
