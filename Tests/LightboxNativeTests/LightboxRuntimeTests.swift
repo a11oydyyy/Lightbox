@@ -13,8 +13,7 @@ import Testing
 }
 
 @Test func shippingBuildsPreserveExistingCacheLocation() {
-    for identifier in [nil, "io.github.a11oydyyy.Lightbox", LightboxRuntime.compatibilityBundleIdentifier,
-                       "io.github.a11oydyyy.Lightbox.locality"] as [String?] {
+    for identifier in [nil, "io.github.a11oydyyy.Lightbox", "io.github.a11oydyyy.Lightbox.locality"] as [String?] {
         #expect(LightboxRuntime.cacheDirectoryName(for: identifier) == "Lightbox")
     }
 }

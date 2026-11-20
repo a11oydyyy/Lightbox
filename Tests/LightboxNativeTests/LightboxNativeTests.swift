@@ -3345,30 +3345,18 @@ private func previewRouteAsset(
     }
 }
 
-@Test func compatibilityGalleryProfileUsesLighterImageLoadingPolicy() async throws {
-    let normal = GalleryPerformanceProfile(isCompatibilityMode: false)
-    let compatibility = GalleryPerformanceProfile(isCompatibilityMode: true)
+@Test func galleryProfileImageLoadingPolicy() async throws {
+    let profile = GalleryPerformanceProfile()
 
-    #expect(normal.initialImageLoadWindow(prefersFastRawThumbnails: false) == 48)
-    #expect(compatibility.initialImageLoadWindow(prefersFastRawThumbnails: false) == 30)
-    #expect(normal.maxPrioritizedAssetCount == 36)
-    #expect(compatibility.maxPrioritizedAssetCount == 24)
-    #expect(!normal.reducesHoverEffects)
-    #expect(compatibility.reducesHoverEffects)
-    #expect(normal.thumbnailQuality(assetCount: 101, usesConservativeExternalLoading: false) == .thumbnail)
-    #expect(normal.thumbnailQuality(assetCount: 79, usesConservativeExternalLoading: true) == .thumbnail)
-    #expect(normal.thumbnailQuality(assetCount: 80, usesConservativeExternalLoading: true) == .thumbnailBalanced)
-    #expect(normal.thumbnailQuality(assetCount: 320, usesConservativeExternalLoading: true) == .thumbnailFast)
-    #expect(compatibility.thumbnailQuality(assetCount: 101, usesConservativeExternalLoading: false) == .thumbnailBalanced)
-    #expect(compatibility.thumbnailQuality(assetCount: 300, usesConservativeExternalLoading: false) == .thumbnailFast)
-    #expect(normal.permitsFullThumbnailPromotion(assetCount: 79, usesConservativeExternalLoading: true))
-    #expect(!normal.permitsFullThumbnailPromotion(assetCount: 80, usesConservativeExternalLoading: true))
-    #expect(normal.permitsFullThumbnailPromotion(assetCount: 300, usesConservativeExternalLoading: false))
-    #expect(!compatibility.permitsFullThumbnailPromotion(assetCount: 12, usesConservativeExternalLoading: false))
-    #expect(
-        compatibility.preloadMargin(viewportHeight: 1_000, prefersFastRawThumbnails: false)
-        < normal.preloadMargin(viewportHeight: 1_000, prefersFastRawThumbnails: false)
-    )
+    #expect(profile.initialImageLoadWindow(prefersFastRawThumbnails: false) == 48)
+    #expect(profile.maxPrioritizedAssetCount == 36)
+    #expect(profile.thumbnailQuality(assetCount: 101, usesConservativeExternalLoading: false) == .thumbnail)
+    #expect(profile.thumbnailQuality(assetCount: 79, usesConservativeExternalLoading: true) == .thumbnail)
+    #expect(profile.thumbnailQuality(assetCount: 80, usesConservativeExternalLoading: true) == .thumbnailBalanced)
+    #expect(profile.thumbnailQuality(assetCount: 320, usesConservativeExternalLoading: true) == .thumbnailFast)
+    #expect(profile.permitsFullThumbnailPromotion(assetCount: 79, usesConservativeExternalLoading: true))
+    #expect(!profile.permitsFullThumbnailPromotion(assetCount: 80, usesConservativeExternalLoading: true))
+    #expect(profile.permitsFullThumbnailPromotion(assetCount: 300, usesConservativeExternalLoading: false))
 }
 
 @Test func userFolderExternalSourcesKeepLocalImageLoadingPolicy() async throws {
@@ -3402,7 +3390,7 @@ private func previewRouteAsset(
         rootURL: homeSymlink,
         kind: .external
     )
-    let profile = GalleryPerformanceProfile(isCompatibilityMode: false)
+    let profile = GalleryPerformanceProfile()
 
     #expect(!gr3x.usesConservativeExternalLoading)
     #expect(nas.usesConservativeExternalLoading)
@@ -3510,19 +3498,6 @@ private func previewRouteAsset(
         LibraryRefreshPolicy(usesConservativeExternalLoading: false, hasCachedVisibleSnapshot: true).scanStartDelayMilliseconds
         == 0
     )
-}
-
-@Test func compatibilityImageCacheProfileLowersMemoryAndDecodePressure() async throws {
-    let normal = ImageCacheMemoryProfile(isCompatibilityMode: false)
-    let compatibility = ImageCacheMemoryProfile(isCompatibilityMode: true)
-
-    #expect(compatibility.thumbnailCountLimit < normal.thumbnailCountLimit)
-    #expect(compatibility.thumbnailTotalCostLimit < normal.thumbnailTotalCostLimit)
-    #expect(compatibility.previewCountLimit < normal.previewCountLimit)
-    #expect(compatibility.previewTotalCostLimit < normal.previewTotalCostLimit)
-    #expect(compatibility.comparisonCountLimit < normal.comparisonCountLimit)
-    #expect(compatibility.comparisonTotalCostLimit < normal.comparisonTotalCostLimit)
-    #expect(compatibility.decodeConcurrency < normal.decodeConcurrency)
 }
 
 @Test func imageDecodePriorityMapsLowPriorityWorkToUtilityQoS() async throws {
@@ -4850,8 +4825,7 @@ private func previewRouteAsset(
 @Test func updateCheckerChoosesMainReleaseAsset() async throws {
     let result = try LightboxUpdateChecker.checkResult(
         from: sampleReleaseData(tag: "v1.3.1"),
-        currentVersion: "1.3.0",
-        compatibility: false
+        currentVersion: "1.3.0"
     )
 
     guard case let .updateAvailable(version, _, assetURL, digest) = result else {
@@ -4862,22 +4836,6 @@ private func previewRouteAsset(
     #expect(version == "1.3.1")
     #expect(assetURL.lastPathComponent == "Lightbox-v1.3.1.zip")
     #expect(digest == "sha256:" + String(repeating: "b", count: 64))
-}
-
-@Test func updateCheckerChoosesIntelReleaseAssetForCompatibilityBuild() async throws {
-    let result = try LightboxUpdateChecker.checkResult(
-        from: sampleReleaseData(tag: "v1.3.1"),
-        currentVersion: "1.3.0",
-        compatibility: true
-    )
-
-    guard case let .updateAvailable(_, _, assetURL, digest) = result else {
-        Issue.record("Expected update to be available")
-        return
-    }
-
-    #expect(assetURL.lastPathComponent == "Lightbox-Intel-x86-v1.3.1.zip")
-    #expect(digest == "sha256:" + String(repeating: "a", count: 64))
 }
 
 @Test func updateCheckerRejectsReleaseWithoutExactCompatibleAsset() async throws {
@@ -4898,8 +4856,7 @@ private func previewRouteAsset(
     do {
         _ = try LightboxUpdateChecker.checkResult(
             from: try #require(json.data(using: .utf8)),
-            currentVersion: "1.3.0",
-            compatibility: true
+            currentVersion: "1.3.0"
         )
         Issue.record("Expected an exact compatible asset to be required")
     } catch let error as UpdateError {
@@ -5631,7 +5588,7 @@ func fileTransferSkipsDanglingSymlinks(operation: FileTransferOperation) throws 
 
 @Test func updateCheckerKeepsInstalledVersionWhenAheadOfPublishedRelease() throws {
     let result = try LightboxUpdateChecker.checkResult(
-        from: sampleReleaseData(tag: "v1.3.6"), currentVersion: "2.0.0", compatibility: false
+        from: sampleReleaseData(tag: "v1.3.6"), currentVersion: "2.0.0"
     )
     guard case let .upToDate(version, _) = result else {
         Issue.record("A development release must not offer a downgrade")

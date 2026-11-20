@@ -61,7 +61,7 @@ struct RenameSheet: View {
         }
         .padding(RenameSheetMetrics.padding)
         .frame(width: RenameSheetMetrics.width)
-        .onChange(of: items) { _ in diskIssue = nil }
+        .onChange(of: items) { diskIssue = nil }
     }
 
     private var singleField: some View {
@@ -238,7 +238,7 @@ struct RenameFolderSheet: View {
         }
         .padding(RenameSheetMetrics.padding)
         .frame(width: RenameSheetMetrics.width)
-        .onChange(of: name) { _ in diskIssue = nil }
+        .onChange(of: name) { diskIssue = nil }
     }
 
     private func submit() {
@@ -299,7 +299,7 @@ struct NewFolderSheet: View {
         }
         .padding(RenameSheetMetrics.padding)
         .frame(width: RenameSheetMetrics.width)
-        .onChange(of: name) { _ in diskIssue = nil }
+        .onChange(of: name) { diskIssue = nil }
     }
 
     private func submit() {

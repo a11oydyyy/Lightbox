@@ -7,15 +7,6 @@ struct RootShellView: View {
     @LightboxViewState private var isResizingSidebar = false
     @LightboxViewState private var isTogglingSidebar = false
     @LightboxViewState private var sidebarToggleTask: Task<Void, Never>?
-    @LightboxViewState private var sidebarSlotExpanded: Bool
-    @LightboxViewState private var sidebarContentVisible: Bool
-    @LightboxViewState private var sidebarVisibilityTask: Task<Void, Never>?
-
-    init() {
-        let isExpanded = !LightboxSettingsStore.loadSidebarCollapsed()
-        _sidebarSlotExpanded = State(initialValue: isExpanded)
-        _sidebarContentVisible = State(initialValue: isExpanded)
-    }
 
     // Natural footprint of the sidebar slot: glass (sidebarWidth + 10pt leading
     // pad) + the 8pt resize handle. Used as the expanded width the collapse
@@ -37,20 +28,8 @@ struct RootShellView: View {
         appState.previewAssetID != nil
     }
 
-    private var usesCompatibilitySidebarMotion: Bool {
-        LightboxRuntime.usesCompatibilityPerformanceMode
-    }
-
-    private var effectiveSidebarSlotExpanded: Bool {
-        usesCompatibilitySidebarMotion ? sidebarSlotExpanded : !appState.sidebarCollapsed
-    }
-
-    private var effectiveSidebarContentVisible: Bool {
-        usesCompatibilitySidebarMotion ? sidebarContentVisible : !appState.sidebarCollapsed
-    }
-
     private var chromeLeadingInset: CGFloat {
-        effectiveSidebarSlotExpanded ? sidebarSlotWidth : 0
+        !appState.sidebarCollapsed ? sidebarSlotWidth : 0
     }
 
     var body: some View {
@@ -76,19 +55,12 @@ struct RootShellView: View {
                         .accessibilityHidden(appState.hasActiveOverlay || appState.sidebarCollapsed)
                     SidebarResizeHandle(isResizing: $isResizingSidebar)
                 }
-                .frame(width: effectiveSidebarSlotExpanded ? sidebarSlotWidth : 0, alignment: .trailing)
-                .offset(x: usesCompatibilitySidebarMotion && !effectiveSidebarContentVisible ? -sidebarSlotWidth : 0)
-                .opacity(effectiveSidebarContentVisible ? 1 : 0)
+                .frame(width: !appState.sidebarCollapsed ? sidebarSlotWidth : 0, alignment: .trailing)
+                .opacity(appState.sidebarCollapsed ? 0 : 1)
                 // The preview's opaque veil reveals the sidebar together with
                 // folder cards and directory headings, without a second fade.
                 .previewChromePresentation(isVisible: !appState.isComparing, reduceMotion: reduceMotion)
-                .allowsHitTesting(effectiveSidebarContentVisible && overlayChromeVisible && !overlayIsPresented)
-                .animation(
-                    usesCompatibilitySidebarMotion
-                        ? MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)
-                        : nil,
-                    value: sidebarContentVisible
-                )
+                .allowsHitTesting(!appState.sidebarCollapsed && overlayChromeVisible && !overlayIsPresented)
 
                 ZStack {
                     // Hold the gallery's column count steady while the sidebar slot
@@ -178,28 +150,18 @@ struct RootShellView: View {
         }
         .ignoresSafeArea(.container, edges: .top)
         .animation(
-            usesCompatibilitySidebarMotion
-                ? nil
-                : MotionTokens.ifAllowed(MotionTokens.sidebarChrome, reduceMotion: reduceMotion),
+            MotionTokens.ifAllowed(MotionTokens.sidebarChrome, reduceMotion: reduceMotion),
             value: appState.sidebarCollapsed
         )
         .animation(MotionTokens.ifAllowed(MotionTokens.preview, reduceMotion: reduceMotion), value: appState.isComparing)
-        .onAppear {
-            synchronizeCompatibilitySidebarMotion(animated: false)
-        }
-        .onChange(of: appState.sidebarCollapsed) { _ in
+        .onChange(of: appState.sidebarCollapsed) {
             beginSidebarToggleFreeze()
-            synchronizeCompatibilitySidebarMotion(animated: true)
         }
         .onDisappear {
             sidebarToggleTask?.cancel()
-            sidebarVisibilityTask?.cancel()
         }
         .sheet(item: $appState.renameRequest) { request in
             RenameSheet(appState: appState, request: request)
-        }
-        .sheet(item: $appState.jpegExportRequest) { request in
-            JPEGExportSheet(appState: appState, request: request)
         }
         .sheet(item: $appState.folderRenameRequest) { request in
             RenameFolderSheet(appState: appState, request: request)
@@ -229,55 +191,6 @@ struct RootShellView: View {
             try? await Task.sleep(for: .milliseconds(420))
             guard !Task.isCancelled else { return }
             isTogglingSidebar = false
-        }
-    }
-
-    private func synchronizeCompatibilitySidebarMotion(animated: Bool) {
-        guard usesCompatibilitySidebarMotion else { return }
-
-        sidebarVisibilityTask?.cancel()
-        let isExpanded = !appState.sidebarCollapsed
-        let sidebarAnimation = MotionTokens.ifAllowed(MotionTokens.standard, reduceMotion: reduceMotion)
-
-        guard animated, !reduceMotion else {
-            var transaction = Transaction()
-            transaction.animation = nil
-            withTransaction(transaction) {
-                sidebarSlotExpanded = isExpanded
-                sidebarContentVisible = isExpanded
-            }
-            return
-        }
-
-        if isExpanded {
-            var transaction = Transaction()
-            transaction.animation = nil
-            withTransaction(transaction) {
-                sidebarSlotExpanded = true
-            }
-
-            sidebarVisibilityTask = Task { @MainActor in
-                await Task.yield()
-                guard !Task.isCancelled else { return }
-                withAnimation(sidebarAnimation) {
-                    sidebarContentVisible = true
-                }
-            }
-        } else {
-            withAnimation(sidebarAnimation) {
-                sidebarContentVisible = false
-            }
-
-            sidebarVisibilityTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(320))
-                guard !Task.isCancelled else { return }
-
-                var transaction = Transaction()
-                transaction.animation = nil
-                withTransaction(transaction) {
-                    sidebarSlotExpanded = false
-                }
-            }
         }
     }
 }

@@ -589,10 +589,9 @@ final class FileListCoordinator: NSObject, NSTableViewDataSource, NSTableViewDel
                 menu.addItem(ClosureMenuItem(titles.rename) { [weak self] in self?.appState.beginRename(fallback: asset) })
             }
             menu.addItem(ClosureMenuItem(titles.copy) { [weak self] in self?.appState.copyToClipboard(asset) })
-            if !asset.isDeleted, asset.isImage, PhotoshopJPEGExport.applicationURL != nil {
+            if !asset.isDeleted, asset.isImage, PhotoshopApp.url != nil {
                 menu.addItem(.separator())
                 menu.addItem(ClosureMenuItem(titles.openInPhotoshop) { [weak self] in self?.appState.openInPhotoshop(fallback: asset) })
-                menu.addItem(ClosureMenuItem(titles.exportJPEG) { [weak self] in self?.appState.beginJPEGExport(fallback: asset) })
             }
             menu.addItem(.separator())
             if asset.isDeleted {

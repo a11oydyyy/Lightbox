@@ -132,10 +132,10 @@ struct GlassSidebar: View {
                 navigation.availableRows = rows
                 revealPending(using: scrollProxy, available: rows)
             }
-            .onChange(of: navigation.pendingReveal) { _ in
+            .onChange(of: navigation.pendingReveal) {
                 revealPending(using: scrollProxy, available: navigation.availableRows)
             }
-            .onChange(of: navigation.childrenRevision) { _ in
+            .onChange(of: navigation.childrenRevision) {
                 revealPending(using: scrollProxy, available: navigation.availableRows)
             }
             }
@@ -167,14 +167,14 @@ struct GlassSidebar: View {
         .padding(.leading, SidebarMetrics.panelLeadingInset)
         .padding(.top, 8)
         .padding(.bottom, 10)
-        .onChange(of: appState.currentFolderURL) { _ in
+        .onChange(of: appState.currentFolderURL) {
             navigation.pendingReveal = nil
         }
-        .onChange(of: appState.activeTabID) { _ in navigation.pendingReveal = nil }
-        .onChange(of: appState.selectedFilter) { _ in navigation.pendingReveal = nil }
-        .onChange(of: appState.showsHiddenItems) { _ in navigation.resetReveal() }
-        .onChange(of: appState.sidebarVolumes.map(\.id)) { _ in navigation.resetReveal() }
-        .onChange(of: appState.sidebarLocations) { _ in navigation.resetReveal() }
+        .onChange(of: appState.activeTabID) { navigation.pendingReveal = nil }
+        .onChange(of: appState.selectedFilter) { navigation.pendingReveal = nil }
+        .onChange(of: appState.showsHiddenItems) { navigation.resetReveal() }
+        .onChange(of: appState.sidebarVolumes.map(\.id)) { navigation.resetReveal() }
+        .onChange(of: appState.sidebarLocations) { navigation.resetReveal() }
     }
 
     private var selectedFolderPath: String? {

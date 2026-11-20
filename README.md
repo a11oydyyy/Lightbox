@@ -16,8 +16,8 @@
 
 <p align="center">
   <a href="https://github.com/a11oydyyy/Lightbox/releases/latest"><img src="https://img.shields.io/github/v/release/a11oydyyy/Lightbox?label=download&color=2f2f2f" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/macOS-13%2B-2f2f2f" alt="macOS 13 or later">
-  <img src="https://img.shields.io/badge/Apple%20Silicon%20%26%20Intel-native-2f2f2f" alt="Apple Silicon and Intel">
+  <img src="https://img.shields.io/badge/macOS-15%2B-2f2f2f" alt="macOS 15 or later">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-only-2f2f2f" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/languages-EN%20%C2%B7%20%E7%B9%81%E4%B8%AD%20%C2%B7%20%E7%AE%80%E4%B8%AD%20%C2%B7%20%E6%97%A5%E6%9C%AC%E8%AA%9E-2f2f2f" alt="English, Traditional Chinese, Simplified Chinese, Japanese">
 </p>
 
@@ -33,7 +33,7 @@
 ## Why Lightbox
 
 - **Your folders are the library.** Open any folder on your Mac, an external drive or a NAS and start browsing. Nothing is imported, copied or locked into a catalog, so Finder, Photoshop and every other app keep seeing the same files.
-- **Made for Camera Raw workflows.** See at a glance which photos you have already edited in Adobe Camera Raw or Lightroom, cull with single keys, and export finished JPEGs through Photoshop — the parts of Adobe Bridge most photographers actually use, without the weight.
+- **Made for Camera Raw workflows.** See at a glance which photos you have already edited in Adobe Camera Raw or Lightroom, cull with single keys, and open photos in Photoshop to finish them — the parts of Adobe Bridge most photographers actually use, without the weight.
 - **Feels like part of macOS.** Native, quick to open, light and dark, keyboard friendly, with tabs, Quick Look, color tags and undo where you expect them.
 
 ## Features
@@ -77,13 +77,6 @@
 - Drag photos between tabs to copy or move them; drag them out to any app
 - Quick Look, Show in Finder, Open With, and an option to show non-image files too
 
-### Export JPEGs through Photoshop
-
-
-Lightbox's take on Bridge's **Image Processor**: select photos, choose **Export as JPEG…**, and Photoshop opens each one with its Camera Raw settings applied and saves a JPEG — quality, sRGB conversion and an optional long-edge limit included. Originals are never touched and nothing is overwritten. **Open in Photoshop** is one click away for everything else.
-
-> Only Adobe's engine can render Camera Raw edits, so exporting needs Photoshop installed. Browsing, culling and organizing do not.
-
 ### Made for the Mac
 
 - Light and dark appearances that follow the system, with optional glass styling
@@ -102,7 +95,7 @@ Lightbox's take on Bridge's **Image Processor**: select photos, choose **Export 
 | Search | ⌘F | New folder | ⇧⌘N |
 | Sort & Filter | ⌥⌘F | Move to Trash | ⌘⌫ |
 | Larger / smaller thumbnails | ⌘= / ⌘− | Open in Photoshop | ⌥⌘O |
-| Gallery / list | ⌃⌘1 / ⌃⌘2 | Export as JPEG | ⇧⌘E |
+| Gallery / list | ⌃⌘1 / ⌃⌘2 | | |
 
 ## Download
 
@@ -111,20 +104,19 @@ Get the latest version from **[Releases](https://github.com/a11oydyyy/Lightbox/r
 | Package | Requirements |
 | --- | --- |
 | `Lightbox-v*.zip` | Apple Silicon, macOS 15 or later |
-| `Lightbox-Intel-x86-v*.zip` | Intel or Apple Silicon, macOS 13 or later |
 
-The Intel package contains both architectures and runs natively on Apple Silicon too. Release notes list the signing status and known limitations of each version.
+Release notes list the signing status and known limitations of each version.
 
 ## FAQ
 
 **Is Lightbox an Adobe Bridge alternative?**
-For browsing folders, checking Camera Raw edits, culling and batch JPEG export, yes. It deliberately leaves out keywords, collections and output templates to stay small and fast.
+For browsing folders, checking Camera Raw edits, culling and opening photos in Photoshop, yes. It deliberately leaves out keywords, collections and output templates to stay small and fast.
 
 **Does Lightbox import or change my photos?**
 No. It reads your folders where they are. It only changes files when you ask — renaming, moving, tagging or trashing. Renaming, tagging and trashing can be undone. Moving files between tabs cannot yet be undone and clears earlier undo history.
 
 **Does it support RAW files?**
-Yes: CR3, CR2, NEF, ARW, RAF, ORF, RW2, DNG and other formats macOS can read. Previews show the original RAW; Camera Raw edits are rendered by Photoshop when you export.
+Yes: CR3, CR2, NEF, ARW, RAF, ORF, RW2, DNG and other formats macOS can read. Previews show the original RAW; Camera Raw edits are finished in Photoshop (Open in Photoshop, ⌥⌘O).
 
 **Can I use it as a photo viewer instead of Preview or Photos?**
 Yes. It opens straight onto a folder, previews with one click and steps with the arrow keys, without importing anything into a library.
@@ -138,4 +130,4 @@ Found a problem or have an idea? Open an [issue](https://github.com/a11oydyyy/Li
 
 <sub>Demo photography courtesy of the contributing photographers on <a href="https://unsplash.com">Unsplash</a>.</sub>
 
-<sub>Keywords: Mac image browser · macOS photo viewer · Adobe Bridge alternative · Camera Raw · XMP sidecar · photo culling · RAW viewer · Finder for photos · batch rename · JPEG export</sub>
+<sub>Keywords: Mac image browser · macOS photo viewer · Adobe Bridge alternative · Camera Raw · XMP sidecar · photo culling · RAW viewer · Finder for photos · batch rename</sub>

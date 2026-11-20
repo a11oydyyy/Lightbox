@@ -125,7 +125,7 @@ struct SettingsView: View {
 
             Section(appState.localized(.updates)) {
                 Toggle(appState.localized(.automaticallyCheckUpdates), isOn: $updater.automaticallyChecksForUpdates)
-                    .onChange(of: updater.automaticallyChecksForUpdates) { enabled in
+                    .onChange(of: updater.automaticallyChecksForUpdates) { _, enabled in
                         if enabled { Task { await updater.checkAutomatically(appState: appState) } }
                     }
                 Text(appState.localized(.automaticUpdateHelp))

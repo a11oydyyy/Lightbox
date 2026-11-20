@@ -16,7 +16,6 @@ struct AssetContextMenuTitles: Equatable {
     var rename = "Rename…"
     var quickLook = "Quick Look"
     var openInPhotoshop = "Open in Photoshop"
-    var exportJPEG = "Export as JPEG…"
 
     static let english = AssetContextMenuTitles(
         copy: "Copy",
@@ -63,8 +62,7 @@ struct AssetContextMenuTitles: Equatable {
         )
         rename = appState.renameText.menuItem
         quickLook = appState.localized(.quickLook)
-        openInPhotoshop = appState.exportText.openInPhotoshop
-        exportJPEG = appState.exportText.exportMenuItem
+        openInPhotoshop = appState.photoshopText.openInPhotoshop
     }
 }
 
@@ -101,8 +99,6 @@ struct AssetCardView: View, Equatable {
     var onAddToCompareTray: () -> Void
     /// Nil leaves Rename out of the menu.
     var onRename: (() -> Void)?
-    /// Nil leaves Export as JPEG out of the menu (it also needs Photoshop).
-    var onExportJPEG: (() -> Void)?
     /// Space, when it does something other than `onActivate`; nil leaves
     /// Quick Look out of the menu.
     var onQuickLook: (() -> Void)?
@@ -242,7 +238,6 @@ struct AssetCardView: View, Equatable {
                     onShare: onShare,
                     onAddToCompareTray: onAddToCompareTray,
                     onRename: onRename,
-                    onExportJPEG: onExportJPEG,
                     onQuickLook: onQuickLook,
                     onSpace: onSpace
                 )
@@ -283,7 +278,6 @@ struct AssetInteractionLayer: NSViewRepresentable {
     var onShare: (NSView) -> Void
     var onAddToCompareTray: () -> Void
     var onRename: (() -> Void)? = nil
-    var onExportJPEG: (() -> Void)? = nil
     var onQuickLook: (() -> Void)? = nil
     var onSpace: (() -> Void)? = nil
 
@@ -315,7 +309,6 @@ struct AssetInteractionLayer: NSViewRepresentable {
         nsView.onShare = onShare
         nsView.onAddToCompareTray = onAddToCompareTray
         nsView.onRename = onRename
-        nsView.onExportJPEG = onExportJPEG
         nsView.onQuickLook = onQuickLook
         nsView.onSpace = onSpace
         nsView.onKeyboard = onKeyboard
@@ -511,7 +504,6 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     var onShare: (NSView) -> Void = { _ in }
     var onAddToCompareTray: () -> Void = {}
     var onRename: (() -> Void)?
-    var onExportJPEG: (() -> Void)?
     var onQuickLook: (() -> Void)?
     var onSpace: (() -> Void)?
 
@@ -690,18 +682,15 @@ final class AssetInteractionView: NSView, NSDraggingSource {
         menu.addItem(openWithItem)
 
         // Photoshop by name, as Bridge offers it: it is where Camera Raw
-        // edits are finished, and it renders them for Export as JPEG.
+        // edits are finished.
         if !isDeleted, let assetURL, LightboxAsset.isImageName(assetURL.lastPathComponent),
-           let photoshopURL = PhotoshopJPEGExport.applicationURL {
+           let photoshopURL = PhotoshopApp.url {
             let photoshopItem = actionItem(title: menuTitles.openInPhotoshop, action: #selector(openWithSelectedApplication(_:)))
             photoshopItem.representedObject = photoshopURL
             let icon = NSWorkspace.shared.icon(forFile: photoshopURL.path)
             icon.size = NSSize(width: 16, height: 16)
             photoshopItem.image = icon
             menu.addItem(photoshopItem)
-            if onExportJPEG != nil {
-                menu.addItem(actionItem(title: menuTitles.exportJPEG, action: #selector(exportJPEG)))
-            }
         }
 
         if onQuickLook != nil {
@@ -829,11 +818,6 @@ final class AssetInteractionView: NSView, NSDraggingSource {
     @objc private func renameAsset() {
         guard isInteractionEnabled else { return }
         onRename?()
-    }
-
-    @objc private func exportJPEG() {
-        guard isInteractionEnabled else { return }
-        onExportJPEG?()
     }
 
     @objc private func quickLookAsset() {
@@ -1133,7 +1117,7 @@ private struct CardHoverChrome: ViewModifier {
                     .allowsHitTesting(false)
             }
             .onHover { isHovering = $0 }
-            .onChange(of: isEnabled) { if !$0 { isHovering = false } }
+            .onChange(of: isEnabled) { _, enabled in if !enabled { isHovering = false } }
     }
 }
 
@@ -1298,7 +1282,7 @@ struct AssetImageView: View {
                 imageRequest = nil
             }
         }
-        .onChange(of: decodePriority) { priority in
+        .onChange(of: decodePriority) { _, priority in
             imageRequest?.updatePriority(priority)
         }
         .onDisappear {

@@ -511,7 +511,6 @@ final class AppState: ObservableObject {
     var renameTask: Task<Void, Never>?
     /// The files the rename sheet is open for.
     @Published var renameRequest: RenameRequest?
-    @Published var jpegExportRequest: JPEGExportRequest?
     /// The folder the New Folder sheet creates in.
     @Published var folderRenameRequest: FolderRenameRequest?
     @Published var newFolderRequest: NewFolderRequest?
@@ -636,9 +635,7 @@ final class AppState: ObservableObject {
             FileTransferRequest,
             @escaping @Sendable (FileTransferProgressUpdate) -> Void
         ) -> FileTransferResult = { request, progress in
-            request.operation == .exportJPEG
-                ? PhotoshopJPEGExport.perform(request, progress: progress)
-                : FileTransferService.perform(request, progress: progress)
+            FileTransferService.perform(request, progress: progress)
         },
         defaultApplicationOpener: @escaping @MainActor ([URL]) -> Void = { urls in
             for url in urls { NSWorkspace.shared.open(url) }

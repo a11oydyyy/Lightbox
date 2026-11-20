@@ -146,15 +146,15 @@ private struct GalleryNativeGeometryFixture: View {
                                         measurements.selectionFrame = selection
                                         measurements.previewFrame = preview
                                     }
-                                    .onChange(of: content) { frame in
+                                    .onChange(of: content) { _, frame in
                                         measurements.contentFrame = frame
                                         measurements.contentChanges += 1
                                     }
-                                    .onChange(of: selection) { frame in
+                                    .onChange(of: selection) { _, frame in
                                         measurements.selectionFrame = frame
                                         measurements.absoluteChanges += 1
                                     }
-                                    .onChange(of: preview) { frame in
+                                    .onChange(of: preview) { _, frame in
                                         measurements.previewFrame = frame
                                         measurements.absoluteChanges += 1
                                     }
@@ -175,7 +175,7 @@ private struct GalleryNativeGeometryFixture: View {
                         )
                         Color.clear
                             .onAppear { measurements.origin = origin }
-                            .onChange(of: origin) { origin in
+                            .onChange(of: origin) { _, origin in
                                 measurements.origin = origin
                                 measurements.originChanges += 1
                             }

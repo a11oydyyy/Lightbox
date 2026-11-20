@@ -16,8 +16,7 @@ enum MotionTokens {
     static let previewSourceRevealDelay: Duration = .milliseconds(330)
     static let previewHighResolutionDelay: Duration = .milliseconds(480)
 
-    // Core UI springs. Use APIs available on macOS 13 so the compatibility app
-    // can share the same motion language without macOS 14-only symbols.
+    // Core UI springs.
     static let quick = Animation.spring(response: 0.20, dampingFraction: 1.0)
     static let standard = Animation.spring(response: 0.28, dampingFraction: 1.0)
     static let sidebarChromeDurationSeconds = 0.28
@@ -68,21 +67,11 @@ extension AnyTransition {
 }
 
 extension View {
-    @ViewBuilder
     func lightboxSymbolReplaceTransition() -> some View {
-        if #available(macOS 14.0, *) {
-            contentTransition(.symbolEffect(.replace))
-        } else {
-            contentTransition(.opacity)
-        }
+        contentTransition(.symbolEffect(.replace))
     }
 
-    @ViewBuilder
     func lightboxNumericTextTransition(value: Double) -> some View {
-        if #available(macOS 14.0, *) {
-            contentTransition(.numericText(value: value))
-        } else {
-            contentTransition(.opacity)
-        }
+        contentTransition(.numericText(value: value))
     }
 }

@@ -38,20 +38,6 @@ func fileOperationsWorkOnExFAT() throws {
     FileManager.default.createFile(atPath: folder.appendingPathComponent("other").path, contents: Data([9]))
     #expect(ExclusiveRename.rename(source, to: folder.appendingPathComponent("other")) == EEXIST)
 
-    // Export through a stand-in Photoshop, twice: the second takes "DSC1 2.jpg".
-    let request = FileTransferRequest(sourceURLs: [source], destinationFolderURL: folder,
-                                      operation: .exportJPEG, jpegExport: JPEGExportOptions())
-    let runner: PhotoshopJPEGExport.Runner = { _, destination, _ in
-        FileManager.default.createFile(atPath: destination.path, contents: Data([0xFF]))
-        return nil
-    }
-    for expected in ["DSC1.jpg", "DSC1 2.jpg"] {
-        let result = PhotoshopJPEGExport.perform(request, progress: { _ in }, shouldCancel: { false },
-                                                 permission: { nil }, runner: runner)
-        #expect(result.failures.isEmpty, "\(result.failures.map(\.message))")
-        #expect(result.successes.map(\.destinationURL.lastPathComponent) == [expected])
-    }
-
     // Copy, then move, into a subfolder; then rename.
     let into = folder.appendingPathComponent("into", isDirectory: true)
     try FileManager.default.createDirectory(at: into, withIntermediateDirectories: false)

@@ -199,7 +199,7 @@ struct PreviewOverlay: View {
                         GeometryReader { controls in
                             Color.clear
                                 .onAppear { controlsHeight = controls.size.height }
-                                .onChange(of: controls.size.height) { controlsHeight = $0 }
+                                .onChange(of: controls.size.height) { _, height in controlsHeight = height }
                         }
                     }
                     .previewChromePresentation(isVisible: isPresented && !showsLoupe, reduceMotion: reduceMotion)
@@ -281,7 +281,7 @@ struct PreviewOverlay: View {
                 presentationTask?.cancel()
                 highResolutionTask?.cancel()
             }
-            .onChange(of: asset.id) { _ in
+            .onChange(of: asset.id) {
                 // Stepped onto something without pixels to zoom into (a document,
                 // a deleted item): back to the fitted view. This closure may carry
                 // the previous image's values, so ask the app state.
@@ -301,15 +301,15 @@ struct PreviewOverlay: View {
                     scheduleHighResolutionUpgrade()
                 }
             }
-            .onChange(of: CGSize(width: asset.width, height: asset.height)) { _ in
+            .onChange(of: CGSize(width: asset.width, height: asset.height)) {
                 // Real dimensions can arrive after the preview opened.
                 guard let current = appState.previewAsset, current.id == lockedAssetID else { return }
                 withAnimation(MotionTokens.ifAllowed(MotionTokens.previewGeometry, reduceMotion: reduceMotion)) {
                     lockGeometry(for: current, viewport: proxy.size)
                 }
             }
-            .onChange(of: appState.previewZoomRequest) { _ in toggleZoom() }
-            .onChange(of: appState.isPreviewClosing) { closing in
+            .onChange(of: appState.previewZoomRequest) { toggleZoom() }
+            .onChange(of: appState.isPreviewClosing) { _, closing in
                 if closing {
                     closeFromExternalRoute()
                 } else if appState.isPreviewPresented, isClosing {

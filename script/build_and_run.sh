@@ -6,9 +6,8 @@ APP_NAME="LightboxNative"
 APP_BUNDLE_NAME="Lightbox"
 BUNDLE_ID="io.github.a11oydyyy.Lightbox"
 MIN_SYSTEM_VERSION="15.0"
-VERSION="2.4.7"
-BUILD_NUMBER="138"
-BUILD_ARCH_ARGS=()
+VERSION="2.5.0"
+BUILD_NUMBER="139"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/script/build_toolchain.sh"
@@ -26,21 +25,6 @@ APP_ICON="$ROOT_DIR/Sources/LightboxNative/Resources/AppIcon.icns"
 PACKAGE_ZIP="$DIST_DIR/Lightbox-v$VERSION.zip"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
-configure_compatibility_app() {
-  APP_BUNDLE_NAME="Lightbox 13"
-  BUNDLE_ID="io.github.a11oydyyy.Lightbox13"
-  MIN_SYSTEM_VERSION="13.0"
-  BUILD_ARCH_ARGS=(--arch arm64 --arch x86_64)
-  APP_BUNDLE="$DIST_DIR/$APP_BUNDLE_NAME.app"
-  INSTALL_APP_BUNDLE="/Applications/$APP_BUNDLE_NAME.app"
-  APP_CONTENTS="$APP_BUNDLE/Contents"
-  APP_MACOS="$APP_CONTENTS/MacOS"
-  APP_RESOURCES="$APP_CONTENTS/Resources"
-  APP_BINARY="$APP_MACOS/$APP_NAME"
-  INFO_PLIST="$APP_CONTENTS/Info.plist"
-  PACKAGE_ZIP="$DIST_DIR/Lightbox-Intel-x86-v$VERSION.zip"
-}
-
 build_bundle() {
   local configuration="${1:-debug}"
   local stop_running="${2:-true}"
@@ -48,10 +32,6 @@ build_bundle() {
 
   if [ "$configuration" = "release" ]; then
     build_args=(-c release)
-  fi
-
-  if [ "${#BUILD_ARCH_ARGS[@]}" -gt 0 ]; then
-    build_args+=("${BUILD_ARCH_ARGS[@]}")
   fi
 
   lightbox_configure_toolchain "$ROOT_DIR"
@@ -198,16 +178,7 @@ case "$MODE" in
     build_bundle release
     open_app
     ;;
-  run13)
-    configure_compatibility_app
-    build_bundle release
-    open_app
-    ;;
   --package|package)
-    package_app
-    ;;
-  package13|--package13)
-    configure_compatibility_app
     package_app
     ;;
   --debug|debug)
@@ -245,7 +216,7 @@ case "$MODE" in
     pgrep -x "$APP_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|run13|package|package13|--debug|--logs|--telemetry|--diagnose|--recent-logs [10m]|--performance-logs [10m]|--verify]" >&2
+    echo "usage: $0 [run|package|--debug|--logs|--telemetry|--diagnose|--recent-logs [10m]|--performance-logs [10m]|--verify]" >&2
     exit 2
     ;;
 esac

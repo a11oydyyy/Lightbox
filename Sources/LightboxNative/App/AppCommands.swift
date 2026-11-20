@@ -62,19 +62,13 @@ struct LightboxCommands: Commands {
             .keyboardShortcut("f", modifiers: [.command])
             .disabled(appState.isShowingStartPage)
 
-            // Photoshop, for finishing Camera Raw edits and exporting them.
-            if PhotoshopJPEGExport.applicationURL != nil {
+            // Photoshop, for finishing Camera Raw edits.
+            if PhotoshopApp.url != nil {
                 Divider()
-                Button(appState.exportText.openInPhotoshop) {
+                Button(appState.photoshopText.openInPhotoshop) {
                     appState.openSelectionInPhotoshop()
                 }
                 .keyboardShortcut("o", modifiers: [.command, .option])
-                .disabled(!appState.canSendSelectionToPhotoshop)
-
-                Button(appState.exportText.exportMenuItem) {
-                    appState.exportSelectionAsJPEG()
-                }
-                .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(!appState.canSendSelectionToPhotoshop)
             }
         }

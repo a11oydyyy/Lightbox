@@ -847,7 +847,7 @@ private struct CompareTrayControl: View {
         .onDrop(of: dropTypes, isTargeted: $isDropTargeted) { providers in
             appState.handleCompareTrayDrop(providers: providers)
         }
-        .onChange(of: appState.compareTrayRejectGeneration) { _ in
+        .onChange(of: appState.compareTrayRejectGeneration) {
             flashRejectFeedback()
         }
         .animation(MotionTokens.ifAllowed(MotionTokens.quick, reduceMotion: reduceMotion), value: isDropTargeted)

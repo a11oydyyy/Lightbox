@@ -10,7 +10,7 @@ import Foundation
     defer { try? FileManager.default.removeItem(at: root) }
     let images = try (0..<3).map { _ in try performanceTestImage() }
     let counter = ImagePerformanceCounter()
-    let cache = ImageCache(memoryProfile: ImageCacheMemoryProfile(isCompatibilityMode: false)) { url, _ in
+    let cache = ImageCache(memoryProfile: ImageCacheMemoryProfile()) { url, _ in
         counter.increment()
         return images[Int(url.deletingPathExtension().lastPathComponent)!]
     }

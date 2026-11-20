@@ -127,13 +127,10 @@ struct WindowConfigurator: NSViewRepresentable {
             // places the window controls; the header is a titlebar accessory.
             let toolbar = NSToolbar(identifier: "Lightbox.WindowHeader")
             toolbar.displayMode = .iconOnly
-            toolbar.showsBaselineSeparator = false
             toolbar.allowsUserCustomization = false
             // Display-mode customization is independent of item customization.
             // Text modes change native toolbar geometry around our fixed-height accessory.
-            if #available(macOS 15.0, *) {
-                toolbar.allowsDisplayModeCustomization = false
-            }
+            toolbar.allowsDisplayModeCustomization = false
             window.toolbar = toolbar
             let host = NativeNavigationBar(appState: appState)
             let width = max(300, window.frame.width - 152)

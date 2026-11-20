@@ -16,8 +16,8 @@
 
 <p align="center">
   <a href="https://github.com/a11oydyyy/Lightbox/releases/latest"><img src="https://img.shields.io/github/v/release/a11oydyyy/Lightbox?label=%E4%B8%8B%E8%BC%89&color=2f2f2f" alt="最新版本"></a>
-  <img src="https://img.shields.io/badge/macOS-13%2B-2f2f2f" alt="macOS 13 以上">
-  <img src="https://img.shields.io/badge/Apple%20Silicon%20%26%20Intel-%E5%8E%9F%E7%94%9F-2f2f2f" alt="支援 Apple Silicon 與 Intel">
+  <img src="https://img.shields.io/badge/macOS-15%2B-2f2f2f" alt="macOS 15 以上">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-only-2f2f2f" alt="支援 Apple Silicon">
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 ## 為什麼是 Lightbox
 
 - **資料夾就是你的圖庫。** 打開 Mac、外接硬碟或 NAS 上的任何資料夾就能瀏覽。不匯入、不複製、不鎖進目錄檔，Finder、Photoshop 和其他 App 看到的始終是同一批檔案。
-- **為 Camera Raw 工作流程而做。** 一眼看出哪些照片已在 Adobe Camera Raw 或 Lightroom 調整過，單鍵選片，再透過 Photoshop 批次轉存 JPEG——正是多數攝影師在 Bridge 裡真正會用到的那些功能，卻沒有它的笨重。
+- **為 Camera Raw 工作流程而做。** 一眼看出哪些照片已在 Adobe Camera Raw 或 Lightroom 調整過，單鍵選片，再用 Photoshop 開啟照片完成後製——正是多數攝影師在 Bridge 裡真正會用到的那些功能，卻沒有它的笨重。
 - **就像 macOS 的一部分。** 原生、開啟迅速，支援淺色與深色、鍵盤操作，分頁、Quick Look、顏色標籤和復原都在你預期的地方。
 
 ## 功能
@@ -76,13 +76,6 @@
 - 把照片拖到其他分頁即可拷貝或搬移，也能拖到任何 App
 - Quick Look、在 Finder 中顯示、打開方式，也可選擇顯示圖片以外的檔案
 
-### 透過 Photoshop 批次轉存 JPEG
-
-
-相當於 Bridge 的**影像處理器**：選好照片、選「轉存為 JPEG…」，Photoshop 會逐張套用 Camera Raw 設定後存成 JPEG，可設定品質、轉換為 sRGB 和限制長邊。原圖不會被改動，也不會覆蓋任何檔案。其他時候，「在 Photoshop 中開啟」也只要一下。
-
-> Camera Raw 的調整只有 Adobe 的引擎能算出來，所以轉存需要安裝 Photoshop；瀏覽、選片和整理則不需要。
-
 ### 為 Mac 而生
 
 - 跟隨系統的淺色與深色外觀，可調整玻璃質感
@@ -101,7 +94,7 @@
 | 搜尋 | ⌘F | 新增資料夾 | ⇧⌘N |
 | 排序與篩選 | ⌥⌘F | 移到廢紙簍 | ⌘⌫ |
 | 放大／縮小縮圖 | ⌘= / ⌘− | 在 Photoshop 中開啟 | ⌥⌘O |
-| 圖庫／列表檢視 | ⌃⌘1 / ⌃⌘2 | 轉存為 JPEG | ⇧⌘E |
+| 圖庫／列表檢視 | ⌃⌘1 / ⌃⌘2 | | |
 
 ## 下載
 
@@ -110,20 +103,19 @@
 | 安裝包 | 系統需求 |
 | --- | --- |
 | `Lightbox-v*.zip` | Apple Silicon，macOS 15 或更新版本 |
-| `Lightbox-Intel-x86-v*.zip` | Intel 或 Apple Silicon，macOS 13 或更新版本 |
 
-Intel 安裝包同時包含兩種架構，在 Apple Silicon 上也會原生執行。各版本的簽署狀態與已知限制請見發布說明。
+各版本的簽署狀態與已知限制請見發布說明。
 
 ## 常見問題
 
 **Lightbox 可以取代 Adobe Bridge 嗎？**
-如果你主要用 Bridge 瀏覽資料夾、確認哪些照片修過、選片和批次轉存 JPEG，可以。為了保持輕巧快速，它刻意不做關鍵字、收藏集和輸出範本。
+如果你主要用 Bridge 瀏覽資料夾、確認哪些照片修過、選片和用 Photoshop 開啟照片，可以。為了保持輕巧快速，它刻意不做關鍵字、收藏集和輸出範本。
 
 **Lightbox 會匯入或修改我的照片嗎？**
 不會。它直接讀取原本的資料夾，只有在你要求時才會動檔案（改名、搬移、加標籤、丟到廢紙簍）。改名、加標籤和丟到廢紙簍可以復原；跨分頁搬移目前不能復原，也會清除先前的復原記錄。
 
 **支援 RAW 檔嗎？**
-支援 CR3、CR2、NEF、ARW、RAF、ORF、RW2、DNG 等 macOS 能讀取的格式。預覽顯示的是原始 RAW；Camera Raw 的調整會在轉存時由 Photoshop 套用。
+支援 CR3、CR2、NEF、ARW、RAF、ORF、RW2、DNG 等 macOS 能讀取的格式。預覽顯示的是原始 RAW；Camera Raw 的調整可用「在 Photoshop 中開啟」（⌥⌘O）完成。
 
 **可以拿來取代「預覽程式」或「照片」看圖嗎？**
 可以。它直接打開資料夾，點一下就預覽，方向鍵切換，不會把任何東西匯入圖庫。
@@ -137,4 +129,4 @@ Intel 安裝包同時包含兩種架構，在 Apple Silicon 上也會原生執�
 
 <sub>示範照片由 <a href="https://unsplash.com">Unsplash</a> 攝影師提供。</sub>
 
-<sub>關鍵字：Mac 看圖軟體 · Mac 相片瀏覽器 · Adobe Bridge 替代 · Camera Raw · XMP 旁檔 · 選片 · RAW 看圖 · 批次重新命名 · 批次轉 JPG · Mac 看图软件 · 图片浏览器 · Bridge 替代软件 · 批量导出 JPG</sub>
+<sub>關鍵字：Mac 看圖軟體 · Mac 相片瀏覽器 · Adobe Bridge 替代 · Camera Raw · XMP 旁檔 · 選片 · RAW 看圖 · 批次重新命名 · Mac 看图软件 · 图片浏览器 · Bridge 替代软件</sub>

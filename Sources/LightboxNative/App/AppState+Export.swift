@@ -1,117 +1,31 @@
 import AppKit
 import Foundation
 
-/// The images an export sheet is open for.
-struct JPEGExportRequest: Identifiable, Equatable {
-    let id = UUID()
-    var assets: [LightboxAsset]
+/// Adobe Photoshop, where finished Camera Raw edits are made.
+enum PhotoshopApp {
+    static let bundleIdentifier = "com.adobe.Photoshop"
+
+    /// The installed Photoshop, if any; looked up once a launch, as menus
+    /// ask on every update.
+    static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
 }
 
-// Opening in Photoshop, and exporting JPEGs through it (`PhotoshopJPEGExport`).
 extension AppState {
-    var exportText: ExportText { ExportText(appLanguage) }
+    var photoshopText: PhotoshopText { PhotoshopText(appLanguage) }
 
     /// The selection (or `asset`) in Photoshop, when it is installed.
     func openInPhotoshop(fallback asset: LightboxAsset) {
-        guard let applicationURL = PhotoshopJPEGExport.applicationURL else { return }
+        guard let applicationURL = PhotoshopApp.url else { return }
         openWithApplication(asset, applicationURL: applicationURL)
     }
 
-    /// Opens the export sheet for the selected images (or `asset`).
-    func beginJPEGExport(fallback asset: LightboxAsset) {
-        let images = operationTargetAssets(fallback: asset).filter { $0.isImage && !$0.isDeleted && $0.sourceURL != nil }
-        guard !images.isEmpty, PhotoshopJPEGExport.applicationURL != nil else { return }
-        jpegExportRequest = JPEGExportRequest(assets: images)
-    }
-
-    /// File › Open in Photoshop and Export as JPEG act on the selection.
+    /// File › Open in Photoshop acts on the selection.
     var canSendSelectionToPhotoshop: Bool {
-        PhotoshopJPEGExport.applicationURL != nil && !hasActiveOverlay && !isViewingTrash && selectedAssetID != nil
+        PhotoshopApp.url != nil && !hasActiveOverlay && !isViewingTrash && selectedAssetID != nil
     }
 
     func openSelectionInPhotoshop() {
         guard canSendSelectionToPhotoshop, let asset = selectedAsset else { return }
         openInPhotoshop(fallback: asset)
-    }
-
-    func exportSelectionAsJPEG() {
-        guard canSendSelectionToPhotoshop, let asset = selectedAsset else { return }
-        beginJPEGExport(fallback: asset)
-    }
-
-    /// Queues the export with the copies and moves, which show its progress.
-    func exportJPEG(_ request: JPEGExportRequest, options: JPEGExportOptions) {
-        jpegExportRequest = nil
-        options.save(defaults: libraryDefaults)
-        let urls = request.assets.compactMap(\.sourceURL)
-        guard let first = urls.first else { return }
-        var options = options
-        // Same name at the destination: replace, keep both (numbered), or stop.
-        let conflicts = PhotoshopJPEGExport.conflicts(urls, options: options)
-        if let conflict = conflicts.first {
-            let text = exportText
-            let alert = NSAlert()
-            alert.messageText = text.existsTitle(count: conflicts.count,
-                                                 name: options.destination(for: conflict).lastPathComponent)
-            alert.addButton(withTitle: text.keepBoth)
-            alert.addButton(withTitle: text.replace)
-            alert.addButton(withTitle: text.cancelButton)
-            switch alert.runModal() {
-            case .alertFirstButtonReturn: break
-            case .alertSecondButtonReturn: options.replacesExisting = true
-            default: return
-            }
-        }
-        fileTransfers.enqueue(FileTransferRequest(
-            sourceURLs: urls,
-            destinationFolderURL: options.destinationFolder(for: first),
-            operation: .exportJPEG,
-            jpegExport: options
-        ))
-    }
-
-    /// The export the title shows, from its start until its status goes away
-    /// (failures stay until dismissed).
-    var titleExportProgress: FileTransferProgress? {
-        guard let progress = fileTransferProgress, progress.operation.isExport else { return nil }
-        return progress
-    }
-
-    func exportStatusText(_ progress: FileTransferProgress) -> String {
-        let text = exportText
-        switch progress.phase {
-        case .active: return text.progress(min(progress.completedCount, progress.totalCount), of: progress.totalCount)
-        case .completed: return text.exported(progress.completedCount)
-        case .failed: return text.notExported(progress.failedCount)
-        case .cancelled: return text.cancelled
-        }
-    }
-
-    /// Apple Events to Photoshop were refused: says where to allow them.
-    func presentPhotoshopPermissionAlert() {
-        let text = exportText
-        let alert = NSAlert()
-        alert.messageText = text.notPermittedTitle
-        alert.informativeText = text.notPermittedMessage
-        alert.addButton(withTitle: text.openSettings)
-        alert.addButton(withTitle: text.cancelButton)
-        guard alert.runModal() == .alertFirstButtonReturn,
-              let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
-        else { return }
-        NSWorkspace.shared.open(url)
-    }
-}
-
-extension JPEGExportOptions {
-    private static let defaultsKey = "Lightbox.jpegExport.v1"
-
-    /// The options last exported with.
-    static func load(defaults: UserDefaults) -> JPEGExportOptions {
-        defaults.data(forKey: defaultsKey).flatMap { try? JSONDecoder().decode(JPEGExportOptions.self, from: $0) }
-            ?? JPEGExportOptions()
-    }
-
-    func save(defaults: UserDefaults) {
-        if let data = try? JSONEncoder().encode(self) { defaults.set(data, forKey: Self.defaultsKey) }
     }
 }

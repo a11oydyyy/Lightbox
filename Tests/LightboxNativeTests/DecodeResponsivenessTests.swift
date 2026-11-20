@@ -18,7 +18,7 @@ private final class DecodeGate: @unchecked Sendable {
     let gate = DecodeGate()
     defer { gate.release() }
     let image = NSImage(size: NSSize(width: 8, height: 8))
-    let cache = ImageCache(memoryProfile: .init(isCompatibilityMode: false), decodeImage: { _, quality in
+    let cache = ImageCache(memoryProfile: .init(), decodeImage: { _, quality in
         if quality == .preview { return image }
         gate.block()
         return nil

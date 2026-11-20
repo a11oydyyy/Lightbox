@@ -638,38 +638,36 @@ private final class CachedImageEntry: @unchecked Sendable {
 }
 
 struct ImageCacheMemoryProfile: Equatable {
-    var isCompatibilityMode: Bool
-
     static var current: ImageCacheMemoryProfile {
-        ImageCacheMemoryProfile(isCompatibilityMode: LightboxRuntime.usesCompatibilityPerformanceMode)
+        ImageCacheMemoryProfile()
     }
 
     var thumbnailCountLimit: Int {
-        isCompatibilityMode ? 96 : 160
+        160
     }
 
     var thumbnailTotalCostLimit: Int {
-        (isCompatibilityMode ? 96 : 180) * 1024 * 1024
+        180 * 1024 * 1024
     }
 
     var previewCountLimit: Int {
-        isCompatibilityMode ? 3 : 5
+        5
     }
 
     var previewTotalCostLimit: Int {
-        (isCompatibilityMode ? 96 : 160) * 1024 * 1024
+        160 * 1024 * 1024
     }
 
     var comparisonCountLimit: Int {
-        isCompatibilityMode ? 12 : 24
+        24
     }
 
     var comparisonTotalCostLimit: Int {
-        (isCompatibilityMode ? 256 : 512) * 1024 * 1024
+        512 * 1024 * 1024
     }
 
     var decodeConcurrency: Int {
-        isCompatibilityMode ? 3 : 4
+        4
     }
 
     var previewDecodeConcurrency: Int { 2 }

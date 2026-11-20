@@ -17,18 +17,11 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     private var lastActivityVisible: Bool?
     private var isFadingActivity = false
     private var activityTransitionGeneration = 0
-    /// A hairline under the title's export status that fills as files finish.
-    private let activityTrack = CALayer()
-    private let activityFill = CALayer()
-    /// The line's fill, 0…1; nil when no export is shown.
-    private var activityFraction: Double?
-    private lazy var activityClick = NSClickGestureRecognizer(target: self, action: #selector(showExportStatus))
     private let ancestors = BreadcrumbPathControl()
     private let editor = NSTextField()
     private let searchField = NSSearchField()
     private let selectionHost: NSHostingView<NativeHeaderPanel>
     private let transferHost: NSHostingView<NativeHeaderPanel>
-    private var popover: NSPopover?
     // Mutated only on the main actor; deinit only releases the opaque event token.
     nonisolated(unsafe) private var outsideClickMonitor: Any?
     private var pathSubmissionTask: Task<Void, Never>?
@@ -100,10 +93,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         activityLabel.lineBreakMode = .byClipping
         activityLabel.maximumNumberOfLines = 1
         activity.addSubview(activityLabel)
-        activityTrack.opacity = 0
-        activityTrack.addSublayer(activityFill)
-        activity.layer?.addSublayer(activityTrack)
-        activity.addGestureRecognizer(activityClick)
         locationSlot.addSubview(activity)
         ancestors.focusRingType = .none
         ancestors.pathStyle = .standard
@@ -229,8 +218,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         let point = convert(event.locationInWindow, from: nil)
         let titleFrame = titleButton.isHidden ? NSRect.zero : titleButton.frame
         let pathFrame = ancestors.isHidden ? NSRect.zero : ancestors.frame
-        // A click on an export's status opens its details instead.
-        let activityFrame = activity.isHidden || appState.titleExportProgress != nil ? NSRect.zero : activity.frame
+        let activityFrame = activity.isHidden ? NSRect.zero : activity.frame
         return [titleFrame, pathFrame, activityFrame].contains { !$0.isEmpty && $0.contains(point) }
     }
 
@@ -253,7 +241,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
     }
 
     func refresh() {
-        let enabled = appState.previewAssetID == nil && !appState.isComparing
         updateChromeVisibility(appState.isOverlayChromeVisible)
         label(back, appState.localized(.goBack))
         label(forward, appState.localized(.goForward))
@@ -283,14 +270,10 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         titleButton.title = startPage ? appState.localized(.newTab) : appState.isViewingTrash ? appState.localized(.trash) : folderTitle
         titleButton.contentTintColor = .labelColor
         activityLabel.font = titleButton.font
-        // A running export takes the title; a failed one stays, in red, until dismissed.
-        let export = appState.titleExportProgress
-        activityLabel.textColor = export?.phase == .failed ? .systemRed : titleButton.contentTintColor
+        activityLabel.textColor = titleButton.contentTintColor
         titleButton.toolTip = path
         titleButton.setAccessibilityLabel(titleButton.title)
-        updateActivity(export.map(appState.exportStatusText) ?? appState.navigationActivityText)
-        updateActivityLine(export)
-        if export == nil, popover?.isShown == true { popover?.close() }
+        updateActivity(appState.navigationActivityText)
         if breadcrumbsChanged {
             lastViewingTrash = appState.isViewingTrash
             // NSPathControl.url derives names/icons with synchronous volume
@@ -317,7 +300,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         if startPage {
             titleButton.menu = nil
             closeSearch()
-            popover?.close()
         }
         titleButton.isEnabled = !startPage && appState.navigationActivityText == nil
         ancestors.toolTip = path
@@ -345,7 +327,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
             lastPathGeneration = appState.goToFolderFocusGeneration
             beginPathEditing()
         }
-        if !enabled { popover?.close() }
         needsLayout = true
     }
 
@@ -354,7 +335,7 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         if let text, lastActivityVisible == true, !isFadingActivity,
            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
            Self.caption(text) != Self.caption(activityLabel.stringValue) {
-            // A new phase (exporting → exported) crossfades; counts roll.
+            // A new phase (copying → copied) crossfades; counts roll.
             let fade = CATransition()
             fade.type = .fade
             fade.duration = 0.22
@@ -393,58 +374,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         text.replacingOccurrences(of: "[0-9][0-9,]*", with: "#", options: .regularExpression)
     }
 
-    private func updateActivityLine(_ progress: FileTransferProgress?) {
-        let fraction: Double? = switch progress?.phase {
-        case .active: progress?.fractionCompleted
-        case .completed: 1
-        default: nil
-        }
-        guard fraction != activityFraction else { return }
-        let appearing = activityFraction == nil
-        activityFraction = fraction
-        CATransaction.begin()
-        if appearing {
-            // Start empty, without sliding in from the last export's width.
-            CATransaction.setDisableActions(true)
-            activityFill.frame.size.width = 0
-            CATransaction.commit()
-            CATransaction.begin()
-        }
-        let animated = window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        CATransaction.setAnimationDuration(animated ? 0.45 : 0)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(controlPoints: 0.22, 0.8, 0.28, 1))
-        activityTrack.opacity = fraction == nil ? 0 : 1
-        layoutActivityLine()
-        CATransaction.commit()
-    }
-
-    private func layoutActivityLine() {
-        activity.effectiveAppearance.performAsCurrentDrawingAppearance {
-            activityTrack.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
-            activityFill.backgroundColor = NSColor(LightboxColorTokens.accent).cgColor
-        }
-        let height: CGFloat = 1.5
-        activityTrack.cornerRadius = height / 2
-        activityFill.cornerRadius = height / 2
-        activityTrack.frame = CGRect(x: 0, y: 0, width: activity.bounds.width, height: height)
-        let fraction = CGFloat(activityFraction ?? 1)
-        activityFill.frame = CGRect(x: 0, y: 0, width: activity.bounds.width * fraction, height: height)
-    }
-
-    @objc private func showExportStatus() {
-        guard appState.titleExportProgress != nil, !activity.isHidden else { return }
-        if popover?.isShown == true {
-            popover?.close()
-            return
-        }
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: ExportStatusPopover(appState: appState) { [weak popover] in
-            popover?.close()
-        })
-        popover.show(relativeTo: activity.bounds, of: activity, preferredEdge: .minY)
-        self.popover = popover
-    }
 
     override func layout() {
         super.layout()
@@ -477,11 +406,8 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         let origin = convert(.zero, to: nil).x
         let galleryInset: CGFloat = appState.sidebarCollapsed ? 0 : appState.sidebarWidth + 18
         let leading = max(0, galleryInset - origin)
-        // An export's status takes the center over the selection bar: exports
-        // usually start from a multiple selection.
-        let selecting = appState.selectedAssetCount > 1 && appState.titleExportProgress == nil
-        // Exports show in the title instead.
-        let hasTransfer = appState.fileTransferProgress.map { !$0.operation.isExport } ?? false
+        let selecting = appState.selectedAssetCount > 1
+        let hasTransfer = appState.fileTransferProgress != nil
         // Selection only swaps the center slot; navigation and search stay put.
         for (index, button) in [back, forward, up].enumerated() {
             place(button, at: NSRect(x: leading + CGFloat(index) * 32, y: 6, width: LightboxControlMetrics.iconButtonSize, height: LightboxControlMetrics.iconButtonSize), animated: animated)
@@ -507,7 +433,6 @@ final class NativeNavigationBar: NSView, NSSearchFieldDelegate, NSMenuItemValida
         place(activity, at: NSRect(x: activityX, y: ancestors.pathItems.isEmpty ? 10 : 0, width: activityWidth, height: 23), animated: animated)
         let labelFrame = activity.bounds.insetBy(dx: 0, dy: 2)
         if activityLabel.frame != labelFrame { activityLabel.frame = labelFrame }
-        if activityTrack.frame.width != activity.bounds.width { layoutActivityLine() }
         let fittingStart = crumbStart(fitting: location.width)
         if fittingStart != shownCrumbStart { showCrumbs(from: fittingStart) }
         let ancestorWidth = min(location.width, ancestors.pathItems.reduce(CGFloat(0)) { $0 + Self.crumbWidth($1.title) })

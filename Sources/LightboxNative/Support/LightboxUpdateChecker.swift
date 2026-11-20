@@ -37,8 +37,7 @@ enum LightboxUpdateChecker {
     }
 
     static func checkLatestRelease(
-        currentVersion: String = currentAppVersion,
-        compatibility: Bool = LightboxRuntime.isCompatibilityApp
+        currentVersion: String = currentAppVersion
     ) async throws -> CheckResult {
         var request = URLRequest(url: latestReleaseAPIURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -51,17 +50,17 @@ enum LightboxUpdateChecker {
             throw UpdateError.unavailable
         }
 
-        return try checkResult(from: data, currentVersion: currentVersion, compatibility: compatibility)
+        return try checkResult(from: data, currentVersion: currentVersion)
     }
 
-    static func checkResult(from data: Data, currentVersion: String, compatibility: Bool) throws -> CheckResult {
+    static func checkResult(from data: Data, currentVersion: String) throws -> CheckResult {
         let release = try JSONDecoder().decode(Release.self, from: data)
         let latestVersion = normalizedVersion(release.tagName)
 
         guard isVersion(latestVersion, newerThan: currentVersion) else {
             return .upToDate(version: normalizedVersion(currentVersion), releaseURL: release.htmlURL)
         }
-        guard let asset = preferredAsset(in: release, compatibility: compatibility) else {
+        guard let asset = preferredAsset(in: release) else {
             throw UpdateError.compatibleAssetMissing
         }
         guard let digest = asset.digest, !digest.isEmpty else {
@@ -80,11 +79,9 @@ enum LightboxUpdateChecker {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     }
 
-    static func preferredAsset(in release: Release, compatibility: Bool) -> Asset? {
+    static func preferredAsset(in release: Release) -> Asset? {
         let version = normalizedVersion(release.tagName)
-        let expectedName = compatibility
-            ? "Lightbox-Intel-x86-v\(version).zip"
-            : "Lightbox-v\(version).zip"
+        let expectedName = "Lightbox-v\(version).zip"
         return release.assets.first { asset in
             asset.name.caseInsensitiveCompare(expectedName) == .orderedSame
         }

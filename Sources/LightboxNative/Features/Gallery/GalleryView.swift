@@ -306,48 +306,23 @@ final class GalleryMasonryColumnCache {
 }
 
 struct GalleryPerformanceProfile: Equatable {
-    var isCompatibilityMode: Bool
-
     static var current: GalleryPerformanceProfile {
-        GalleryPerformanceProfile(isCompatibilityMode: LightboxRuntime.usesCompatibilityPerformanceMode)
+        GalleryPerformanceProfile()
     }
 
     var maxPrioritizedAssetCount: Int {
-        isCompatibilityMode ? 24 : GalleryImagePriorityPlanner.maxPrioritizedAssetCount
-    }
-
-    var reducesHoverEffects: Bool {
-        isCompatibilityMode
+        GalleryImagePriorityPlanner.maxPrioritizedAssetCount
     }
 
     func initialImageLoadWindow(prefersFastRawThumbnails: Bool) -> Int {
-        if isCompatibilityMode {
-            return prefersFastRawThumbnails ? 20 : 30
-        }
-        return prefersFastRawThumbnails ? 30 : 48
+        prefersFastRawThumbnails ? 30 : 48
     }
 
     func preloadMargin(viewportHeight: CGFloat, prefersFastRawThumbnails: Bool) -> CGFloat {
-        let multiplier: CGFloat
-        if isCompatibilityMode {
-            multiplier = prefersFastRawThumbnails ? 0.35 : 0.55
-        } else {
-            multiplier = prefersFastRawThumbnails ? 0.55 : 1.0
-        }
-        return viewportHeight * multiplier
+        viewportHeight * (prefersFastRawThumbnails ? 0.55 : 1.0)
     }
 
     func thumbnailQuality(assetCount: Int, usesConservativeExternalLoading: Bool) -> ImageCacheQuality {
-        if isCompatibilityMode {
-            if assetCount >= 260 || (usesConservativeExternalLoading && assetCount >= 160) {
-                return .thumbnailFast
-            }
-            if assetCount >= 80 || (usesConservativeExternalLoading && assetCount >= 48) {
-                return .thumbnailBalanced
-            }
-            return .thumbnail
-        }
-
         if assetCount >= 700 || (usesConservativeExternalLoading && assetCount >= 320) {
             return .thumbnailFast
         }
@@ -358,8 +333,7 @@ struct GalleryPerformanceProfile: Equatable {
     }
 
     func permitsFullThumbnailPromotion(assetCount: Int, usesConservativeExternalLoading: Bool) -> Bool {
-        guard !isCompatibilityMode else { return false }
-        return !(usesConservativeExternalLoading && assetCount >= 80)
+        !(usesConservativeExternalLoading && assetCount >= 80)
     }
 }
 
@@ -502,7 +476,7 @@ private struct GalleryContentView: View {
                 assetCount: activeAssets.count,
                 performanceProfile: performanceProfile
             ) && !scrollGeometry.isScrolling && !appState.isScalingThumbnails
-            let usesReducedHover = appState.libraryLoadingStatus != nil || performanceProfile.reducesHoverEffects
+            let usesReducedHover = appState.libraryLoadingStatus != nil
             let assetMenuTitles = AssetContextMenuTitles(appState: appState)
             let visibleFolders = visibleFolderEntries
             let searchGroups = appState.usesRecursiveResults ? appState.searchAssetGroups : []
@@ -674,23 +648,23 @@ private struct GalleryContentView: View {
                         refreshRenderPlan(viewportHeight: viewport.size.height)
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
-                    .onChange(of: navigationToken) { _ in
+                    .onChange(of: navigationToken) {
                         pendingGroupScroll = nil
                         _ = prepareGeometry(for: navigationToken)
                         selectionRect = nil
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
-                    .onChange(of: appState.activeAssetsRevision) { _ in
+                    .onChange(of: appState.activeAssetsRevision) {
                         masonryColumnCache.retain(identities: Set(appState.searchAssetGroups.map(\.id)).union(["active"]))
                         masonryPlacementCache.retain(identities: Set(appState.searchAssetGroups.map(\.id)).union(["active"]))
                         scrollGeometry.retain(activeAssetIDs: appState.activeAssetIDs)
                         refreshRenderPlan(viewportHeight: viewport.size.height)
                     }
-                    .onChange(of: viewport.size.height) { height in
+                    .onChange(of: viewport.size.height) { _, height in
                         lastViewportHeight = height
                         refreshRenderPlan(viewportHeight: viewport.size.height)
                     }
-                    .onChange(of: appState.galleryKeyboardScrollGeneration) { _ in
+                    .onChange(of: appState.galleryKeyboardScrollGeneration) {
                         // A preview stepping to another image keeps that image's
                         // card in view underneath, so closing lands on it.
                         guard !appState.isComparing, let id = appState.galleryKeyboardFocusID else { return }
@@ -698,16 +672,16 @@ private struct GalleryContentView: View {
                            frame.minY >= 52, frame.maxY <= viewport.size.height - 55 { return }
                         requestScroll(to: id, anchor: .center, using: scrollProxy)
                     }
-                    .onChange(of: appState.isRefreshingGallery) { refreshing in
+                    .onChange(of: appState.isRefreshingGallery) { _, refreshing in
                         if !refreshing { isPullRefreshing = false }
                     }
-                    .onChange(of: scrollRestoreAvailabilityToken) { _ in
+                    .onChange(of: scrollRestoreAvailabilityToken) {
                         restoreScrollIfNeeded(using: scrollProxy)
                     }
-                    .onChange(of: viewport.size.width) { width in
+                    .onChange(of: viewport.size.width) { _, width in
                         lastViewportWidth = width
                     }
-                    .onChange(of: appState.isScalingThumbnails) { scaling in
+                    .onChange(of: appState.isScalingThumbnails) { _, scaling in
                         refreshRenderPlan(viewportHeight: viewport.size.height)
                         // Land the slider on the width the filled grid shows, so the
                         // next drag starts from what is on screen instead of jumping.
@@ -716,13 +690,13 @@ private struct GalleryContentView: View {
                             appState.thumbnailWidth = GalleryThumbnailSizing.clampedStoredWidth(settledWidth)
                         }
                     }
-                    .onChange(of: thumbnailScale.columnStepAnchor) { step in
+                    .onChange(of: thumbnailScale.columnStepAnchor) { _, step in
                         // Keep the image that was at the top there once the
                         // new columns have laid out.
                         guard let step, appState.activeAssetIDs.contains(step.assetID) else { return }
                         DispatchQueue.main.async { requestScroll(to: step.assetID, anchor: .top, using: scrollProxy) }
                     }
-                    .onChange(of: isResizingSidebar) { resizing in
+                    .onChange(of: isResizingSidebar) { _, resizing in
                         if resizing {
                             frozenColumns = galleryMetrics(viewportWidth: lastViewportWidth).columns
                         } else {
@@ -1262,9 +1236,6 @@ private struct GalleryContentView: View {
             onRename: {
                 appState.beginRename(fallback: asset)
             },
-            onExportJPEG: {
-                appState.beginJPEGExport(fallback: asset)
-            },
             onQuickLook: {
                 appState.showQuickLook(appState.operationTargetAssets(fallback: asset))
             },
@@ -1605,7 +1576,7 @@ private struct AssetFrameProbe: View {
             let frame = proxy.frame(in: .named("GalleryContent"))
             Color.clear
                 .onAppear { onUpdate(frame, owner, true) }
-                .onChange(of: frame) { onUpdate($0, owner, false) }
+                .onChange(of: frame) { _, frame in onUpdate(frame, owner, false) }
                 .onDisappear { onDisappear(owner) }
         }
     }
@@ -1623,7 +1594,7 @@ private struct GalleryContentOriginProbe: View {
             )
             Color.clear
                 .onAppear { onUpdate(origin) }
-                .onChange(of: origin) { onUpdate($0) }
+                .onChange(of: origin) { _, origin in onUpdate(origin) }
         }
     }
 }

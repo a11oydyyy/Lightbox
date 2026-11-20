@@ -114,7 +114,7 @@ enum ImageSchedulingPriorityRoute: CaseIterable, Equatable, Sendable {
 @MainActor
 private func schedulingBlockedCache(quality: ImageCacheQuality = .thumbnail) async throws -> (ImageCache, ImageSchedulingRecorder) {
     let recorder = ImageSchedulingRecorder()
-    let profile = ImageCacheMemoryProfile(isCompatibilityMode: true)
+    let profile = ImageCacheMemoryProfile()
     let cache = ImageCache(
         memoryProfile: profile,
         decodeImage: { url, quality in

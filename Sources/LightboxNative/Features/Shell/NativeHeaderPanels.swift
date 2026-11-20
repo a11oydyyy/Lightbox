@@ -135,7 +135,6 @@ private struct FileTransferControl: View {
             switch progress.operation {
             case .copy: "doc.on.doc"
             case .move: "arrow.right"
-            case .exportJPEG: "square.and.arrow.up"
             }
         case .completed:
             "checkmark"
@@ -160,9 +159,7 @@ private struct FileTransferControl: View {
     private var accessibilityLabel: String {
         switch progress.phase {
         case .active:
-            progress.operation == .exportJPEG
-                ? appState.exportText.exporting
-                : appState.localized(progress.operation == .copy ? .copyingFiles : .movingFiles)
+            appState.localized(progress.operation == .copy ? .copyingFiles : .movingFiles)
         case .completed, .failed, .cancelled:
             appState.fileTransferStatusText(progress)
         }
